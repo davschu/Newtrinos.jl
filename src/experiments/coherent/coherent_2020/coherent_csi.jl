@@ -10,6 +10,7 @@ using BAT
 using CairoMakie
 using Logging
 using StatsBase
+using ..Helpers
 import ..Newtrinos
 
 @kwdef struct COHERENT_CSI <: Newtrinos.Experiment
@@ -48,7 +49,10 @@ function get_params()
         coherent_csi_qfa_a = 0.0554628,  # QF polynomial coefficients
         coherent_csi_qfa_b = 4.30681,
         coherent_csi_qfa_c = -111.707,
-        coherent_csi_qfa_d = 840.384,      
+        coherent_csi_qfa_d = 840.384,
+        brn_norm= 18.4,  # Normalization factor for BRN
+        nin_norm= 5.6,  # Normalization factor for NIN
+        ss_bkg_norm= 1286.0,  # Normalization factor for SS background
         )
 end
 
@@ -63,6 +67,9 @@ function get_priors()
         coherent_csi_qfa_b = Normal(4.30681, 0.79),
         coherent_csi_qfa_c = Normal(-111.707, 26.15),
         coherent_csi_qfa_d = Normal(840.384, 244.82),
+        brn_norm= Normal(18.4, 4.6),  # Normalization factor for BRN
+        nin_norm= Normal(5.6, 2.0),  # Normalization factor for NIN
+        ss_bkg_norm= Normal(1286.0, 27.0),  # Normalization factor for SS background
         )
 end
 
@@ -79,10 +86,10 @@ function get_assets(physics, datadir = @__DIR__)
     light_yield = 13.35  # PE/keVee
     resolution = [0.0749, 9.56]  # a/Eee and b*Eee
     # Import Data
-    brnPE = CSV.read(joinpath(datadir, "csi/brnPE.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, BRN PDF
-    ninPE = CSV.read(joinpath(datadir, "csi/ninPE.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, NIN PDF
-    ssBkg = CSV.read(joinpath(datadir, "csi/dataBeamOnAC.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, SS Background
-    observed = CSV.read(joinpath(datadir, "csi/dataBeamOnC.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, Observed Counts
+    brnPE_df = CSV.read(joinpath(datadir, "csi/brnPE.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, BRN PDF
+    ninPE_df = CSV.read(joinpath(datadir, "csi/ninPE.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, NIN PDF
+    ssBkg_df = CSV.read(joinpath(datadir, "csi/dataBeamOnAC.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, timestamp
+    observed_df = CSV.read(joinpath(datadir, "csi/dataBeamOnC.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, timestamp
 
     # Reconstruct bin edges from centers
     er_centers = midpoints(er_edges)
@@ -90,6 +97,14 @@ function get_assets(physics, datadir = @__DIR__)
     pe_width = 5.0
     out_edges = collect(2.5:pe_width:62.5)  # Bin edges: 5–60 PE, 5 PE width
     out_centers = midpoints(out_edges) # Bin centers
+
+    # For event lists (PE only, e.g. ssBkg, observed), use Helpers.bin
+    ssBkg = Helpers.bin(ssBkg_df, out_edges; col=1)
+    observed = Helpers.bin(observed_df, out_edges; col=1)
+
+    # For PDFs (PE, count), use Helpers.rebin
+    brnPE = Helpers.rebin(brnPE_df, out_edges; var_col=1, count_col=2)
+    ninPE = Helpers.rebin(ninPE_df, out_edges; var_col=1, count_col=2)
 
     distance = 19.3 # m
     exposure = 13.99 # GWh
@@ -215,9 +230,24 @@ function get_expected(params, physics, assets)
     return predicted_counts
 end
 
+function get_backgrounds(params, assets)
+    scale_template(template, norm) = sum(template) > 0 ? norm * (template / sum(template)) : zeros(length(template))
+    brnPE = scale_template(assets.brnPE, params.brn_norm)
+    ninPE = scale_template(assets.ninPE, params.nin_norm)
+    ssBkg = scale_template(assets.ssBkg, params.ss_bkg_norm)
+    return (brnPE, ninPE, ssBkg)
+end
+
 function get_forward_model(physics, assets)
     function forward_model(params)
-        exp_events = get_expected(params, physics, assets)
+        # Signal prediction
+        signal = get_expected(params, physics, assets)
+        # Backgrounds (scaled by normalization parameters)
+        brnPE, ninPE, ssBkg = get_backgrounds(params, assets)
+        # Sum all backgrounds per bin
+        total_bkg = brnPE .+ ninPE .+ ssBkg
+        # Total expected events per bin
+        exp_events = signal .+ total_bkg
         distprod(Poisson.(exp_events))
     end
 end

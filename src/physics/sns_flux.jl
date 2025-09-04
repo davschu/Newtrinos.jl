@@ -22,13 +22,13 @@ end
 
 function get_params()
     (
-        sns_nu_per_POT = 0.0848,
+        sns_nu_per_POT = 0.09,
     )
 end
 
 function get_priors()
     (
-        sns_nu_per_POT = Normal(0.0848, 0.00848),
+        sns_nu_per_POT = Normal(0.09, 0.009),
     )
 end
 
