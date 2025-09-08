@@ -59,17 +59,17 @@ end
 # TODO!
 function get_priors()
     priors = (
-        coherent_csi_eff_a = Truncated(Normal(1.32045, 0.02), 0, 1),
-        coherent_csi_eff_b = Truncated(Normal(0.285979, 0.0006), 0, 1),
-        coherent_csi_eff_c = Truncated(Normal(10.8646, 1.), 0, 1),
-        coherent_csi_eff_d = Truncated(Normal(-0.333322, 0.03), 0, 1),
+        coherent_csi_eff_a = Normal(1.32045, 0.02),
+        coherent_csi_eff_b = Normal(0.285979, 0.0006),
+        coherent_csi_eff_c = Normal(10.8646, 1.),
+        coherent_csi_eff_d = Normal(-0.333322, 0.03),
         coherent_csi_qfa_a = Normal(0.0554628, 0.0059),
         coherent_csi_qfa_b = Normal(4.30681, 0.79),
         coherent_csi_qfa_c = Normal(-111.707, 26.15),
         coherent_csi_qfa_d = Normal(840.384, 244.82),
-        brn_norm= Normal(18.4, 4.6),  # Normalization factor for BRN
-        nin_norm= Normal(5.6, 2.0),  # Normalization factor for NIN
-        ss_bkg_norm= Normal(1286.0, 27.0),  # Normalization factor for SS background
+        brn_norm= truncated(Normal(18.4, 4.6), 0.0, Inf),  # Normalization factor for BRN
+        nin_norm= truncated(Normal(5.6, 2.0), 0.0, Inf),  # Normalization factor for NIN
+        ss_bkg_norm= truncated(Normal(1286.0, 27.0), 0.0, Inf),  # Normalization factor for SS background
         )
 end
 
