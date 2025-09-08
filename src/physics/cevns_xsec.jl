@@ -48,7 +48,7 @@ function build_params_and_priors(isotopes)
     )
     for iso in isotopes
         param_dict[iso.Rn_key] = iso.Rn_nom
-        prior_dict[iso.Rn_key] = Normal(iso.Rn_nom, 1)
+        prior_dict[iso.Rn_key] = truncated(Normal(iso.Rn_nom, 1), 0.0, Inf)
     end
     return (NamedTuple(param_dict), NamedTuple(prior_dict))
 end

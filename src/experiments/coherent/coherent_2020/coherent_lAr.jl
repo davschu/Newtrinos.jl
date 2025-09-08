@@ -55,8 +55,8 @@ end
 # TODO!
 function get_priors()
     priors = (
-        coherent_lar_qfa_a = Normal(0.246, 0.006),
-        coherent_lar_qfa_b = Normal(0.00078, 0.00009),
+        coherent_lar_qfa_a = truncated(Normal(0.246, 0.006), 0.0, Inf),
+        coherent_lar_qfa_b = truncated(Normal(0.00078, 0.00009), 0.0, Inf),
         coherent_lar_mass = truncated(Normal(24.4, 0.61), 0.0, Inf),
         brn_norm= truncated(Normal(497.0, 160.0), 0.0, Inf),  # Normalization factor for BRN
         delbrn_norm= truncated(Normal(33.0, 33.0), 0.0, Inf),  # Normalization factor for delBRN
@@ -122,7 +122,9 @@ end
 function qf(er_centers, params)
     a = params.coherent_lar_qfa_a
     b = params.coherent_lar_qfa_b
-    return @. (a + b * er_centers) * er_centers  # Convert to keVee
+    vals = @. (a + b * er_centers) * er_centers  # Convert to keVee
+    vals[vals .< 0] .= 0.0
+    return vals
 end
 
 function eff(keVee, assets)

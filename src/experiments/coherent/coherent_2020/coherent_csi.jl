@@ -133,8 +133,10 @@ function qf(er_centers, params)
     b = params.coherent_csi_qfa_b
     c = params.coherent_csi_qfa_c
     d = params.coherent_csi_qfa_d
-    er_centers = er_centers * 1e-3 #Convert to MeV (no mutation)
-    return @. (a * er_centers + b * er_centers ^ 2 + c * er_centers ^ 3 + d * er_centers ^ 4) * 1e3  # Convert to keVee
+    er_centers = er_centers * 1e-3 # Convert to MeV (no mutation)
+    vals = @. (a * er_centers + b * er_centers ^ 2 + c * er_centers ^ 3 + d * er_centers ^ 4) * 1e3  # Convert to keVee
+    vals = max.(vals, 0.0)  # Ensure non-negative QF
+    return vals
 end
 
 function eff(pe, params)
@@ -142,7 +144,9 @@ function eff(pe, params)
     b = params.coherent_csi_eff_b
     c = params.coherent_csi_eff_c
     d = params.coherent_csi_eff_d
-    return @. a / (1 + exp(-b * (pe - c))) + d
+    vals = @. a / (1 + exp(-b * (pe - c))) + d
+    vals = max.(vals, 0.0)  # Ensure non-negative efficiency
+    return vals
 end
 
 function gamma_pdf_integrated_over_bins(Eee, pe_centers, pe_edges, resolution, light_yield)
