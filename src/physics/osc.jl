@@ -508,7 +508,11 @@ function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{L
 end
 
 function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool)
-    H_eff = U * Diagonal(h) * adjoint(U)
+    if anti
+        H_eff = conj.(U) * Diagonal(h) * adjoint(conj.(U))
+    else
+        H_eff = U * Diagonal(h) * adjoint(U)
+    end
     p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction), E))
     permutedims(p, (1, 2, 4, 3))
 end
