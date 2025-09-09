@@ -28,7 +28,7 @@ end
 
 function get_priors()
     (
-        sns_nu_per_POT = truncated(Normal(0.09, 0.009), 0.0, Inf)
+        sns_nu_per_POT = truncated(Normal(0.09, 0.009), 0.0, 0.09 + 3 * 0.009),
     )
 end
 

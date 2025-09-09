@@ -42,13 +42,13 @@ function build_params_and_priors(isotopes)
     )
     prior_dict = Dict{Symbol, Distributions.Distribution}(
         :cevns_xsec_a => Uniform(-1, 1),
-        :cevns_xsec_b => Uniform(-1, 1),
+        :cevns_xsec_b => Uniform(-1000.0, 1000.0),
         :cevns_xsec_c => Uniform(-1, 1),
-        :cevns_xsec_d => Uniform(-1, 1),
+        :cevns_xsec_d => Uniform(-1e6, 1e6),
     )
     for iso in isotopes
         param_dict[iso.Rn_key] = iso.Rn_nom
-        prior_dict[iso.Rn_key] = truncated(Normal(iso.Rn_nom, 1), 0.0, Inf)
+        prior_dict[iso.Rn_key] = truncated(Normal(iso.Rn_nom, 1), 0.0, iso.Rn_nom + 3 * 1)
     end
     return (NamedTuple(param_dict), NamedTuple(prior_dict))
 end
@@ -86,7 +86,7 @@ function ds(er, enu, params, nupar, Rn_key)
     qwsq = (N - (1 - 4 * sw2) * Z)^2
     freepar_array = [params.cevns_xsec_a, params.cevns_xsec_b, params.cevns_xsec_c, params.cevns_xsec_d]
     sm_pars = [1.0, -1.0, -1.0, 1.0]
-    coeffs = freepar_array .+ qwsq .* sm_pars
+    coeffs = qwsq .* (freepar_array .+ sm_pars)
     # Compute basis arrays for all (er, enu) pairs
     base1 = ones(length(er), length(enu))
     base2 = er_grid ./ enu_grid
