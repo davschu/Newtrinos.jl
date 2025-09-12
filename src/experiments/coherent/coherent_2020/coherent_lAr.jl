@@ -46,7 +46,7 @@ function get_params()
         coherent_lar_qfa_a = 0.246,  # QF polynomial coefficients
         coherent_lar_qfa_b = 0.00078,
         coherent_lar_mass = 24.4,  # kg
-        brn_norm= 497.0,  # Normalization factor for BRN
+        pbrn_norm= 497.0,  # Normalization factor for BRN
         delbrn_norm= 33.0,  # Normalization factor for delBRN
         ss_bkg_norm= 3154.0,  # Normalization factor for SS background
         )
@@ -58,7 +58,7 @@ function get_priors()
         coherent_lar_qfa_a = truncated(Normal(0.246, 0.006), 0.2, 0.3),
         coherent_lar_qfa_b = truncated(Normal(0.00078, 0.00009), 0.0007, 0.0009),
         coherent_lar_mass = truncated(Normal(24.4, 0.61), 20, 30),
-        brn_norm= truncated(Normal(497.0, 160.0), 0.0, 1000),  # Normalization factor for BRN
+        pbrn_norm= truncated(Normal(497.0, 160.0), 0.0, 1000),  # Normalization factor for BRN
         delbrn_norm= truncated(Normal(33.0, 33.0), 0.0, 1000),  # Normalization factor for delBRN
         ss_bkg_norm= truncated(Normal(3154.0, 25.0), 3000, 3500),  # Normalization factor for SS background
         )
@@ -214,7 +214,7 @@ end
 
 function get_backgrounds(params, assets)
     scale_template(template, norm) = sum(template) > 0 ? norm * (template / sum(template)) : zeros(length(template))
-    brn = scale_template(assets.brn_binned, params.brn_norm)
+    brn = scale_template(assets.brn_binned, params.pbrn_norm)
     delbrn = scale_template(assets.delbrn_binned, params.delbrn_norm)
     ss_bkg = scale_template(assets.ss_bkg_binned, params.ss_bkg_norm)
     return (brn, delbrn, ss_bkg)
