@@ -59,17 +59,17 @@ end
 # TODO!
 function get_priors()
     priors = (
-        coherent_csi_eff_a = Normal(1.32045, 0.02),
-        coherent_csi_eff_b = Normal(0.285979, 0.0006),
-        coherent_csi_eff_c = Normal(10.8646, 1.),
-        coherent_csi_eff_d = Normal(-0.333322, 0.03),
-        coherent_csi_qfa_a = Normal(0.0554628, 0.0059),
-        coherent_csi_qfa_b = Normal(4.30681, 0.79),
-        coherent_csi_qfa_c = Normal(-111.707, 26.15),
-        coherent_csi_qfa_d = Normal(840.384, 244.82),
-        brn_norm= truncated(Normal(18.4, 4.6), 0.0, Inf),  # Normalization factor for BRN
-        nin_norm= truncated(Normal(5.6, 2.0), 0.0, Inf),  # Normalization factor for NIN
-        ss_bkg_norm= truncated(Normal(1286.0, 27.0), 0.0, Inf),  # Normalization factor for SS background
+        coherent_csi_eff_a = truncated(Normal(1.32045, 0.02), 1, 1.5),
+        coherent_csi_eff_b = truncated(Normal(0.285979, 0.0006), 0.25, 0.3),
+        coherent_csi_eff_c = truncated(Normal(10.8646, 1.), 5, 15),
+        coherent_csi_eff_d = truncated(Normal(-0.333322, 0.03), -0.4, -0.25),
+        coherent_csi_qfa_a = truncated(Normal(0.0554628, 0.0059), 0.01, 0.1),
+        coherent_csi_qfa_b = truncated(Normal(4.30681, 0.79), 1, 8),
+        coherent_csi_qfa_c = truncated(Normal(-111.707, 26.15), -200, -10),
+        coherent_csi_qfa_d = truncated(Normal(840.384, 244.82), 0, 1500),
+        brn_norm= truncated(Normal(18.4, 4.6), 0.0, 40),  # Normalization factor for BRN
+        nin_norm= truncated(Normal(5.6, 2.0), 0.0, 12),  # Normalization factor for NIN
+        ss_bkg_norm= truncated(Normal(1286.0, 27.0), 1000, 1500),  # Normalization factor for SS background
         )
 end
 

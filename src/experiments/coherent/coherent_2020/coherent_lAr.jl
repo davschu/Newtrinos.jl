@@ -55,12 +55,12 @@ end
 # TODO!
 function get_priors()
     priors = (
-        coherent_lar_qfa_a = truncated(Normal(0.246, 0.006), 0.0, Inf),
-        coherent_lar_qfa_b = truncated(Normal(0.00078, 0.00009), 0.0, Inf),
-        coherent_lar_mass = truncated(Normal(24.4, 0.61), 0.0, Inf),
-        brn_norm= truncated(Normal(497.0, 160.0), 0.0, Inf),  # Normalization factor for BRN
-        delbrn_norm= truncated(Normal(33.0, 33.0), 0.0, Inf),  # Normalization factor for delBRN
-        ss_bkg_norm= truncated(Normal(3154.0, 25.0), 0.0, Inf),  # Normalization factor for SS background
+        coherent_lar_qfa_a = truncated(Normal(0.246, 0.006), 0.2, 0.3),
+        coherent_lar_qfa_b = truncated(Normal(0.00078, 0.00009), 0.0007, 0.0009),
+        coherent_lar_mass = truncated(Normal(24.4, 0.61), 20, 30),
+        brn_norm= truncated(Normal(497.0, 160.0), 0.0, 1000),  # Normalization factor for BRN
+        delbrn_norm= truncated(Normal(33.0, 33.0), 0.0, 1000),  # Normalization factor for delBRN
+        ss_bkg_norm= truncated(Normal(3154.0, 25.0), 3000, 3500),  # Normalization factor for SS background
         )
 end
 
