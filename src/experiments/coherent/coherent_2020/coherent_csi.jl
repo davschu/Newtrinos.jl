@@ -32,15 +32,15 @@ function configure(physics)
     physics = (;physics.sns_flux, cevns_xsec)
     return COHERENT_CSI(
         physics = physics,
-        params = get_params(),
-        priors = get_priors(),
+        params = get_params(assets.ss_bkg_nom, assets.brn_nom, assets.nin_nom),
+        priors = get_priors(assets.ss_bkg_nom, assets.brn_nom, assets.nin_nom),
         assets = assets,
         forward_model = get_forward_model(physics, assets),
         plot = get_plot(physics, assets)
     )
 end
 
-function get_params()
+function get_params(ss_bkg_nom, brn_nom, nin_nom)
     params = (
         coherent_csi_eff_a = 1.32045,
         coherent_csi_eff_b = 0.285979,
@@ -50,14 +50,14 @@ function get_params()
         coherent_csi_qfa_b = 4.30681,
         coherent_csi_qfa_c = -111.707,
         coherent_csi_qfa_d = 840.384,
-        brn_norm= 18.4,  # Normalization factor for BRN
-        nin_norm= 5.6,  # Normalization factor for NIN
-        ss_bkg_norm= 1286.0,  # Normalization factor for SS background
+        brn_norm= brn_nom,  # Normalization factor for BRN
+        nin_norm= nin_nom,  # Normalization factor for NIN
+        ss_bkg_norm= ss_bkg_nom,  # Normalization factor for SS background
         )
 end
 
 # TODO!
-function get_priors()
+function get_priors(ss_bkg_nom, brn_nom, nin_nom)
     priors = (
         coherent_csi_eff_a = Normal(1.32045, 0.02),
         coherent_csi_eff_b = Normal(0.285979, 0.0006),
@@ -67,9 +67,9 @@ function get_priors()
         coherent_csi_qfa_b = Normal(4.30681, 0.79),
         coherent_csi_qfa_c = Normal(-111.707, 26.15),
         coherent_csi_qfa_d = Normal(840.384, 244.82),
-        brn_norm= truncated(Normal(18.4, 4.6), 0.0, 18.4 + 3 * 4.6),  # Normalization factor for BRN
-        nin_norm= truncated(Normal(5.6, 2.0), 0.0, 5.6 + 3 * 2.0),  # Normalization factor for NIN
-        ss_bkg_norm= truncated(Normal(1286.0, 27.0), 0.0, 1286.0 + 3 * 27.0),  # Normalization factor for SS background
+        brn_norm= truncated(Normal(brn_nom, 0.25 * brn_nom), 0.0, brn_nom + 3 * 0.25 * brn_nom),  # Normalization factor for BRN
+        nin_norm= truncated(Normal(nin_nom, 0.36 * nin_nom), 0.0, nin_nom + 3 * 0.36 * nin_nom),  # Normalization factor for NIN
+        ss_bkg_norm= truncated(Normal(ss_bkg_nom, 0.021 * ss_bkg_nom), 0.0, ss_bkg_nom + 3 * 0.021 * ss_bkg_nom),  # Normalization factor for SS background
         )
 end
 
@@ -77,7 +77,7 @@ function get_assets(physics, datadir = @__DIR__)
     @info "Loading coherent csi data"
 
 
-    er_edges = LinRange(3, 100, Int((100-3)/0.5)) # keV
+    er_edges = LinRange(3, 200, Int((200-3)/0.5)) # keV
     isotopes = [
         (fraction=0.49, mass=123.8e3, Z=55, N=78, Rn_key=:Rn_Cs, Rn_nom=5.7242),  # Cs-133
         (fraction=0.51, mass=118.21e3, Z=53, N=74, Rn_key=:Rn_I, Rn_nom=5.7242) # I-127
@@ -95,8 +95,8 @@ function get_assets(physics, datadir = @__DIR__)
     er_centers = midpoints(er_edges)
 
     pe_width = 5.0
-    out_edges = collect(2.5:pe_width:62.5)  # Bin edges: 5–60 PE, 5 PE width
-    out_centers = midpoints(out_edges) # Bin centers
+    out_edges = collect(2.5:pe_width:202.5)  # PE bin edges: [2.5, 7.5, 12.5, ..., 202.5]
+    out_centers = midpoints(out_edges) # Bin centers: [5, 10, 15, ..., 200]
 
     # For event lists (PE only, e.g. ssBkg, observed), use Helpers.bin
     ssBkg = Helpers.bin(ssBkg_df, out_edges; col=1)
@@ -105,6 +105,14 @@ function get_assets(physics, datadir = @__DIR__)
     # For PDFs (PE, count), use Helpers.rebin
     brnPE = Helpers.rebin(brnPE_df, out_edges; var_col=1, count_col=2)
     ninPE = Helpers.rebin(ninPE_df, out_edges; var_col=1, count_col=2)
+
+    # Get initial nominal value for Bkg normalizations
+    ss_bkg_nom = sum(ssBkg)
+    @info "Initial SS background normalization: $ss_bkg_nom"
+    brn_nom = sum(brnPE)
+    @info "Initial BRN background normalization: $brn_nom"
+    nin_nom = sum(ninPE)
+    @info "Initial NIN background normalization: $nin_nom"
 
     distance = 19.3 # m
     exposure = 13.99 # GWh
@@ -121,8 +129,11 @@ function get_assets(physics, datadir = @__DIR__)
         light_yield,
         resolution,
         brnPE,
+        brn_nom,
         ninPE,
+        nin_nom,
         ssBkg,
+        ss_bkg_nom,
         distance,
         exposure,
     )
