@@ -64,38 +64,51 @@ const gd = -(1/2) + 2*1/3*sw2
 const alph = 1/137
 const ep= (mpi^2-mmu^2)/(2*mpi)
 
+# Helm-like nuclear form factor squared, generic in type
 function ffsq(er, mn, rn)
     r0 = rn / 197.326963
     arg = 2 * mn * er
-    q = sqrt(max(arg, 0))
+    q = sqrt(max(arg, zero(arg)))                 # typed zero
     j1 = sphericalbesselj(1, q * r0)
-    ratio = ifelse.(q .* r0 .== 0, 1.0, (3 .* j1) ./ (q .* r0))
-    exp_factor = exp(-((q * (0.9/197.326963))^2) / 2)
+    denom = q * r0
+    # Use short-circuiting branch to avoid evaluating the division when denom == 0
+    ratio = iszero(denom) ? one(j1) : (3 * j1) / denom
+    exp_factor = exp(-((q * (0.9 / 197.326963))^2) / 2)
     return (ratio * exp_factor)^2
 end
 
+# Vectorized differential cross section dσ/dEr (n_er × n_enu), AD-safe
 function ds(er, enu, params, nupar, Rn_key)
     mN = nupar[2]
-    Z = nupar[3]
-    N = nupar[4]
+    Z  = nupar[3]
+    N  = nupar[4]
     rn = params[Rn_key]
-    # Vectorized implementation
-    er_grid = reshape(er, :, 1)      # (n_er, 1)
-    enu_grid = reshape(enu, 1, :)    # (1, n_enu)
-    C1d = (gf^2 / (4 * pi)) .* ffsq.(er, mN, rn)  # (n_er,)
+
+    # Per-Er prefactor (n_er,)
+    C1d = (gf^2 / (4 * pi)) .* ffsq.(er, mN, rn)
+
     qwsq = (N - (1 - 4 * sw2) * Z)^2
-    freepar_array = [params.cevns_xsec_a, params.cevns_xsec_b, params.cevns_xsec_c, params.cevns_xsec_d]
-    sm_pars = [1.0, -1.0, -1.0, 1.0]
-    coeffs = qwsq .* (freepar_array .+ sm_pars)
-    # Compute basis arrays for all (er, enu) pairs
-    base1 = ones(length(er), length(enu))
+
+    # SM deformation parameters as scalars; no tiny length-4 arrays needed
+    c1 = qwsq * (params.cevns_xsec_a + one(params.cevns_xsec_a))
+    c2 = qwsq * (params.cevns_xsec_b - one(params.cevns_xsec_b))
+    c3 = qwsq * (params.cevns_xsec_c - one(params.cevns_xsec_c))
+    c4 = qwsq * (params.cevns_xsec_d + one(params.cevns_xsec_d))
+
+    # Grids
+    er_grid  = reshape(er, :, 1)          # (n_er, 1)
+    enu_grid = reshape(enu, 1, :)         # (1, n_enu)
+
     base2 = er_grid ./ enu_grid
     base3 = mN .* er_grid ./ (2 .* enu_grid.^2)
     base4 = (er_grid.^2) ./ (enu_grid.^2)
-    xf = coeffs[1] .* base1 .+ coeffs[2] .* base2 .+ coeffs[3] .* base3 .+ coeffs[4] .* base4
-    heav = max.(xf, 0)
-    # C1d is (n_er,), broadcast over columns
-    res = C1d .* mN .* heav
+
+    xf = c1 .+ c2 .* base2 .+ c3 .* base3 .+ c4 .* base4
+    zxf = zero(eltype(xf))
+    heav = max.(xf, zxf)                  # type-stable clamp
+
+    # Broadcast C1d over columns, keep element type generic
+    res = (C1d .* mN) .* heav
     return res
 end
 
