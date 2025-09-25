@@ -41,9 +41,9 @@ function build_params_and_priors(isotopes)
         :cevns_xsec_d => 0.0,
     )
     prior_dict = Dict{Symbol, Distributions.Distribution}(
-        :cevns_xsec_a => Uniform(-1, 1),
-        :cevns_xsec_b => Uniform(-1000.0, 1000.0),
-        :cevns_xsec_c => Uniform(-1, 1),
+        :cevns_xsec_a => Uniform(-2, 2),
+        :cevns_xsec_b => Uniform(-2000.0, 2000.0),
+        :cevns_xsec_c => Uniform(-3, 3),
         :cevns_xsec_d => Uniform(-1e6, 1e6),
     )
     for iso in isotopes

@@ -300,6 +300,54 @@ function safe_merge(nt_list::NamedTuple...)
     sort_nt(merged)
 end
 
+
+
+
+
+
+
+
+struct Wrapper <: Newtrinos.Experiment
+    x::Newtrinos.Experiment
+    aliases::Dict{Symbol, Symbol}  # actual -> alias
+    translated_keys::Vector{Symbol} # translated field names
+    reverse_lookup::Dict{Symbol, Symbol} # alias -> actual
+end
+
+function Wrapper(x::Newtrinos.Experiment, aliases::Dict{Symbol, Symbol})
+    original_keys = keys(x.params)
+    translated_keys = [get(aliases, k, k) for k in original_keys]
+    reverse_lookup = Dict(value => key for (key, value) in aliases)
+    return Wrapper(x, aliases, translated_keys, reverse_lookup)
+end
+
+function Base.getproperty(wrapper::Wrapper, name::Symbol)
+    if name ∈ (:x, :original_keys, :translated_keys, :reverse_lookup)
+        return getfield(wrapper, name)
+    end
+    if name == :params
+        return NamedTuple{Tuple(wrapper.translated_keys)}(values(wrapper.x.params))
+    elseif name == :priors
+        return NamedTuple{Tuple(wrapper.translated_keys)}(values(wrapper.x.priors))
+    elseif name == :forward_model
+        function forward_model(params)
+            orig_param_names = Tuple([get(wrapper.reverse_lookup, k, k) for k in keys(params)])
+            orig_params = NamedTuple{orig_param_names}(values(params))
+            return wrapper.x.forward_model(orig_params)
+        end
+        return forward_model
+    elseif name == :plot
+        function plot(params, data=wrapper.x.assets.observed)
+            orig_param_names = Tuple([get(wrapper.reverse_lookup, k, k) for k in keys(params)])
+            orig_params = NamedTuple{orig_param_names}(values(params))
+            return wrapper.x.plot(orig_params, data)
+        end
+        return plot
+    else
+        return getfield(wrapper.x, name)
+    end
+end
+
 function get_priors(x::Newtrinos.Experiment)
     safe_merge(x.priors, get_priors(x.physics))
 end
