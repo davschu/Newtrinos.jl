@@ -256,9 +256,8 @@ function get_expected(params, physics, assets)
     response_matrix = construct_response_matrix(params, assets)
 
     flux = physics.sns_flux.flux(exposure = assets.exposure, distance = assets.distance, params = params)
-    dNdEr_all = nothing
 
-    for iso in assets.isotopes
+    function dNdEr(iso)
         nupar = [iso.fraction, iso.mass, iso.Z, iso.N]
         rate_matrix = build_rate_matrix(
             assets.er_centers .* 1e-3,  # MeV
@@ -268,13 +267,10 @@ function get_expected(params, physics, assets)
             params,
             iso.Rn_key,
         )
-        dNdEr = vec(sum(rate_matrix .* permutedims(flux.total_flux), dims = 2))
-        if dNdEr_all === nothing
-            dNdEr_all = zero.(dNdEr)   # correct element type (Dual when AD is on)
-        end
-        dNdEr_all .+= iso.fraction .* dNdEr
+        return iso.fraction .* vec(sum(rate_matrix .* permutedims(flux.total_flux), dims = 2))
     end
-
+    
+    dNdEr_all = sum([dNdEr(iso) for iso in assets.isotopes])
     dEr = diff(assets.er_edges .* 1e-3)           # MeV
     int_rate = assets.Nt .* dNdEr_all .* dEr
     predicted_counts = response_matrix * int_rate
