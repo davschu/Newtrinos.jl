@@ -12,7 +12,7 @@ using DataStructures
 using ADTypes
 using AutoDiffOperators
 using ContentHashes
-import ValueShapes
+using ValueShapes
 using FileIO
 using FillArrays
 import JLD2
@@ -301,10 +301,18 @@ function safe_merge(nt_list::NamedTuple...)
 end
 
 
-
-
-
-
+"""
+This function takes in a namedtuple of prior dists, and an array of vars that will be replaces by a Mv Dist `dist`
+"""
+function correlated_priors_vars(priors::NamedTuple, vars::Union{AbstractArray, Tuple}, dist::Distribution)
+    named_shapes = NamedTuple(var => ValueShapes.ScalarShape{Real}() for var in vars)
+    corr_prior = Returns(ValueShapes.ReshapedDist(dist, ValueShapes.NamedTupleShape(named_shapes)))
+    keys_to_keep = Tuple(k for k in keys(priors) if k ∉ vars)
+    other_prior =  distprod(;NamedTuple{keys_to_keep}(priors)...)
+    return corr_prior, other_prior
+    # the line below crashes the kernel :/ but if done outside the function it's happy
+    #return BAT.distbind(corr_prior, other_prior, merge)
+end
 
 
 struct Wrapper <: Newtrinos.Experiment
