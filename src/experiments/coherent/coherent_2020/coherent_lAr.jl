@@ -77,33 +77,43 @@ function get_assets(physics, datadir = @__DIR__)
     resolution = 0.58  # a/Eee and b*Eee
     # Import Data
     eff_data = CSV.read(joinpath(datadir, "lAr/CENNS10AnlAEfficiency.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: keVee, keVnr, efficiency
-    pbrn = CSV.read(joinpath(datadir, "lAr/brnpdf.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: keVee, F90, t, counts/bin/6.12GWh
-    delbrn = CSV.read(joinpath(datadir, "lAr/delbrnpdf.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: keVee, F90, t, counts/bin/6.12GWh
-    ss_bkg = CSV.read(joinpath(datadir, "lAr/bkgpdf.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: keVee, F90, t, counts/bin/6.12GWh
-    observed_df = CSV.read(joinpath(datadir, "lAr/datanobkgsub.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: keVee, F90, t, counts/bin/6.12GWh
-    
+    pbrn = CSV.read(joinpath(datadir, "lAr/brnpdf.txt"), DataFrame, comment="#", header=false, delim=' ')[:, 4] # columns: keVee, F90, t, counts/bin/6.12GWh
+    delbrn = CSV.read(joinpath(datadir, "lAr/delbrnpdf.txt"), DataFrame, comment="#", header=false, delim=' ')[:, 4] # columns: keVee, F90, t, counts/bin/6.12GWh
+    ss_bkg = CSV.read(joinpath(datadir, "lAr/bkgpdf.txt"), DataFrame, comment="#", header=false, delim=' ')[:, 4] # columns: keVee, F90, t, counts/bin/6.12GWh
+    observed = CSV.read(joinpath(datadir, "lAr/datanobkgsub.txt"), DataFrame, comment="#", header=false, delim=' ')[:, 4] # columns: keVee, F90, t, counts/bin/6.12GWh
+    f90_data = CSV.read(joinpath(datadir, "lAr/f90data1d.txt"), DataFrame, skipto=2, header=false, delim=' ') # columns: Bin Center (F_{90}), SS-Sub Data, etc.
+    timing_data = CSV.read(joinpath(datadir, "lAr/timingdata1d.txt"), DataFrame, skipto=2, header=false, delim=' ') # columns: Bin Center (F_{90}), SS-Sub Data, etc.
+
+    # Extract and normalize the 4th column (CEvNS PDF) from f90data1d.txt
+    f90_pdf = f90_data[:, 4]  # Extract the 4th column
+    f90_pdf .= f90_pdf ./ sum(f90_pdf)  # Normalize the PDF in place
+
+    # Extract and normalize the 4th column (CEvNS PDF) from timingdata1d.txt
+    timing_pdf = timing_data[:, 4]  # Extract the 4th column
+    timing_pdf .= timing_pdf ./ sum(timing_pdf)  # Normalize the PDF in place
+
     # Define bin centers as the average of consecutive edges
     er_centers = collect((er_edges[1:end-1] + er_edges[2:end]) ./ 2) # Reconstruct bin centers from edges
 
-    # Match data: output bin centers 5, 15, 25, ..., 55
+    # Output bin centers [keVee] (Match Data)
     out_width = 10.0
     out_edges = collect(0.0:out_width:120.0)         # Edges: [0, 10, 20, ..., 120]
     out_centers = midpoints(out_edges)              # Centers: [5, 15, 25, ..., 115]
-    
-    # Bin observed data into out_centers using Helpers.rebin
-    observed = Helpers.rebin(observed_df, out_edges; var_col=1, count_col=4)
 
-    # Bin background PDFs ONCE
-    pbrn_binned = Helpers.rebin(pbrn, out_edges; var_col=1, count_col=4)
-    delbrn_binned = Helpers.rebin(delbrn, out_edges; var_col=1, count_col=4)
-    ss_bkg_binned = Helpers.rebin(ss_bkg, out_edges; var_col=1, count_col=4)
+    # Extract F90 and timing bin centers from the first column of f90data1d.txt and timingdata1d.txt
+    f90_centers = f90_data[:, 1]  # Bin Center (F_{90})
+    timing_centers = timing_data[:, 1]  # Bin Center (Timing)
+
     # Get initial nominal value for Bkg normalizations
-    ss_bkg_nom = sum(ss_bkg_binned)
+    ss_bkg_nom = sum(ss_bkg)  # Sum over the last column (counts) of ss_bkg
     @info "Initial SS background normalization: $ss_bkg_nom"
-    pbrn_nom = sum(pbrn_binned)
+
+    pbrn_nom = sum(pbrn)  # Sum over the last column (counts) of pbrn
     @info "Initial BRN background normalization: $pbrn_nom"
-    delbrn_nom = sum(delbrn_binned)
+
+    delbrn_nom = sum(delbrn)  # Sum over the last column (counts) of delbrn
     @info "Initial delBRN background normalization: $delbrn_nom"
+    
     distance = 27.5 # m
     exposure = 6.12 # GWh
 
@@ -113,15 +123,19 @@ function get_assets(physics, datadir = @__DIR__)
         er_edges,
         er_centers,
         out_centers,
+        f90_centers,
+        timing_centers,
         isotopes,
         Nt,
         resolution,
         eff_data,
-        pbrn_binned,
+        f90_pdf,
+        timing_pdf,
+        pbrn,
         pbrn_nom,
-        delbrn_binned,
+        delbrn,
         delbrn_nom,
-        ss_bkg_binned,
+        ss_bkg,
         ss_bkg_nom,
         distance,
         exposure,
@@ -211,6 +225,7 @@ function build_rate_matrix(er_centers, enu_centers, nupar, physics, params, Rn_k
 end
 
 function get_expected(params, physics, assets)
+    # Step 1: Compute the 1D predicted counts
     response_matrix = construct_response_matrix(params, assets)
     flux = physics.sns_flux.flux(exposure = assets.exposure, distance = assets.distance, params = params)
 
@@ -235,7 +250,31 @@ function get_expected(params, physics, assets)
     dEr = diff(assets.er_edges .* 1e-3)  # MeV
     int_rate = params.coherent_lar_mass .* assets.Nt .* dNdEr_all .* dEr
     predicted_counts = response_matrix * int_rate
-    return predicted_counts
+
+    # Step 2: Break the 1D predicted counts into f90-bin and time-bin counts
+    f90_pdf = assets.f90_pdf  # Normalized f90 PDF
+    timing_pdf = assets.timing_pdf  # Normalized timing PDF
+
+    n_out_bins = length(predicted_counts)  # Number of out_center bins
+    n_f90_bins = length(f90_pdf)  # Number of f90 bins
+    n_time_bins = length(timing_pdf)  # Number of time bins
+
+    # Initialize the final array with the same type as `predicted_counts`
+    expanded_counts = similar(predicted_counts, n_out_bins * n_f90_bins * n_time_bins)
+
+    # Loop over each out_center bin and distribute counts
+    idx = 1
+    for i in 1:n_out_bins
+        for j in 1:n_f90_bins
+            for k in 1:n_time_bins
+                # Compute the weight for each bin
+                expanded_counts[idx] = predicted_counts[i] * f90_pdf[j] * timing_pdf[k]
+                idx += 1
+            end
+        end
+    end
+
+    return expanded_counts
 end
 
 function get_backgrounds(params, assets)
@@ -243,9 +282,17 @@ function get_backgrounds(params, assets)
         sum(template) > 0 ?
             norm .* (template ./ sum(template)) :
             fill(zero(norm), length(template))
-    pbrn = scale_template(assets.pbrn_binned, params.pbrn_norm)
-    delbrn = scale_template(assets.delbrn_binned, params.delbrn_norm)
-    ss_bkg = scale_template(assets.ss_bkg_binned, params.ss_bkg_norm)
+
+    # Extract the last column (counts) from the 3D binned data
+    pbrn_counts = assets.pbrn
+    delbrn_counts = assets.delbrn
+    ss_bkg_counts = assets.ss_bkg
+
+    # Scale the templates
+    pbrn = scale_template(pbrn_counts, params.pbrn_norm)
+    delbrn = scale_template(delbrn_counts, params.delbrn_norm)
+    ss_bkg = scale_template(ss_bkg_counts, params.ss_bkg_norm)
+
     return (pbrn, delbrn, ss_bkg)
 end
 
