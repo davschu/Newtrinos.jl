@@ -323,7 +323,7 @@ struct Wrapper <: Newtrinos.Experiment
 end
 
 function Wrapper(x::Newtrinos.Experiment, aliases::Dict{Symbol, Symbol})
-    original_keys = keys(x.params)
+    original_keys = keys(get_params(x))
     translated_keys = [get(aliases, k, k) for k in original_keys]
     reverse_lookup = Dict(value => key for (key, value) in aliases)
     return Wrapper(x, aliases, translated_keys, reverse_lookup)
@@ -333,27 +333,27 @@ function Base.getproperty(wrapper::Wrapper, name::Symbol)
     if name ∈ (:x, :original_keys, :translated_keys, :reverse_lookup)
         return getfield(wrapper, name)
     end
-    if name == :params
-        return NamedTuple{Tuple(wrapper.translated_keys)}(values(wrapper.x.params))
-    elseif name == :priors
-        return NamedTuple{Tuple(wrapper.translated_keys)}(values(wrapper.x.priors))
-    elseif name == :forward_model
+    if name == :forward_model
         function forward_model(params)
             orig_param_names = Tuple([get(wrapper.reverse_lookup, k, k) for k in keys(params)])
             orig_params = NamedTuple{orig_param_names}(values(params))
             return wrapper.x.forward_model(orig_params)
         end
         return forward_model
-    elseif name == :plot
+    end
+    if name == :plot
         function plot(params, data=wrapper.x.assets.observed)
             orig_param_names = Tuple([get(wrapper.reverse_lookup, k, k) for k in keys(params)])
             orig_params = NamedTuple{orig_param_names}(values(params))
             return wrapper.x.plot(orig_params, data)
         end
         return plot
-    else
-        return getfield(wrapper.x, name)
     end
+    return getfield(wrapper.x, name)
+end
+
+function get_priors(w::Newtrinos.Wrapper)
+    NamedTuple{Tuple(w.translated_keys)}(values(get_priors(w.x)))
 end
 
 function get_priors(x::Newtrinos.Experiment)
@@ -362,6 +362,10 @@ end
 
 function get_priors(x::Newtrinos.Physics)
     sort_nt(x.priors)
+end
+
+function get_params(w::Newtrinos.Wrapper)
+    NamedTuple{Tuple(w.translated_keys)}(values(get_params(w.x)))
 end
 
 function get_params(x::Newtrinos.Experiment)
