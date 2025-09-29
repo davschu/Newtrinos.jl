@@ -9,6 +9,8 @@ ToDos:
 - DIS xsec
 - GENIE xsecs
 - DEAMON flux?
+- enough energy bins??
+- NC norm is fucked.....probably needs 1/3 applied or so
 """
 
 using LinearAlgebra
@@ -195,10 +197,10 @@ function gather_flux(p_flux, ef, cf, j)
 end
 
 # Function that should NOT allocate
-function gather_flux_nc(p_flux, ef, cf)
-    result = Vector{eltype(p_flux)}(undef, length(ef))
+function gather_flux_nc(s_flux, ef, cf)
+    result = Vector{eltype(s_flux)}(undef, length(ef))
     @inbounds for i in eachindex(ef)
-        result[i] = p_flux[ef[i], cf[i]]
+        result[i] = s_flux[ef[i], cf[i]] / 3
     end
     result
 end
