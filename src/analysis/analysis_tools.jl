@@ -21,6 +21,8 @@ using FunctionChains
 using Accessors
 using Logging
 using ProgressMeter
+using Dates
+using LibGit2
 using ..Newtrinos
 
 adsel = AutoForwardDiff()
@@ -29,6 +31,7 @@ set_batcontext(ad = adsel)
 @kwdef struct NewtrinosResult
     axes::NamedTuple
     values::NamedTuple
+    meta::Dict = Dict()
 end
 
 function build_optimizationfunction(f, adsel::AutoDiffOperators.ADSelector)
@@ -200,9 +203,19 @@ function _profile(likelihood, scanpoints, params, cache_dir)
     NamedTuple(s)
 end
 
+function add_meta!(meta)
+    meta["hostname"] = gethostname()
+    meta["username"] = get(ENV, "USER", get(ENV, "USERNAME", "unknown"))
+    meta["date"] = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+    repo = dirname(dirname(pathof(Newtrinos)))
+    meta["repo"] = repo
+    meta["commit_hash"] = LibGit2.head(repo)
+    meta["repo_clean"] = !LibGit2.isdirty(LibGit2.GitRepo(repo))
+end
+
 "Run Profile llh scan"
 function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
-
+    t1 = time()
     #check if there is actually any variable to be profiled over, or if they all or just Numbers
     if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
         # so all variables are just numbers and it reduces to a simple scan
@@ -216,14 +229,16 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
         end
     end
     res = _profile(likelihood, scanpoints, params, cache_dir)
-
+    t2 = time()
+    meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
+    add_meta!(meta)
     axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
-    result = NewtrinosResult(axes=axes, values=res)
-
+    result = NewtrinosResult(axes=axes, values=res, meta=meta)
 end
 
 "Run simple llh scan"
 function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
+    t1 = time()
     vars = collect(keys(vars_to_scan))
     values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
     mesh = collect(IterTools.product(values...))
@@ -262,10 +277,11 @@ function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
     s[:llh] = llhs
     s[:log_posterior] = llhs
     res = NamedTuple(s)
-
+    t2 = time()
+    meta = Dict("task"=>"scan", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1,)
+    add_meta!(meta)
     axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
-    result = NewtrinosResult(axes=axes, values=res)
-    
+    result = NewtrinosResult(axes=axes, values=res, meta=meta)
 end
 
 function bestfit(result::NewtrinosResult)
@@ -397,6 +413,25 @@ end
 
 function generate_likelihood(experiments::NamedTuple, observed=get_observed(experiments))
     likelihoodof(get_fwd_model(experiments), observed)
+end
+
+
+function condition(priors::NamedTuple, conditional_vars::AbstractArray, p)
+    for var in conditional_vars
+        @reset priors[var] = p[var]
+    end
+    priors
+end
+
+function condition(priors::NamedTuple, conditional_vars::AbstractDict, p)
+    for var in keys(conditional_vars)
+        if isnothing(conditional_vars[var])
+            @reset priors[var] = p[var]
+        else
+            @reset priors[var] = conditional_vars[var]
+        end
+    end
+    priors
 end
 
 function generate_toy_data(experiment::Newtrinos.Experiment, params::NamedTuple)

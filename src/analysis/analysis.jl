@@ -119,25 +119,12 @@ p = Newtrinos.get_params(experiments)
 priors = Newtrinos.get_priors(experiments)
 
 
-function condition(priors::NamedTuple, conditional_vars::AbstractArray, p)
-    for var in conditional_vars
-        @reset priors[var] = p[var]
-    end
-    priors
-end
 
-function condition(priors::NamedTuple, conditional_vars::AbstractDict, p)
-    for var in keys(conditional_vars)
-        if isnothing(conditional_vars[var])
-            @reset priors[var] = p[var]
-        else
-            @reset priors[var] = conditional_vars[var]
-        end
-    end
-    priors
-end
 
-priors = condition(priors, conditional_vars, p)
+priors = Newtrinos.condition(priors, conditional_vars, p)
+
+@reset priors.Δm²₃₁ = Uniform(0.0022, 0.0028)
+@reset priors.θ₂₃ = Uniform(pi/4-0.15, pi/4+0.15)
     
 if lowercase(args["task"]) == "nestedsampling"
     #import NestedSamplers
