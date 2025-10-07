@@ -19,8 +19,8 @@ physics = (; osc, xsec)
 experiments = (minos = Newtrinos.minos.configure(physics),)
 
 vars_to_scan = OrderedDict()
-vars_to_scan[:θ₂₃] = 11
-vars_to_scan[:Δm²₃₁] = 11
+vars_to_scan[:θ₂₃] = 21
+vars_to_scan[:Δm²₃₁] = 21
 
 likelihood = Newtrinos.generate_likelihood(experiments);
 
@@ -31,6 +31,7 @@ priors = Newtrinos.get_priors(experiments)
 @reset priors.θ₁₂ = p.θ₁₂
 @reset priors.δCP = p.δCP
 @reset priors.nc_norm = p.nc_norm
+@reset priors.θ₁₃ = Truncated(Normal(0.156, 0.008), 0.13, 0.18)
 
 result = Newtrinos.profile(likelihood, priors, vars_to_scan, p, cache_dir="test")
 
