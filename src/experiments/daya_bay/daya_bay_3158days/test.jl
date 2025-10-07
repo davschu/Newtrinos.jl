@@ -38,11 +38,11 @@ priors = Newtrinos.get_priors(experiments)
 
 result = Newtrinos.profile(likelihood, priors, vars_to_scan, p, cache_dir="test")
 
-if !isdir("test")
-    mkdir("test")
+if !isdir("test_output")
+    mkdir("test_output")
 end
 
-FileIO.save("test/test.jld2", Dict("result" => result))
+FileIO.save("test_output/test.jld2", Dict("result" => result))
 
 converted = Newtrinos.NewtrinosResult(axes = (sin22theta13 = sin.(2*result.axes.θ₁₃).^2, Δm²₃₂ = result.axes.Δm²₃₁ .- p.Δm²₂₁), values=result.values);
 official_raw = CSV.read("DayaBay_DeltaChiSq_NO_3158days.txt", DataFrame, skipto=10, delim=" ", header=["sin22theta13", "Dm232", "Deltachi2"], ignorerepeated=true)
@@ -58,20 +58,20 @@ plot!(ax, official, levels=1 .- 2*ccdf(Normal(), 1:3), label="official", color=:
 ax.xlabel = "sin²2θ₁₃"
 ax.ylabel = "Δm²₃₂ (eV²)"
 axislegend(ax)
-save("test/contours.png", fig)
+save("test_output/contours.png", fig)
 
 bestfit = Newtrinos.bestfit(result)
 
 
 fig = experiments.dayabay.plot(bestfit)
-save("test/datamc.png", fig)
+save("test_output/datamc.png", fig)
 
 open("README.md", "w") do io
     write(io, "# DayaBay\n ## Resources\n")
     write(io, "Data from supplemental files on https://arxiv.org/abs/2211.14988\n\n")
     write(io, "\n## Test output plots\n")
-    write(io, "![Comparison](test/contours.png)\n")
-    write(io, "![DataMC](test/datamc.png)\n")
+    write(io, "![Comparison](test_output/contours.png)\n")
+    write(io, "![DataMC](test_output/datamc.png)\n")
     write(io, "## Meta Information\n")
     for (key, value) in result.meta
         write(io, "- **$(key)**: $(value)\n")
