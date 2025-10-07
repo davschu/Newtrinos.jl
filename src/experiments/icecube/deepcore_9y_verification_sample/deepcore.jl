@@ -337,8 +337,8 @@ function get_plot(physics, assets)
             ax.xticksvisible = true
             ax.xlabel="cos(zenith)"
         end
-        fig.content[1].title = "Cascades"
-        fig.content[9].title = "Tracks"
+        fig.content[1].title = "Mixed"
+        fig.content[11].title = "Tracks"
         rowgap!(fig.layout, 0)
         fig
     end
