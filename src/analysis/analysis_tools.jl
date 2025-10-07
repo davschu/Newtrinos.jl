@@ -226,7 +226,7 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
     if !isnothing(cache_dir)
         if isdir(cache_dir)
             while true
-                print("Cache dir $(cache_dir) is not empty and results may be reused; continue? [y/n]: ")
+                print("Cache dir `$(cache_dir)` exists and results may be reused; continue? [y/n]: ")
                 answer = readline(stdin)
                 if lowercase(answer) in ["y", "yes"]
                     break

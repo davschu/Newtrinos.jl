@@ -31,6 +31,7 @@ priors = Newtrinos.get_priors(experiments)
 @reset priors.θ₁₂ = p.θ₁₂
 @reset priors.δCP = p.δCP
 @reset priors.nc_norm = p.nc_norm
+@reset priors.nutau_cc_norm = p.nutau_cc_norm
 @reset priors.θ₁₃ = Truncated(Normal(0.156, 0.008), 0.13, 0.18)
 
 result = Newtrinos.profile(likelihood, priors, vars_to_scan, p, cache_dir="test")
@@ -50,7 +51,7 @@ ax = Axis(fig[1,1])
 ax.title = "MINOS/MINOS+ NO 68%, 90% C.L. contours"
 plot!(ax, converted, levels=[0.68, 0.9], label="ours")
 
-lines!(ax, vcat(official.X, official.X[[1]]), vcat(official.Y, official.Y[[1]]), color=:red, label="official")
+lines!(ax, vcat(official.X, official.X[[1]]), vcat(official.Y, official.Y[[1]]), color=:red, label="official (slightly different analysis)")
 lines!(ax, Float32.(vcat(official.X_1[1:end-1], official.X_1[[1]])), Float32.(vcat(official.Y_1[1:end-1], official.Y_1[[1]])), color=:red)
 
 ax.xlabel = "sin²θ₂₃"
