@@ -8,6 +8,7 @@ using HDF5
 using StatsBase
 using CairoMakie
 using BAT
+using Printf
 using ..Newtrinos
 
 @kwdef struct ORCA <: Newtrinos.Experiment
@@ -16,7 +17,7 @@ using ..Newtrinos
     priors::NamedTuple
     assets::NamedTuple
     forward_model::Function
-    #plot::Function
+    plot::Function
 end
 
 function configure(physics)
@@ -28,7 +29,7 @@ function configure(physics)
         priors = get_priors(),
         assets = assets,
         forward_model = get_forward_model(physics, assets),
-        #plot = get_plot(physics, assets)
+        plot = get_plot(physics, assets)
     )
 end
 
@@ -188,7 +189,48 @@ function get_forward_model(physics, assets)
     end
 end
 
+function get_plot(physics, assets)
 
+    function plot(params, data=assets.observed)
+        expected = get_expected(params, physics, assets)
+    
+        fig = Figure(size=(1000, 800))
+
+        channels = [:hpt, :lpt, :showers]
+
+        cz_bin_edges = assets.binning.cz_reco_edges[1:11]
+        
+        for j in 1:3
+            key = channels[j]
+            for i in 1:15
+                ax = Axis(fig[i,j], yticklabelsize=10)
+                if i > size(expected[key])[1] continue end
+                stephist!(ax, midpoints(cz_bin_edges), bins=cz_bin_edges, weights=expected[key][i, :])
+                scatter!(ax, midpoints(cz_bin_edges), data[key][i, :], color=:black)
+                ax.xticksvisible = false
+                ax.xticklabelsvisible = false
+                ax.xlabel = ""
+                up = maximum((maximum(data[key][i, :]), maximum(expected[key][i, :]))) * 1.2
+                ylims!(ax, 0, up)
+                e_low = assets.binning.e_reco_edges[i]
+                e_high = assets.binning.e_reco_edges[i+1]
+                text!(ax, 0.5, 0, text=@sprintf("E in [%.1f, %.1f] GeV", e_low, e_high), align = (:center, :bottom), space = :relative)
+            end
+        end
+        for i in [15, 30, 45]
+            ax = fig.content[i]
+            ax.xticklabelsvisible = true
+            ax.xticksvisible = true
+            ax.xlabel="cos(zenith)"
+        end
+        fig.content[1].title = "High-purity Tracks"
+        fig.content[16].title = "Low-purity Tracks"
+        fig.content[31].title = "Showers"
+        rowgap!(fig.layout, 0)
+        linkxaxes!(fig.content...)
+        fig
+    end
+end
 
 end
 

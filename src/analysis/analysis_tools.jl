@@ -224,7 +224,17 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
     
     values, scanpoints = generate_scanpoints(vars_to_scan, priors)
     if !isnothing(cache_dir)
-        if !isdir(cache_dir)
+        if isdir(cache_dir)
+            while true
+                print("Cache dir $(cache_dir) is not empty and results may be reused; continue? [y/n]: ")
+                answer = readline(stdin)
+                if lowercase(answer) in ["y", "yes"]
+                    break
+                else
+                    exit()
+                end
+            end
+        else
             mkdir(cache_dir)
         end
     end
