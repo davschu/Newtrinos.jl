@@ -20,8 +20,8 @@ physics = (; osc,)
 experiments = (dayabay = Newtrinos.dayabay.configure(physics),)
 
 vars_to_scan = OrderedDict()
-vars_to_scan[:θ₁₃] = 11
-vars_to_scan[:Δm²₃₁] = 11
+vars_to_scan[:θ₁₃] = 31
+vars_to_scan[:Δm²₃₁] = 31
 
 likelihood = Newtrinos.generate_likelihood(experiments);
 
