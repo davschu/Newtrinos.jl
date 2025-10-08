@@ -475,7 +475,7 @@ function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTup
     
     asimov_data_flt = mean(dist_obj)
     
-    if dist_obj isa Product && !isempty(dist_obj.v) && first(dist_obj.v) isa Distributions.Poisson
+    if dist_obj isa Distributions.ProductDistribution && !isempty(dist_obj.dists) && first(dist_obj.dists) isa Distributions.Poisson
         @info "Poisson-based model. Rounding Asimov data to nearest integer."
         return round.(Int, asimov_data_flt)    
     else  
@@ -486,25 +486,9 @@ function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTup
 end
 
 function generate_asimov_data(experiments::NamedTuple, params::NamedTuple)
-    
     final_data = map(experiments) do experiment
-    
-        model = experiment.forward_model
-        dist_obj = model(params)
-        
-        asimov_data_flt = mean(dist_obj)
-
-        if dist_obj isa Product && !isempty(dist_obj.v) && first(dist_obj.v) isa Distributions.Poisson
-            @info "Poisson-based model. Rounding Asimov data to nearest integer."
-            round.(Int, asimov_data_flt) 
-        else
-            @info "Not Poisson-based model. Returning std floating-point Asimov data."
-            asimov_data_flt   
-        end
-        
-    end
-    
+        generate_asimov_data(experiment, params) 
+    end    
     return final_data
-    
 end
    
