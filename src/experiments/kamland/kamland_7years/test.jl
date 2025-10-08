@@ -21,8 +21,8 @@ physics = (; osc,)
 experiments = (kamland = Newtrinos.kamland.configure(physics),)
 
 vars_to_scan = OrderedDict()
-vars_to_scan[:θ₁₂] = 11
-vars_to_scan[:Δm²₂₁] = 11
+vars_to_scan[:θ₁₂] = 21
+vars_to_scan[:Δm²₂₁] = 21
 
 likelihood = Newtrinos.generate_likelihood(experiments);
 
