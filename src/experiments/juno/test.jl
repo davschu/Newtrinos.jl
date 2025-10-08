@@ -106,8 +106,8 @@ ax.xlabel = "sin²θ₁₃"
 axislegend(ax)
 save("test_output/theta13.png", fig)
 
-#fig = experiments.juno.plot(p, asimov.juno)
-#save("test_output/speactrum.png", fig)
+fig = experiments.juno.plot(p, data_to_plot=asimov.juno)
+save("test_output/spectrum.png", fig)
 
 open("README.md", "w") do io
     write(io, "# JUNO\n ## Resources\n")
@@ -117,7 +117,7 @@ open("README.md", "w") do io
     write(io, "![Comparison](test_output/dm21.png)\n")
     write(io, "![Comparison](test_output/theta12.png)\n")
     write(io, "![Comparison](test_output/theta13.png)\n")
-    #write(io, "![Comparison](test_output/spectrum.png)\n")
+    write(io, "![Comparison](test_output/spectrum.png)\n")
     write(io, "## Meta Information\n")
     for (key, value) in result.meta
         write(io, "- **$(key)**: $(value)\n")
