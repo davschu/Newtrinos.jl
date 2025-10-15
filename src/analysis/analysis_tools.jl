@@ -12,7 +12,7 @@ using DataStructures
 using ADTypes
 using AutoDiffOperators
 using ContentHashes
-import ValueShapes
+using ValueShapes
 using FileIO
 using FillArrays
 import JLD2
@@ -21,6 +21,8 @@ using FunctionChains
 using Accessors
 using Logging
 using ProgressMeter
+using Dates
+using LibGit2
 using ..Newtrinos
 
 adsel = AutoForwardDiff()
@@ -29,6 +31,7 @@ set_batcontext(ad = adsel)
 @kwdef struct NewtrinosResult
     axes::NamedTuple
     values::NamedTuple
+    meta::Dict = Dict()
 end
 
 function build_optimizationfunction(f, adsel::AutoDiffOperators.ADSelector)
@@ -200,9 +203,19 @@ function _profile(likelihood, scanpoints, params, cache_dir)
     NamedTuple(s)
 end
 
+function add_meta!(meta)
+    meta["hostname"] = gethostname()
+    meta["username"] = get(ENV, "USER", get(ENV, "USERNAME", "unknown"))
+    meta["date"] = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+    repo = dirname(dirname(pathof(Newtrinos)))
+    meta["repo"] = repo
+    meta["commit_hash"] = LibGit2.head(repo)
+    meta["repo_clean"] = !LibGit2.isdirty(LibGit2.GitRepo(repo))
+end
+
 "Run Profile llh scan"
 function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
-
+    t1 = time()
     #check if there is actually any variable to be profiled over, or if they all or just Numbers
     if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
         # so all variables are just numbers and it reduces to a simple scan
@@ -211,19 +224,31 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
     
     values, scanpoints = generate_scanpoints(vars_to_scan, priors)
     if !isnothing(cache_dir)
-        if !isdir(cache_dir)
+        if isdir(cache_dir)
+            while true
+                print("Cache dir `$(cache_dir)` exists and results may be reused; continue? [y/n]: ")
+                answer = readline(stdin)
+                if lowercase(answer) in ["y", "yes"]
+                    break
+                else
+                    exit()
+                end
+            end
+        else
             mkdir(cache_dir)
         end
     end
     res = _profile(likelihood, scanpoints, params, cache_dir)
-
+    t2 = time()
+    meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
+    add_meta!(meta)
     axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
-    result = NewtrinosResult(axes=axes, values=res)
-
+    result = NewtrinosResult(axes=axes, values=res, meta=meta)
 end
 
 "Run simple llh scan"
 function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
+    t1 = time()
     vars = collect(keys(vars_to_scan))
     values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
     mesh = collect(IterTools.product(values...))
@@ -262,10 +287,11 @@ function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
     s[:llh] = llhs
     s[:log_posterior] = llhs
     res = NamedTuple(s)
-
+    t2 = time()
+    meta = Dict("task"=>"scan", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1,)
+    add_meta!(meta)
     axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
-    result = NewtrinosResult(axes=axes, values=res)
-    
+    result = NewtrinosResult(axes=axes, values=res, meta=meta)
 end
 
 function bestfit(result::NewtrinosResult)
@@ -301,10 +327,18 @@ function safe_merge(nt_list::NamedTuple...)
 end
 
 
-
-
-
-
+"""
+This function takes in a namedtuple of prior dists, and an array of vars that will be replaces by a Mv Dist `dist`
+"""
+function correlated_priors_vars(priors::NamedTuple, vars::Union{AbstractArray, Tuple}, dist::Distribution)
+    named_shapes = NamedTuple(var => ValueShapes.ScalarShape{Real}() for var in vars)
+    corr_prior = Returns(ValueShapes.ReshapedDist(dist, ValueShapes.NamedTupleShape(named_shapes)))
+    keys_to_keep = Tuple(k for k in keys(priors) if k ∉ vars)
+    other_prior =  distprod(;NamedTuple{keys_to_keep}(priors)...)
+    return corr_prior, other_prior
+    # the line below crashes the kernel :/ but if done outside the function it's happy
+    #return BAT.distbind(corr_prior, other_prior, merge)
+end
 
 
 struct Wrapper <: Newtrinos.Experiment
@@ -315,7 +349,7 @@ struct Wrapper <: Newtrinos.Experiment
 end
 
 function Wrapper(x::Newtrinos.Experiment, aliases::Dict{Symbol, Symbol})
-    original_keys = keys(x.params)
+    original_keys = keys(get_params(x))
     translated_keys = [get(aliases, k, k) for k in original_keys]
     reverse_lookup = Dict(value => key for (key, value) in aliases)
     return Wrapper(x, aliases, translated_keys, reverse_lookup)
@@ -325,27 +359,27 @@ function Base.getproperty(wrapper::Wrapper, name::Symbol)
     if name ∈ (:x, :original_keys, :translated_keys, :reverse_lookup)
         return getfield(wrapper, name)
     end
-    if name == :params
-        return NamedTuple{Tuple(wrapper.translated_keys)}(values(wrapper.x.params))
-    elseif name == :priors
-        return NamedTuple{Tuple(wrapper.translated_keys)}(values(wrapper.x.priors))
-    elseif name == :forward_model
+    if name == :forward_model
         function forward_model(params)
             orig_param_names = Tuple([get(wrapper.reverse_lookup, k, k) for k in keys(params)])
             orig_params = NamedTuple{orig_param_names}(values(params))
             return wrapper.x.forward_model(orig_params)
         end
         return forward_model
-    elseif name == :plot
+    end
+    if name == :plot
         function plot(params, data=wrapper.x.assets.observed)
             orig_param_names = Tuple([get(wrapper.reverse_lookup, k, k) for k in keys(params)])
             orig_params = NamedTuple{orig_param_names}(values(params))
             return wrapper.x.plot(orig_params, data)
         end
         return plot
-    else
-        return getfield(wrapper.x, name)
     end
+    return getfield(wrapper.x, name)
+end
+
+function get_priors(w::Newtrinos.Wrapper)
+    NamedTuple{Tuple(w.translated_keys)}(values(get_priors(w.x)))
 end
 
 function get_priors(x::Newtrinos.Experiment)
@@ -354,6 +388,10 @@ end
 
 function get_priors(x::Newtrinos.Physics)
     sort_nt(x.priors)
+end
+
+function get_params(w::Newtrinos.Wrapper)
+    NamedTuple{Tuple(w.translated_keys)}(values(get_params(w.x)))
 end
 
 function get_params(x::Newtrinos.Experiment)
@@ -387,6 +425,25 @@ function generate_likelihood(experiments::NamedTuple, observed=get_observed(expe
     likelihoodof(get_fwd_model(experiments), observed)
 end
 
+
+function condition(priors::NamedTuple, conditional_vars::AbstractArray, p)
+    for var in conditional_vars
+        @reset priors[var] = p[var]
+    end
+    priors
+end
+
+function condition(priors::NamedTuple, conditional_vars::AbstractDict, p)
+    for var in keys(conditional_vars)
+        if isnothing(conditional_vars[var])
+            @reset priors[var] = p[var]
+        else
+            @reset priors[var] = conditional_vars[var]
+        end
+    end
+    priors
+end
+
 function generate_toy_data(experiment::Newtrinos.Experiment, params::NamedTuple)
     
     model = experiment.forward_model
@@ -418,7 +475,7 @@ function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTup
     
     asimov_data_flt = mean(dist_obj)
     
-    if dist_obj isa Product && !isempty(dist_obj.v) && first(dist_obj.v) isa Distributions.Poisson
+    if dist_obj isa Distributions.ProductDistribution && !isempty(dist_obj.dists) && first(dist_obj.dists) isa Distributions.Poisson
         @info "Poisson-based model. Rounding Asimov data to nearest integer."
         return round.(Int, asimov_data_flt)    
     else  
@@ -429,25 +486,9 @@ function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTup
 end
 
 function generate_asimov_data(experiments::NamedTuple, params::NamedTuple)
-    
     final_data = map(experiments) do experiment
-    
-        model = experiment.forward_model
-        dist_obj = model(params)
-        
-        asimov_data_flt = mean(dist_obj)
-
-        if dist_obj isa Product && !isempty(dist_obj.v) && first(dist_obj.v) isa Distributions.Poisson
-            @info "Poisson-based model. Rounding Asimov data to nearest integer."
-            round.(Int, asimov_data_flt) 
-        else
-            @info "Not Poisson-based model. Returning std floating-point Asimov data."
-            asimov_data_flt   
-        end
-        
-    end
-    
+        generate_asimov_data(experiment, params) 
+    end    
     return final_data
-    
 end
    

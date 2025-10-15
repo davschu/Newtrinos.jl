@@ -73,11 +73,9 @@ context = set_batcontext(ad = adsel)
 name = args["name"]
 
 osc_cfg = Newtrinos.osc.OscillationConfig(
-    flavour=Newtrinos.osc.Darkdim_Masses(three_flavour=Newtrinos.osc.ThreeFlavour(ordering=Symbol(args["ordering"]))),
-    #propagation=Newtrinos.osc.Basic(),
-    propagation=Newtrinos.osc.Damping(σₑ=0.05),
-    #states=Newtrinos.osc.All(),
-    states=Newtrinos.osc.Cut(cutoff=10.),
+    flavour=Newtrinos.osc.ThreeFlavour(ordering=Symbol(args["ordering"])),
+    propagation=Newtrinos.osc.Basic(),
+    states=Newtrinos.osc.All(),
     interaction=Newtrinos.osc.SI()
     )
 osc = Newtrinos.osc.configure(osc_cfg)
@@ -99,18 +97,18 @@ physics = (; osc, atm_flux, earth_layers, xsec);
 experiments = configure_experiments(args["experiments"], physics)
 
 # Variables to condition on (=fix)
-#conditional_vars = [:θ₁₂, :θ₁₃, :δCP, :Δm²₂₁, :nutau_cc_norm]
+conditional_vars = [:θ₁₂, :θ₁₃, :δCP, :Δm²₂₁, :nutau_cc_norm]
 #conditional_vars = [:Darkdim_radius, :δCP, :λ₁, :λ₂, :λ₃]
 
 #conditional_vars = Dict(:δCP=>0., :ca1=>args["ca"], :ca2=>args["ca"], :ca3=>args["ca"], :nutau_cc_norm=>1., :nc_norm=>1.)
-conditional_vars = Dict(:δCP=>0., :λ₁=>args["lambda"], :λ₂=>args["lambda"], :λ₃=>args["lambda"], :nutau_cc_norm=>1., :nc_norm=>1.)
+#conditional_vars = Dict(:δCP=>0., :λ₁=>args["lambda"], :λ₂=>args["lambda"], :λ₃=>args["lambda"], :nutau_cc_norm=>1., :nc_norm=>1.)
 #conditional_vars = Dict(:δCP=>0., :nutau_cc_norm=>1., :nc_norm=>1.)
 #conditional_vars = []
 
 # For profile / scan task only: choose scan grid
 vars_to_scan = OrderedDict()
-#vars_to_scan[:θ₂₃] = 31
-#vars_to_scan[:Δm²₃₁] = 31
+vars_to_scan[:θ₂₃] = 11
+vars_to_scan[:Δm²₃₁] = 11
 
 
 ###### END CONFIG ######
@@ -121,93 +119,12 @@ p = Newtrinos.get_params(experiments)
 priors = Newtrinos.get_priors(experiments)
 
 
-if args["ordering"] == "NO"
-    #@reset p.ca1 = 0.95
-    #@reset priors.ca1 = LogUniform(1e-3, 10.)
-    #@reset p.ca2 = 7.36
-    #@reset priors.ca2 = LogUniform(1e-3, 10.)
-    ##@reset p.ca3 = 0.2
-    ##@reset priors.ca3 = LogUniform(1e-3, 10.)
-    #@reset p.ca3 = -1.
-    #@reset priors.ca3 = -LogUniform(1e-3, 10.)
-   
-    # informed choices:
-    #@reset p.ca1 = 8.
-    #@reset priors.ca1 = Uniform(0.1, 10.)
-    #@reset p.ca2 = 0.952
-    #@reset priors.ca2 = Uniform(0.01, 1.1)
-    #@reset p.ca3 = 0.203
-    #@reset priors.ca3 = Uniform(0.001, 0.3)
-
-    #@reset priors.θ₁₂ = Uniform(0., pi/2)
-    #@reset priors.θ₁₃ = Uniform(0., pi/2)
-    #@reset priors.θ₂₃ = Uniform(0., pi/2)
-
-    # informed choices 2:
-    #@reset p.ca1 = 2.
-    #@reset priors.ca1 = Uniform(0.5, 10.)
-    #@reset p.ca2 = 0.9
-    #@reset priors.ca2 = Uniform(0.1, 2.)
-    #@reset p.ca3 = -0.1
-    #@reset priors.ca3 = Uniform(-5, -0.01)
-    #
-    #@reset p.λ₁ = 0.044
-    #@reset p.λ₂ = 0.031
-    #@reset p.λ₃ = 0.058
 
 
-elseif args["ordering"] == "IO"
-    #@reset p.λ₁ = 0.021
-    #@reset p.λ₂ = 0.700
-    #@reset p.λ₃ = 0.396
-    #@reset p.ca1 = -4.9977
-    #@reset priors.ca1 = Uniform(-5., -0.1)
-    #@reset p.ca2 = -5.
-    #@reset priors.ca2 = Uniform(-5., -0.1)
-    #@reset p.ca3 = -4.92
-    #@reset priors.ca3 = Uniform(-5., -0.1)
+priors = Newtrinos.condition(priors, conditional_vars, p)
 
-    #@reset priors.θ₁₂ = Uniform(0., pi/2)
-    #@reset priors.θ₁₃ = Uniform(0., pi/2)
-    #@reset priors.θ₂₃ = Uniform(0., pi/2)
-
-    #@reset p.ca3 = -0.1.
-    #@reset priors.ca3 = -LogUniform(1e-3, 10.)
-end
-
-@reset priors.Darkdim_radius = LogUniform(1., 100.)
-@reset priors.m₀ = LogUniform(0.001, 1)
-
-vars_to_scan[:Darkdim_radius] = 11
-vars_to_scan[:m₀] = 16
-
-#if args["scan"] == "ca1"
-#    vars_to_scan[:ca1] = 11
-#elseif args["scan"] == "ca2"
-#    vars_to_scan[:ca2] = 11
-#elseif args["scan"] == "ca3"
-#    vars_to_scan[:ca3] = 11
-#end
-
-function condition(priors::NamedTuple, conditional_vars::AbstractArray, p)
-    for var in conditional_vars
-        @reset priors[var] = p[var]
-    end
-    priors
-end
-
-function condition(priors::NamedTuple, conditional_vars::AbstractDict, p)
-    for var in keys(conditional_vars)
-        if isnothing(conditional_vars[var])
-            @reset priors[var] = p[var]
-        else
-            @reset priors[var] = conditional_vars[var]
-        end
-    end
-    priors
-end
-
-priors = condition(priors, conditional_vars, p)
+@reset priors.Δm²₃₁ = Uniform(0.0022, 0.0028)
+@reset priors.θ₂₃ = Uniform(pi/4-0.15, pi/4+0.15)
     
 if lowercase(args["task"]) == "nestedsampling"
     #import NestedSamplers
