@@ -1,6 +1,7 @@
 # Newtrinos.jl
 
 **Newtrinos.jl** is a Julia package for the **global analysis of neutrino data**.
+This package is a Julia re-implementation of a former Python-based, closed-source project `newtrinos`.
 
 ## Overview
 
@@ -196,8 +197,8 @@ f(p) = logdensityof(likelihood, p)
 ## Inference
 
 Let's run a likelihood analysis to construct confidence contours in the (θ₂₃, Δm²₃₁) parameter space.
-Here we use a conditional likelihood for illusatration. More realistically, you may want to run `Newtrinos.profile` instead for a full profile likelihood.
-Examples on Bayesian Inference will follow.
+Here we use a conditional likelihood for illustration. More realistically, you may want to run `Newtrinos.profile` instead for a full profile likelihood.
+For more realistic examples, browse the GitHub directories of the different experiments under ´src/experiments´, which contain GitHub-style ´README.md´ pages that show realistic reproductions of official results.
 
 
 ```julia
@@ -226,9 +227,10 @@ display("image/png", img)
     
 ![png](README_files/README_22_0.png)
     
+# References
 
+Newtrinos has been used to produce the results presented in:
+* [Testing the number of neutrino species with a global fit of neutrino data](https://arxiv.org/abs/2402.00490) Published in: Phys.Rev.D 109 (2024) 9, 095016
+* [Constraints on non-unitary neutrino mixing in light of atmospheric and reactor neutrino data](https://arxiv.org/abs/2407.20388) Published in: JHEP 05 (2025) 130
+* [A neutrino data analysis of extra-dimensional theories with massive bulk fields](https://arxiv.org/abs/2508.04274) Published in: Phys.Rev.D 112 (2025) 5, 055009
 
-
-```julia
-
-```
