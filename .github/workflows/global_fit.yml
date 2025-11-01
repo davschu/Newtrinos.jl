@@ -30,7 +30,7 @@ jobs:
         julia --project=. src/analysis/analysis.jl --experiments dayabay minos kamland deepcore orca --task profile --name test_IO --ordering IO --plot
 
     - name: Upload output
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: newtrinos-output
         path: |

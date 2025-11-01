@@ -34,16 +34,16 @@ set_batcontext(ad = adsel)
     meta::Dict = Dict()
 end
 
-function build_optimizationfunction(f, adsel::AutoDiffOperators.ADSelector)
-    adm = convert(ADTypes.AbstractADType, reverse_ad_selector(adsel))
-    optimization_function = Optimization.OptimizationFunction(f, adm)
-    return optimization_function
-end
+# function build_optimizationfunction(f, adsel::AutoDiffOperators.ADSelector)
+#     adm = convert(ADTypes.AbstractADType, reverse_ad_selector(adsel))
+#     optimization_function = Optimization.OptimizationFunction(f, adm)
+#     return optimization_function
+# end
 
-function build_optimizationfunction(f, adsel::BAT._NoADSelected)
-    optimization_function = Optimization.OptimizationFunction(f)
-    return optimization_function
-end
+# function build_optimizationfunction(f, adsel::BAT._NoADSelected)
+#     optimization_function = Optimization.OptimizationFunction(f)
+#     return optimization_function
+# end
 
 "Find Maximum Likelihood Estimator (MLE)"
 function find_mle(likelihood, prior, params)
@@ -469,19 +469,28 @@ function generate_toy_data(experiments::NamedTuple, params::NamedTuple )
 end
 
 function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTuple)
-
+    
     model = experiment.forward_model
     dist_obj = model(params)
-    
     asimov_data_flt = mean(dist_obj)
-    
-    if dist_obj isa Distributions.ProductDistribution && !isempty(dist_obj.dists) && first(dist_obj.dists) isa Distributions.Poisson
+    check_dist(dist_obj) = (dist_obj isa Distributions.Poisson) | (dist_obj isa Distributions.ProductDistribution && !isempty(dist_obj.dists) && first(dist_obj.dists) isa Distributions.Poisson) | (dist_obj isa Distributions.Product && !isempty(dist_obj.v) && first(dist_obj.v) isa Distributions.Poisson)
+
+    if dist_obj isa ValueShapes.NamedTupleDist
+        for key in keys(dist_obj)
+            if check_dist(dist_obj[key])
+                @info "Poisson-based model for $(key). Rounding Asimov data to nearest integer."
+                @reset asimov_data_flt[key] = round.(Int, asimov_data_flt[key])
+            end
+        end
+        return asimov_data_flt
+    end
+    if check_dist(dist_obj)
         @info "Poisson-based model. Rounding Asimov data to nearest integer."
         return round.(Int, asimov_data_flt)    
-    else  
-        @info "Not Poisson-based model. Returning std floating-point Asimov data."
-        return asimov_data_flt  
     end
+    
+    @info "Not Poisson-based model. Returning std floating-point Asimov data."
+    return asimov_data_flt  
     
 end
 
