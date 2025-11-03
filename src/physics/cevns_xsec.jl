@@ -8,18 +8,18 @@ using ..Newtrinos
 @kwdef struct CevnsXsec <: Newtrinos.Physics
     params::NamedTuple
     priors::NamedTuple
-    diff_xsec_lar::Function
-    diff_xsec_csi::Function
+    diff_xsec::Function
 end
 
 # Only keep the dynamic configure (isotope_keys) and the (params, priors) version
-function configure(isotope_keys::Vector{Symbol})
-    params, priors = build_params_and_priors(isotope_keys)
+function configure(isotopes, er_centers, enu_centers)
+    # Build assets from isotopes
+    assets = get_assets(isotopes, er_centers, enu_centers)
+    params, priors = build_params_and_priors(isotopes)
     CevnsXsec(
         params = params,
         priors = priors,
-        diff_xsec_lar = get_diff_xsec_lar(),
-        diff_xsec_csi = get_diff_xsec_csi(),
+        diff_xsec = get_diff_xsec(assets),
     )
 end
 
@@ -64,6 +64,24 @@ const gd = -(1/2) + 2*1/3*sw2
 const alph = 1/137
 const ep= (mpi^2-mmu^2)/(2*mpi)
 
+function get_assets(isotopes, er_centers, enu_centers)
+    # Extract isotope data into a structured format
+    isotope_data = Dict(iso.Rn_key => (
+        mass = iso.mass,
+        Z = iso.Z,
+        N = iso.N,
+        fraction = iso.fraction,
+        Rn_nom = iso.Rn_nom
+    ) for iso in isotopes)
+
+    # Return assets as a NamedTuple
+    return (
+        isotopes = isotope_data,  # Dictionary of isotope data keyed by Rn_key
+        er_centers = er_centers,
+        enu_centers = enu_centers
+    )
+end
+
 # Helm-like nuclear form factor squared, generic in type
 function ffsq(er, mn, rn)
     r0 = rn / 197.326963
@@ -79,9 +97,9 @@ end
 
 # Vectorized differential cross section dσ/dEr (n_er × n_enu), AD-safe
 function ds(er, enu, params, nupar, Rn_key)
-    mN = nupar[2]
-    Z  = nupar[3]
-    N  = nupar[4]
+    mN = nupar[1]
+    Z  = nupar[2]
+    N  = nupar[3]
     rn = params[Rn_key]
 
     # Per-Er prefactor (n_er,)
@@ -124,4 +142,29 @@ function get_diff_xsec_csi()
     end
 end
 
+function get_diff_xsec(assets)
+    # Extract assets
+    er_centers = assets.er_centers
+    enu_centers = assets.enu_centers
+    isotopes = assets.isotopes
+
+    # Return a callable function that computes the differential cross-section
+    return function (params)
+        # Determine the element type of params (e.g., from the first element)
+        param_type = eltype(params[:cevns_xsec_a])
+
+        # Compute cross-section for each isotope and store in a dictionary
+        xsec_dict = Dict{Symbol, Matrix{param_type}}()
+        for (Rn_key, iso) in isotopes
+            mass = iso.mass
+            Z = iso.Z
+            N = iso.N
+
+            # Call ds() for the current isotope
+            xsec_dict[Rn_key] = ds(er_centers, enu_centers, params, (mass, Z, N), Rn_key)
+        end
+
+        return xsec_dict  # Dictionary of cross-section matrices keyed by Rn_key
+    end
 end
+end # module cevns_xsec

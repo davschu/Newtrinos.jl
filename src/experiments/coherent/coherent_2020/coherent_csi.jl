@@ -23,14 +23,29 @@ import ..Newtrinos
     plot::Function
 end
 
-function configure(physics)
-    assets = get_assets(physics)
-    # Dynamically build params/priors for cevns_xsec using isotope list (with Rn_nom)
-    cevns_params, cevns_priors = Newtrinos.cevns_xsec.build_params_and_priors(assets.isotopes)
-    # Reconfigure cevns_xsec with correct params/priors
-    cevns_xsec = Newtrinos.cevns_xsec.configure(cevns_params, cevns_priors)
-    # Update physics NamedTuple with new cevns_xsec
-    physics = (;physics.sns_flux, cevns_xsec)
+function configure(; datadir = @__DIR__)
+    assets = get_assets(datadir)
+
+    # Configure the SNS flux module
+    sns_flux = Newtrinos.sns_flux.configure(
+        exposure = assets.exposure,
+        distance = assets.distance,
+        use_data = true,
+    )
+
+    # Reconfigure assets with data loaded from sns_flux
+    assets = get_assets(datadir, sns_flux)
+
+    # Configure the CEvNS cross-section module
+    cevns_xsec = Newtrinos.cevns_xsec.configure(
+        assets.isotopes,
+        assets.er_centers .* 1e-3, # Convert keV to MeV
+        sns_flux.assets.E,  # Pass the energy grid from the SNS flux assets
+    )
+
+    # Combine SNS flux and CEvNS cross-section into the physics NamedTuple
+    physics = (;sns_flux = sns_flux, cevns_xsec = cevns_xsec)
+
     return COHERENT_CSI(
         physics = physics,
         params = get_params(assets.ss_bkg_nom, assets.brn_nom, assets.nin_nom),
@@ -74,64 +89,129 @@ function get_priors(ss_bkg_nom, brn_nom, nin_nom)
         )
 end
 
-function get_assets(physics, datadir = @__DIR__)
+function get_assets(datadir = @__DIR__, sns_flux = nothing)
     @info "Loading coherent csi data"
 
-
-    er_edges = LinRange(3, 200, Int((200-3)/0.5)) # keV
+    # Basic assets that are always loaded
+    er_edges = LinRange(3, 200, Int((200 - 3) / 0.5))  # keV
     isotopes = [
         (fraction=0.49, mass=123.8e3, Z=55, N=78, Rn_key=:Rn_Cs, Rn_nom=5.7242),  # Cs-133
-        (fraction=0.51, mass=118.21e3, Z=53, N=74, Rn_key=:Rn_I, Rn_nom=5.7242) # I-127
-    ] # List of isotopes with [fraction, Nuclear mass (GeV), Z, N=A-Z, Rn_key]
-    Nt = 2 * (14.6/0.25981) * 6.023e+23
+        (fraction=0.51, mass=118.21e3, Z=53, N=74, Rn_key=:Rn_I, Rn_nom=5.7242)   # I-127
+    ]  # List of isotopes with [fraction, Nuclear mass (GeV), Z, N=A-Z, Rn_key, Rn_nom (fm)]
+    Nt = 2 * (14.6 / 0.25981) * 6.023e+23
     light_yield = 13.35  # PE/keVee
     resolution = [0.0749, 9.56]  # a/Eee and b*Eee
-    # Import Data
-    brnPE_df = CSV.read(joinpath(datadir, "csi/brnPE.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, BRN PDF
-    ninPE_df = CSV.read(joinpath(datadir, "csi/ninPE.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, NIN PDF
-    ssBkg_df = CSV.read(joinpath(datadir, "csi/dataBeamOnAC.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, timestamp
-    observed_df = CSV.read(joinpath(datadir, "csi/dataBeamOnC.txt"), DataFrame, comment="#", header=false, delim=' ') # columns: PE, timestamp
 
     # Reconstruct bin edges from centers
     er_centers = midpoints(er_edges)
 
     pe_width = 5.0
     out_edges = collect(2.5:pe_width:202.5)  # PE bin edges: [2.5, 7.5, 12.5, ..., 202.5]
-    out_centers = midpoints(out_edges) # Bin centers: [5, 10, 15, ..., 200]
+    out_centers = midpoints(out_edges)  # Bin centers: [5, 10, 15, ..., 200]
 
-    # For event lists (PE only, e.g. ssBkg, observed), use Helpers.bin
-    ssBkg = Helpers.bin(ssBkg_df, out_edges; col=1)
-    observed = Helpers.bin(observed_df, out_edges; col=1)
+    # Initialize placeholders for binned data
+    ssBkg = nothing
+    observed = nothing
+    brn = nothing
+    nin = nothing
+    ss_bkg_nom = nothing
+    brn_nom = nothing
+    nin_nom = nothing
+    time_bins = nothing
+    time_edges = nothing
+    # Check if sns_flux is provided and has time bin centers
+    if sns_flux !== nothing && haskey(sns_flux.assets, :T)
+        @info "Loading and binning CsI data"
+        time_bins = sns_flux.assets.T  # Extract time bins from sns_flux (nanoseconds)
+        dt = median(diff(time_bins))
+        time_edges = [time_bins[1] - dt/2; (time_bins[1:end-1] + time_bins[2:end])/2; time_bins[end] + dt/2]
+        
+        # Import Data
+        ssBkg_df = CSV.read(joinpath(datadir, "csi/dataBeamOnAC.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: PE, timestamp
+        observed_df = CSV.read(joinpath(datadir, "csi/dataBeamOnC.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: PE, timestamp
+        brnPE_df = CSV.read(joinpath(datadir, "csi/brnPE.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: PE, counts
+        brnTrec_df = CSV.read(joinpath(datadir, "csi/brnTrec.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: time (µs), counts
+        ninPE_df = CSV.read(joinpath(datadir, "csi/ninPE.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: PE, counts
+        ninTrec_df = CSV.read(joinpath(datadir, "csi/ninTrec.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: time (µs), counts
 
-    # For PDFs (PE, count), use Helpers.rebin
-    brnPE = Helpers.rebin(brnPE_df, out_edges; var_col=1, count_col=2)
-    ninPE = Helpers.rebin(ninPE_df, out_edges; var_col=1, count_col=2)
+        # Convert timestamps in microseconds to nanoseconds for consistency with sns_flux.assets.T
+        ssBkg_df[:, 2] .*= 1e3
+        observed_df[:, 2] .*= 1e3
+        brnTrec_df[:, 1] .*= 1e3
+        ninTrec_df[:, 1] .*= 1e3
 
-    # Get initial nominal value for Bkg normalizations
-    ss_bkg_nom = sum(ssBkg)
-    @info "Initial SS background normalization: $ss_bkg_nom"
-    brn_nom = sum(brnPE)
-    @info "Initial BRN background normalization: $brn_nom"
-    nin_nom = sum(ninPE)
-    @info "Initial NIN background normalization: $nin_nom"
+        # Perform 2D binning for unbinned event lists (PE, timestamp)
+        @info "Binning unbinned CsI data"
 
-    distance = 19.3 # m
-    exposure = 13.99 # GWh
+        # Filter out events outside the range of out_edges and time_bins
+        valid_ssBkg = filter(row -> row[1] >= first(out_edges) && row[1] <= last(out_edges) &&
+                              row[2] >= first(time_edges) && row[2] <= last(time_edges), eachrow(ssBkg_df))
+        valid_observed = filter(row -> row[1] >= first(out_edges) && row[1] <= last(out_edges) &&
+                                  row[2] >= first(time_edges) && row[2] <= last(time_edges), eachrow(observed_df))
 
+        # Convert filtered data back to DataFrame
+        ssBkg_df = DataFrame(valid_ssBkg)
+        observed_df = DataFrame(valid_observed)
 
-    assets = (;
+        # Perform binning
+        ssBkg_hist = fit(Histogram, (ssBkg_df[:, 1], ssBkg_df[:, 2]), (out_edges, time_edges))
+        observed_hist = fit(Histogram, (observed_df[:, 1], observed_df[:, 2]), (out_edges, time_edges))
+        ssBkg = ssBkg_hist.weights
+        observed = observed_hist.weights
+
+        # Rebin BRN and NIN data into desired bins
+        @info "Rebinning binned CsI data"
+
+        # Convert zipped data into an array of tuples
+        brn_data = collect(zip(brnPE_df[:, 1], brnTrec_df[:, 1]))
+        nin_data = collect(zip(ninPE_df[:, 1], ninTrec_df[:, 1]))
+
+        # Filter out events outside the range of out_edges and time_bins
+        valid_brn = filter(row -> row[1] >= first(out_edges) && row[1] <= last(out_edges) &&
+                            row[2] >= first(time_edges) && row[2] <= last(time_edges), brn_data)
+        valid_nin = filter(row -> row[1] >= first(out_edges) && row[1] <= last(out_edges) &&
+                            row[2] >= first(time_edges) && row[2] <= last(time_edges), nin_data)
+
+        # Convert filtered data back to DataFrame
+        brnPE_df = DataFrame(PE=[row[1] for row in valid_brn], Time=[row[2] for row in valid_brn])
+        ninPE_df = DataFrame(PE=[row[1] for row in valid_nin], Time=[row[2] for row in valid_nin])
+
+        # Perform rebinning
+        brn_hist = fit(Histogram, (brnPE_df.PE, brnPE_df.Time), (out_edges, time_edges))
+        nin_hist = fit(Histogram, (ninPE_df.PE, ninPE_df.Time), (out_edges, time_edges))
+        brn = brn_hist.weights
+        nin = nin_hist.weights
+
+        # Get initial nominal value for Bkg normalizations
+        ss_bkg_nom = sum(ssBkg)
+        @info "Initial SS background normalization: $ss_bkg_nom"
+        brn_nom = sum(brn)
+        @info "Initial BRN background normalization: $brn_nom"
+        nin_nom = sum(nin)
+        @info "Initial NIN background normalization: $nin_nom"
+    else
+        @info "Flux is not fully configured yet."
+    end
+
+    distance = 1930  # cm
+    exposure = 13.99  # GWh
+
+    # Return assets as a NamedTuple
+    return (;
         observed,
         er_edges,
         er_centers,
+        time_edges,
+        time_bins,
         out_edges,
         out_centers,
         isotopes,
         Nt,
         light_yield,
         resolution,
-        brnPE,
+        brn,
         brn_nom,
-        ninPE,
+        nin,
         nin_nom,
         ssBkg,
         ss_bkg_nom,
@@ -251,29 +331,46 @@ function build_rate_matrix(er_centers, enu_centers, nupar, physics, params, Rn_k
     physics.cevns_xsec.diff_xsec_csi(er_centers, enu_centers, params, nupar, Rn_key)
 end
 
+function get_rate_matrix(params, physics)
+    # Simply return the dictionary of diff_xsec matrices for the given params
+    return physics.cevns_xsec.diff_xsec(params)
+end
 
 function get_expected(params, physics, assets)
+    # --- Step 1: Construct detector response (n_out × n_Er)
     response_matrix = construct_response_matrix(params, assets)
 
-    flux = physics.sns_flux.flux(exposure = assets.exposure, distance = assets.distance, params = params)
+    # --- Step 2: Get flux and differential cross-sections
+    flux = physics.sns_flux.flux(params)                  # (n_Enu, n_time)
+    diff_xsec_dict = physics.cevns_xsec.diff_xsec(params) # Dict of (n_Er, n_Enu)
 
-    function dNdEr(iso)
-        nupar = [iso.fraction, iso.mass, iso.Z, iso.N]
-        rate_matrix = build_rate_matrix(
-            assets.er_centers .* 1e-3,  # MeV
-            flux.E,                     # MeV
-            nupar,
-            physics,
-            params,
-            iso.Rn_key,
-        )
-        return iso.fraction .* vec(sum(rate_matrix .* permutedims(flux.total_flux), dims = 2))
+    # --- Step 3: Convert recoil energies from keV → MeV
+    er_edges_MeV   = assets.er_edges .* 1e-3
+    er_centers_MeV = assets.er_centers .* 1e-3
+    dEr_MeV        = diff(er_edges_MeV)
+    #dEr_MeV        = vcat(dEr_MeV, last(dEr_MeV))  # pad to match n_Er
+
+    n_Er   = length(er_centers_MeV)
+    n_time = size(flux.total_flux, 2)
+    first_rate_matrix = first(values(diff_xsec_dict))
+    T = eltype(first_rate_matrix)
+    flux_folded_rate = zeros(T, n_Er, n_time)  # (E_r × time)
+    # --- Step 4: Flux folding (sum over E_ν for each isotope)
+    for iso in assets.isotopes
+        rate_matrix = diff_xsec_dict[iso.Rn_key]     # (n_Er, n_Eν)
+        folded_rate = rate_matrix * flux.total_flux   # (n_Er, n_time)
+        flux_folded_rate .+= iso.fraction .* folded_rate
     end
-    
-    dNdEr_all = sum([dNdEr(iso) for iso in assets.isotopes])
-    dEr = diff(assets.er_edges .* 1e-3)           # MeV
-    int_rate = assets.Nt .* dNdEr_all .* dEr
-    predicted_counts = response_matrix * int_rate
+
+    # --- Step 5: Integrate over recoil energy (multiply by ΔE_r)
+    integrated_rate = flux_folded_rate .* dEr_MeV    # (n_Er × n_time)
+
+    # --- Step 6: Multiply by number of target nuclei
+    integrated_rate .*= assets.Nt                    # counts/s per E_r, per time bin
+
+    # --- Step 7: Apply detector response
+    predicted_counts = response_matrix * integrated_rate  # (n_out × n_time)
+
     return predicted_counts
 end
 
@@ -281,17 +378,17 @@ function get_backgrounds(params, assets)
     scale_template(template, norm) = sum(template) > 0 ?
         norm .* (template ./ sum(template)) :
         fill(zero(norm), length(template))
-    brnPE = scale_template(assets.brnPE, params.brn_norm)
-    ninPE = scale_template(assets.ninPE, params.nin_norm)
+    brn = scale_template(assets.brn, params.brn_norm)
+    nin = scale_template(assets.nin, params.nin_norm)
     ssBkg = scale_template(assets.ssBkg, params.ss_bkg_norm)
-    return (brnPE, ninPE, ssBkg)
+    return (brn, nin, ssBkg)
 end
 
 function get_forward_model(physics, assets)
     function forward_model(params)
         signal = get_expected(params, physics, assets)
-        brnPE, ninPE, ssBkg = get_backgrounds(params, assets)
-        total_bkg = brnPE .+ ninPE .+ ssBkg
+        brn, nin, ssBkg = get_backgrounds(params, assets)
+        total_bkg = brn .+ nin .+ ssBkg
         exp_events = signal .+ total_bkg
         distprod(Poisson.(exp_events))
     end

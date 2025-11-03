@@ -23,21 +23,39 @@ import ..Newtrinos
     plot::Function
 end
 
-function configure(physics)
-    assets = get_assets(physics)
-    # Dynamically build params/priors for cevns_xsec using isotope list (with Rn_nom)
-    cevns_params, cevns_priors = Newtrinos.cevns_xsec.build_params_and_priors(assets.isotopes)
-    # Reconfigure cevns_xsec with correct params/priors
-    cevns_xsec = Newtrinos.cevns_xsec.configure(cevns_params, cevns_priors)
-    # Update physics NamedTuple with new cevns_xsec
-    physics = (;physics.sns_flux, cevns_xsec)
+function configure(; datadir = @__DIR__)
+    # Load assets for the experiment
+    assets = get_assets(datadir)
+
+    # Configure the SNS flux module
+    sns_flux = Newtrinos.sns_flux.configure(
+        exposure = assets.exposure,
+        distance = assets.distance,
+        use_data = false,
+    )
+
+    # Configure the CEvNS cross-section module
+    cevns_xsec = Newtrinos.cevns_xsec.configure(
+        assets.isotopes,
+        assets.er_centers .* 1e-3,  # Convert keVnr to MeVnr
+        sns_flux.assets.E,  # Pass the energy grid from the SNS flux assets
+    )
+
+    # Combine SNS flux and CEvNS cross-section into the physics NamedTuple
+    physics = (;sns_flux = sns_flux, cevns_xsec = cevns_xsec)
+
+    # Build experiment-specific parameters and priors
+    params = get_params(assets.ss_bkg_nom, assets.pbrn_nom, assets.delbrn_nom)
+    priors = get_priors(assets.ss_bkg_nom, assets.pbrn_nom, assets.delbrn_nom)
+
+    # Return the configured COHERENT_LAR instance
     return COHERENT_LAR(
         physics = physics,
-        params = get_params(assets.ss_bkg_nom, assets.pbrn_nom, assets.delbrn_nom),
-        priors = get_priors(assets.ss_bkg_nom, assets.pbrn_nom, assets.delbrn_nom),
+        params = params,
+        priors = priors,
         assets = assets,
         forward_model = get_forward_model(physics, assets),
-        plot = get_plot(physics, assets)
+        plot = get_plot(physics, assets),
     )
 end
 
@@ -64,7 +82,7 @@ function get_priors(ss_bkg_nom, pbrn_nom, delbrn_nom)
         )
 end
 
-function get_assets(physics, datadir = @__DIR__)
+function get_assets(datadir = @__DIR__)
     @info "Loading coherent lAr data"
 
 
@@ -114,7 +132,7 @@ function get_assets(physics, datadir = @__DIR__)
     delbrn_nom = sum(delbrn)  # Sum over the last column (counts) of delbrn
     @info "Initial delBRN background normalization: $delbrn_nom"
     
-    distance = 27.5 # m
+    distance = 2750 # cm
     exposure = 6.12 # GWh
 
 
@@ -220,35 +238,34 @@ function construct_response_matrix(params, assets)
     return max.(A, zero(T))
 end
 
-function build_rate_matrix(er_centers, enu_centers, nupar, physics, params, Rn_key)
-    physics.cevns_xsec.diff_xsec_lar(er_centers, enu_centers, params, nupar, Rn_key)
+function get_rate_matrix(params, physics)
+    # Simply return the dictionary of diff_xsec matrices for the given params
+    return physics.cevns_xsec.diff_xsec(params)
 end
 
 function get_expected(params, physics, assets)
     # Step 1: Compute the 1D predicted counts
     response_matrix = construct_response_matrix(params, assets)
-    flux = physics.sns_flux.flux(exposure = assets.exposure, distance = assets.distance, params = params)
+    flux = physics.sns_flux.flux(params)
 
-    dNdEr_all = nothing
+    # Get the differential cross-section for all isotopes
+    diff_xsec_dict = physics.cevns_xsec.diff_xsec(params)
+    # Convert recoil energies from keV → MeV
+    er_edges_MeV   = assets.er_edges .* 1e-3
+    er_centers_MeV = assets.er_centers .* 1e-3
+    dEr_MeV        = diff(er_edges_MeV)
+    n_Er   = length(er_centers_MeV)
+
+    flux_folded_rate = zeros(eltype(first(values(diff_xsec_dict))), n_Er)
+
+    # --- Step 4: Flux folding (sum over E_ν for each isotope)
     for iso in assets.isotopes
-        nupar = [iso.fraction, iso.mass, iso.Z, iso.N]
-        rate_matrix = build_rate_matrix(
-            assets.er_centers .* 1e-3,  # MeV
-            flux.E,                     # MeV
-            nupar,
-            physics,
-            params,
-            iso.Rn_key,
-        )
-        dNdEr = vec(sum(rate_matrix .* permutedims(flux.total_flux), dims = 2))
-        if dNdEr_all === nothing
-            dNdEr_all = zero.(dNdEr)  # picks Dual when AD is active
-        end
-        dNdEr_all .+= iso.fraction .* dNdEr
+        rate_matrix = diff_xsec_dict[iso.Rn_key]     # (n_Er, n_Eν)
+        folded_rate = rate_matrix * flux.total_flux   # (n_Er,)
+        flux_folded_rate .+= iso.fraction .* folded_rate
     end
 
-    dEr = diff(assets.er_edges .* 1e-3)  # MeV
-    int_rate = params.coherent_lar_mass .* assets.Nt .* dNdEr_all .* dEr
+    int_rate = params.coherent_lar_mass .* assets.Nt .* flux_folded_rate .* dEr_MeV  # Integrate over E_ν and scale
     predicted_counts = response_matrix * int_rate
 
     # Step 2: Break the 1D predicted counts into f90-bin and time-bin counts
