@@ -94,9 +94,9 @@ function get_assets(physics; datadir = @__DIR__)
     end
       
 
-    flux = physics.atm_flux.nominal_flux(binning.e_fine, binning.cz_fine)
+    #flux = physics.atm_flux.nominal_flux(binning.e_fine, binning.cz_fine)
 
-    assets = (;mc, flux, layers, paths, binning)
+    assets = (;mc, layers, paths, binning)
 
 end
 
@@ -114,7 +114,7 @@ end
 function get_priors()
     priors = (
         ic_upgrade_lifetime = Uniform(2, 4),
-        ic_upgrade_energy_scale = Truncated(Normal(1, 0.1), 0.8, 1.2),
+        ic_upgrade_energy_scale = Truncated(Normal(1, 0.02), 0.5, 1.5),
         )
 end
 
@@ -137,10 +137,8 @@ end
 
 function make_hist_per_channel(mc, osc_flux, lifetime_seconds, params, assets)
     w = lifetime_seconds * mc.weight .* osc_flux
-
-    sys_e_idx = searchsortedfirst.(Ref(assets.binning.reco_energy_bin_edges), mc.reco_energy .* params.ic_upgrade_energy_scale) .- 1
-    
-    make_hist(sys_e_idx, mc.c_idx, mc.p_idx, mc.t_idx, w)
+    #sys_e_idx = searchsortedfirst.(Ref(assets.binning.reco_energy_bin_edges), mc.reco_energy .* params.ic_upgrade_energy_scale) .- 1
+    make_hist(mc.e_idx, mc.c_idx, mc.p_idx, mc.t_idx, w)
 end
 
 
@@ -155,16 +153,19 @@ end
 
 
 function reweight(params, physics, assets)
-    sys_flux = physics.atm_flux.sys_flux(assets.flux, params)
+
+    flux = physics.atm_flux.nominal_flux(assets.binning.e_fine * params.ic_upgrade_energy_scale, assets.binning.cz_fine)
+
+    sys_flux = physics.atm_flux.sys_flux(flux, params)
 
     s = (size(assets.binning.e_fine)[1], size(assets.binning.cz_fine)[1])
 
-    p = physics.osc.osc_prob(assets.binning.e_fine, assets.paths, assets.layers, params)
+    p = physics.osc.osc_prob(assets.binning.e_fine * params.ic_upgrade_energy_scale, assets.paths, assets.layers, params)
     p_flux = reshape(sys_flux.nue, s) .* p[:, :, 1, :] .+ reshape(sys_flux.numu, s) .* p[:, :, 2, :]
     
     nus = NamedTuple(ch=>gather_flux(p_flux, assets.mc[ch].ef_idx, assets.mc[ch].cf_idx, i) for (i, ch) in enumerate([:nue, :numu, :nutau]))
     
-    p = physics.osc.osc_prob(assets.binning.e_fine, assets.paths, assets.layers, params, anti=true)
+    p = physics.osc.osc_prob(assets.binning.e_fine * params.ic_upgrade_energy_scale, assets.paths, assets.layers, params, anti=true)
     p_flux = reshape(sys_flux.nuebar, s) .* p[:, :, 1, :] .+ reshape(sys_flux.numubar, s) .* p[:, :, 2, :]
 
     nubars = NamedTuple(ch=>gather_flux(p_flux, assets.mc[ch].ef_idx, assets.mc[ch].cf_idx, i) for (i, ch) in enumerate([:nuebar, :numubar, :nutaubar]))
