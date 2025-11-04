@@ -90,7 +90,7 @@ function get_priors(ss_bkg_nom, brn_nom, nin_nom)
 end
 
 function get_assets(datadir = @__DIR__, sns_flux = nothing)
-    @info "Loading coherent csi data"
+    #@info "Loading coherent csi data"
 
     # Basic assets that are always loaded
     er_edges = LinRange(3, 200, Int((200 - 3) / 0.5))  # keV
@@ -122,6 +122,7 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
     # Check if sns_flux is provided and has time bin centers
     if sns_flux !== nothing && haskey(sns_flux.assets, :T)
         @info "Loading and binning CsI data"
+        @info "Configuring Flux"
         time_bins = sns_flux.assets.T  # Extract time bins from sns_flux (nanoseconds)
         dt = median(diff(time_bins))
         time_edges = [time_bins[1] - dt/2; (time_bins[1:end-1] + time_bins[2:end])/2; time_bins[end] + dt/2]
@@ -141,7 +142,7 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
         ninTrec_df[:, 1] .*= 1e3
 
         # Perform 2D binning for unbinned event lists (PE, timestamp)
-        @info "Binning unbinned CsI data"
+        #@info "Binning unbinned CsI data"
 
         # Filter out events outside the range of out_edges and time_bins
         valid_ssBkg = filter(row -> row[1] >= first(out_edges) && row[1] <= last(out_edges) &&
@@ -160,7 +161,7 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
         observed = observed_hist.weights
 
         # Rebin BRN and NIN data into desired bins
-        @info "Rebinning binned CsI data"
+        #@info "Rebinning binned CsI data"
 
         # Convert zipped data into an array of tuples
         brn_data = collect(zip(brnPE_df[:, 1], brnTrec_df[:, 1]))
@@ -184,11 +185,11 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
 
         # Get initial nominal value for Bkg normalizations
         ss_bkg_nom = sum(ssBkg)
-        @info "Initial SS background normalization: $ss_bkg_nom"
+        #@info "Initial SS background normalization: $ss_bkg_nom"
         brn_nom = sum(brn)
-        @info "Initial BRN background normalization: $brn_nom"
+        #@info "Initial BRN background normalization: $brn_nom"
         nin_nom = sum(nin)
-        @info "Initial NIN background normalization: $nin_nom"
+        #@info "Initial NIN background normalization: $nin_nom"
     else
         @info "Flux is not fully configured yet."
     end

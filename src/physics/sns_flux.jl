@@ -74,7 +74,7 @@ function get_assets(; use_data, exposure, distance,
                         beam_power, proton_energy,
                         flux_folder, ecut, E_bin_width, tcut, time_bin_width)
     if use_data
-        @info "Loading SNS Flux data"
+        #@info "Loading SNS Flux data"
         # Function to read and rebin flux data from CSV files
         function read_flux_data(file_path, ecut, tcut, time_bin_width)
             # Read CSV; first column = energy, remaining columns = flux values
@@ -161,7 +161,7 @@ function get_assets(; use_data, exposure, distance,
             flux_e_bar = eta * flux_e_bar,
         )
     else
-        @info "Priming SNS Flux functions"
+        #@info "Priming SNS Flux functions"
         # Uniform grid in E
         npts = Int(round((ecut - 0.5)/E_bin_width))
         E = collect(range(0.5, stop=ecut, length=max(npts, 2)))

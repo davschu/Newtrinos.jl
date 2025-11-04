@@ -124,13 +124,13 @@ function get_assets(datadir = @__DIR__)
 
     # Get initial nominal value for Bkg normalizations
     ss_bkg_nom = sum(ss_bkg)  # Sum over the last column (counts) of ss_bkg
-    @info "Initial SS background normalization: $ss_bkg_nom"
+    #@info "Initial SS background normalization: $ss_bkg_nom"
 
     pbrn_nom = sum(pbrn)  # Sum over the last column (counts) of pbrn
-    @info "Initial BRN background normalization: $pbrn_nom"
+    #@info "Initial BRN background normalization: $pbrn_nom"
 
     delbrn_nom = sum(delbrn)  # Sum over the last column (counts) of delbrn
-    @info "Initial delBRN background normalization: $delbrn_nom"
+    #@info "Initial delBRN background normalization: $delbrn_nom"
     
     distance = 2750 # cm
     exposure = 6.12 # GWh
