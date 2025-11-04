@@ -106,8 +106,8 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
     er_centers = midpoints(er_edges)
 
     pe_width = 5.0
-    out_edges = collect(2.5:pe_width:202.5)  # PE bin edges: [2.5, 7.5, 12.5, ..., 202.5]
-    out_centers = midpoints(out_edges)  # Bin centers: [5, 10, 15, ..., 200]
+    out_edges = collect(7.5:pe_width:202.5)  # PE bin edges: [7.5, 12.5, 17.5, ..., 202.5]
+    out_centers = midpoints(out_edges)  # Bin centers: [10, 15, 20, ..., 200]
 
     # Initialize placeholders for binned data
     ssBkg = nothing
