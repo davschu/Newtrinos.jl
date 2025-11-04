@@ -1,0 +1,104 @@
+// ----------------------------------------------------------------------------
+//
+// Super-Kamiokande I-V Atmospheric Neutrino Data Release
+// Associated publication: "Atmospheric neutrino oscillation analysis with
+//   neutron tagging and an expanded fiducial volume in Super-Kamiokande I-V"
+// Corresponding author: Roger Wendell, <wendell.roger.4s@kyoto-u.ac.jp>
+// DOI: 10.5281/zenodo.8401262
+//
+// ----------------------------------------------------------------------------
+
+
+// Overview
+
+This data release accompanies the publication "Atmospheric neutrino oscillation
+analysis with neutron tagging and an expanded fiducial volume in
+Super-Kamiokande I-V." The information provided is divided into two
+sub-directories:
+
+    - bins: Contains data & MC counts in each analysis bin for different
+            oscillation configurations
+    - chi2: Contains listings of chisquare values at each point in the
+            oscillation parameter space scanned for the analyses described in
+            the accompanying publication
+
+
+// Bin Information
+
+This section describes the provided bin information. The `bin/` subdirectory
+includes a ROOT file which contains binning information, data, and MC counts
+and MC summary statistics in each bin in the form of several ROOT trees. The
+contents of the ROOT file are also provided as text files within the same
+subdirectory.
+
+There are 930 bins used for atmospheric neutrino data in the analysis. Each
+ROOT tree and text file contains sequential listing of information for each of
+the 930 bins, i.e. the first entry or line of each tree and text file
+corresponds to the first bin, and so on.
+
+DISCLAIMER: The data and MC counts and summary statistics provided are not
+expected to be sufficient to identically reproduce the publication fit results.
+The publication fit results rely on response functions of the bins to
+variations in the systematic uncertainty parameters which are not included in
+this release. Additionally, the MC oscillation probabilities used in the
+publication were computed individually for each MC event and are not possible
+to reproduce exactly using the binned event information provided with this
+release.
+
+//// Bin Definitions
+
+The ROOT file contains a `BinInfoTree` which lists the sample name associated
+with each bin, and the upper and lower bin edges of the 2D binning scheme used
+to bin atmospheric neutrino events. The sample names describe the selections
+used to place events in each bin, e.g. "subgev" and "multigev" for sub-GeV and
+multi-GeV events, respectively. Since data from the different SK phases are
+divided into different analysis samples, each sample name also lists the range
+of SK phases included in the same, e.g. sk1-5 for SK I, SK II, SK III, SK IV,
+and SK V, or sk4-5 for SK IV and SK V only. The contents of this tree are also
+listed in the `bin/sk_2023_BinInfo.txt` file.
+
+//// Data Counts
+
+Observed atmospheric neutrino data counts in each bin are listed in the
+`DataTree` within the ROOT file. The contents of this tree are also listed in
+the `bin/sk_2023_Data.txt` file.
+
+//// MC Counts and Summary Statistics
+
+MC counts and summary statistics of the true MC energies and directions are
+provided for each true neutrino type in the ROOT trees named `MC*Tree`. The
+information is provided for three oscillation configurations: The best-fit
+oscillation parameters in the normal ordering (NO), the best-fit oscillation
+parameters in the inverted ordering (IO), and without oscillations (NoOsc).
+
+The following summary statistics are provided for both the true neutrino
+energies and directions (cosine zenith angle) of MC events in each bin:
+Average, RMS, 2.3%, 15.9%, 50%, 84.1%, and 97.7% quantiles. The quantiles
+approximately correspond to -2, -1, 0, +1, and +2 sigma deviations from the
+median.
+
+The ROOT tree MC information is duplicated in the text files found under the
+`bin/[normal,inverted,unoscillated]` subdirectories, corresponding to the three
+oscillation scenarios.
+
+
+// Chisquare Information
+
+This section describes the provided chisquare information. We provide listings
+of the relative chisquare values with respect to the global best-fit point in
+the normal ordering. The listings are provided as text files: The first columns
+correspond to the oscillation parameters at each grid point, while the final
+column lists the chisquare value. Chisquare values are provided for both the
+theta13-free and theta13-constrained analyses.
+
+ROOT files containing the 1D delta chisquare profiles for delta CP, and 2D
+delta chisquare profiles for allowed values of delta m^2 versus sin2 theta23 at
+68% and 90% are also provided. There are two ROOT files corresponding to the
+contours from the theta13-free and theta13-constrained fits.
+
+A ROOT macro which draws the contours is also provided. It can be run using the
+following command from the chi2 directory:
+
+```
+> root draw_sk_contours.cc
+```
