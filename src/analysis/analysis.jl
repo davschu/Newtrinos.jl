@@ -125,7 +125,7 @@ likelihood = Newtrinos.generate_likelihood(experiments);
 
 priors = Newtrinos.condition(priors, conditional_vars, p)
 
-@reset priors.Δm²₃₁ = Uniform(0.002, 0.0028)
+@reset priors.Δm²₃₁ = Uniform(0.0018, 0.0028)
 @reset priors.θ₂₃ = Uniform(pi/4-0.2, pi/4+0.2)
     
 if lowercase(args["task"]) == "nestedsampling"
