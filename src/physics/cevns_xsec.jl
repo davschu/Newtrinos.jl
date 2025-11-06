@@ -66,6 +66,7 @@ const ep= (mpi^2-mmu^2)/(2*mpi)
 
 function get_assets(isotopes, er_centers, enu_centers)
     # Extract isotope data into a structured format
+    @info "Configuring CEvNS cross-section assets"
     isotope_data = Dict(iso.Rn_key => (
         mass = iso.mass,
         Z = iso.Z,

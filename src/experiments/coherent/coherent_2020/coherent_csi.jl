@@ -42,7 +42,7 @@ function configure(; datadir = @__DIR__)
         assets.er_centers .* 1e-3, # Convert keV to MeV
         sns_flux.assets.E,  # Pass the energy grid from the SNS flux assets
     )
-
+    @info "Configured COHERENT CsI module."
     # Combine SNS flux and CEvNS cross-section into the physics NamedTuple
     physics = (;sns_flux = sns_flux, cevns_xsec = cevns_xsec)
 
@@ -106,8 +106,9 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
     er_centers = midpoints(er_edges)
 
     pe_width = 5.0
-    out_edges = collect(7.5:pe_width:202.5)  # PE bin edges: [7.5, 12.5, 17.5, ..., 202.5]
-    out_centers = midpoints(out_edges)  # Bin centers: [10, 15, 20, ..., 200]
+    # Custom PE bin edges
+    out_edges = [0, 14, 18, 22, 26, 30, 40, 50, 60, 80, 100, 140, 180]
+    out_centers = midpoints(out_edges)  # Bin centers: [5, 10, 15, ..., 200]
 
     # Initialize placeholders for binned data
     ssBkg = nothing
@@ -123,10 +124,8 @@ function get_assets(datadir = @__DIR__, sns_flux = nothing)
     if sns_flux !== nothing && haskey(sns_flux.assets, :T)
         @info "Loading and binning CsI data"
         @info "Configuring Flux"
-        time_bins = sns_flux.assets.T  # Extract time bins from sns_flux (nanoseconds)
-        dt = median(diff(time_bins))
-        time_edges = [time_bins[1] - dt/2; (time_bins[1:end-1] + time_bins[2:end])/2; time_bins[end] + dt/2]
-        
+        time_edges = sns_flux.assets.T  # Extract time bin-edges from sns_flux (nanoseconds)
+        time_bins = midpoints(time_edges)  # Bin centers
         # Import Data
         ssBkg_df = CSV.read(joinpath(datadir, "csi/dataBeamOnAC.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: PE, timestamp
         observed_df = CSV.read(joinpath(datadir, "csi/dataBeamOnC.txt"), DataFrame, comment="#", header=false, delim=' ')  # columns: PE, timestamp
