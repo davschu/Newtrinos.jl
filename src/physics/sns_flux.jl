@@ -43,10 +43,7 @@ end
 function get_params(use_data)
     if use_data
         (
-            norm_mu = 1.0,
-            norm_e = 1.0,
-            norm_mu_bar = 1.0,
-            norm_e_bar = 1.0,
+            flux_norm = 1.0,
         )
     else
         (
@@ -58,10 +55,7 @@ end
 function get_priors(use_data)
     if use_data
         (
-            norm_mu = truncated(Normal(1.0, 0.1), 0.7, 1.3),
-            norm_e = truncated(Normal(1.0, 0.1), 0.7, 1.3),
-            norm_mu_bar = truncated(Normal(1.0, 0.1), 0.7, 1.3),
-            norm_e_bar = truncated(Normal(1.0, 0.1), 0.7, 1.3),
+            flux_norm = truncated(Normal(1.0, 0.1), 0.7, 1.3),
         )
     else
         (
@@ -230,28 +224,19 @@ function get_flux(use_data, assets)
         # Return the closure directly
         return function (params)
             # Extract normalization parameters
-            norm_mu = params.norm_mu
-            norm_e = params.norm_e
-            norm_mu_bar = params.norm_mu_bar
-            norm_e_bar = params.norm_e_bar
-
-            # Apply normalizations
-            flux_mu_scaled = flux_mu .* norm_mu
-            flux_e_scaled = flux_e .* norm_e
-            flux_mu_bar_scaled = flux_mu_bar .* norm_mu_bar
-            flux_e_bar_scaled = flux_e_bar .* norm_e_bar
+            norm = params.flux_norm
 
             # Compute total flux
-            total_flux = flux_mu_scaled .+ flux_e_scaled .+ flux_mu_bar_scaled .+ flux_e_bar_scaled
+            total = flux_mu .+ flux_e .+ flux_mu_bar .+ flux_e_bar
 
             return (;
                 E,  # Energy grid
                 T,  # Time grid
-                total_flux,
-                flux_e = flux_e_scaled,
-                flux_mu = flux_mu_scaled,
-                flux_mu_bar = flux_mu_bar_scaled,
-                flux_e_bar = flux_e_bar_scaled,
+                total_flux = total .* norm,
+                flux_e,
+                flux_mu,
+                flux_mu_bar,
+                flux_e_bar,
             )
         end
     else

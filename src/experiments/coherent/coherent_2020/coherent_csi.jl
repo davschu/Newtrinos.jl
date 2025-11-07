@@ -8,6 +8,7 @@ using LinearAlgebra
 using Statistics
 using DataStructures
 using BAT
+using ForwardDiff
 using CairoMakie
 using Logging
 using StatsBase
@@ -388,8 +389,10 @@ function get_forward_model(physics, assets)
     function forward_model(params)
         signal = get_expected(params, physics, assets)
         brn, nin, ssBkg = get_backgrounds(params, assets)
+        
         total_bkg = brn .+ nin .+ ssBkg
         exp_events = signal .+ total_bkg
+    
         distprod(Poisson.(exp_events))
     end
 end
