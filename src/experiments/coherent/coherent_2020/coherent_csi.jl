@@ -249,32 +249,19 @@ end
     :(one(T))
 end
 @inline function _gamma_pdf(x, k, θ)
-    # x, k, θ should be of a common Real-like type (possibly Dual)
-    # Use log-pdf for numerical stability and AD-compatibility
-    # Assumes x > 0 (our PE bin edges are > 0)
+    # Clamp arguments to safe values for AD
+    x = x < eps(real(x)) ? eps(real(x)) : x
+    k = k < eps(real(k)) ? eps(real(k)) : k
+    θ = θ < eps(real(θ)) ? eps(real(θ)) : θ
     return exp((k - 1) * log(x) - x / θ - k * log(θ) - loggamma(k))
 end
 
-"""
-Compute gamma-smearing probabilities per PE bin (Simpson integration), AD-safe.
-
-Arguments:
-- Eee: recoil energy in keVee (can be Dual)
-- pe_centers: PE bin centers (vector)
-- pe_edges: PE bin edges (vector, length = length(pe_centers)+1)
-- resolution: [a, b] with width parameters
-- light_yield: keVee -> PE
-
-Returns:
-- probs: vector of probabilities per PE bin (same length as pe_centers)
-"""
 function gamma_pdf_integrated_over_bins(Eee, pe_centers, pe_edges, resolution, light_yield)
     n_bins = length(pe_centers)
     T = promote_type(eltype(pe_centers), typeof(Eee))
     probs = zeros(T, n_bins)
 
-    # If Eee == 0, there is no signal; avoid divisions by Eee
-    if iszero(Eee)
+    if iszero(Eee) || isnan(Eee) || !isfinite(Eee)
         return probs
     end
 
@@ -283,17 +270,23 @@ function gamma_pdf_integrated_over_bins(Eee, pe_centers, pe_edges, resolution, l
     k = one(T) + b
     θ = inv(a * (one(T) + b))
 
-    # Integrate Gamma(k, θ) over each [lo, hi] via Simpson's rule
     for i in eachindex(pe_centers)
         lo = T(pe_edges[i])
         hi = T(pe_edges[i + 1])
         mid = (lo + hi) / 2
         probs[i] = (hi - lo) / 6 * (_gamma_pdf(lo, k, θ) + 4 * _gamma_pdf(mid, k, θ) + _gamma_pdf(hi, k, θ))
+        # Optional debug:
+        # if isnan(probs[i]) || isinf(probs[i])
+        #     @warn "NaN or Inf in gamma_pdf_integrated_over_bins: i=$i, lo=$lo, hi=$hi, k=$k, θ=$θ"
+        # end
     end
 
     s = sum(probs)
-    if !iszero(s)
+    epsT = eps(T)
+    if s > epsT && !isnan(s) && isfinite(s)
         probs ./= s
+    else
+        probs .= zero(T)
     end
     return probs
 end
