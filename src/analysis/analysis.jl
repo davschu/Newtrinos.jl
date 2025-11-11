@@ -41,9 +41,9 @@ function parse_command_line()
         help = "Enable plotting"
         action = :store_true
 
-        "--lambda"
-        arg_type = Float64
-        default = 1.
+        # "--lambda"
+        # arg_type = Float64
+        # default = 1.
 
         #"--ca"
         #arg_type = Float64
@@ -79,9 +79,13 @@ osc_cfg = Newtrinos.osc.OscillationConfig(
     interaction=Newtrinos.osc.SI()
     )
 osc = Newtrinos.osc.configure(osc_cfg)
-atm_flux = Newtrinos.atm_flux.configure()
+
+atm_flux = Newtrinos.atm_flux.configure(
+        Newtrinos.atm_flux.AtmFluxConfig(nominal_model=Newtrinos.atm_flux.HKKM("kam-ally-20-01-mtn-solmin.d")
+        )
+    )
 earth_layers = Newtrinos.earth_layers.configure()
-xsec = Newtrinos.xsec.configure()
+xsec=Newtrinos.xsec.configure(Newtrinos.xsec.Differential_H2O())
 
 physics = (; osc, atm_flux, earth_layers, xsec);
 
@@ -95,9 +99,12 @@ physics = (; osc, atm_flux, earth_layers, xsec);
 #);
 
 experiments = configure_experiments(args["experiments"], physics)
+p = Newtrinos.get_params(experiments)
+priors = Newtrinos.get_priors(experiments)
 
 # Variables to condition on (=fix)
-conditional_vars = [:θ₁₂, :θ₁₃, :δCP, :Δm²₂₁, :nutau_cc_norm]
+#conditional_vars = [:θ₁₂, :δCP, :Δm²₂₁]
+conditional_vars = Dict(:θ₁₂=>p.θ₁₂, :δCP=>-1.89, :Δm²₂₁=>p.Δm²₂₁)
 #conditional_vars = [:Darkdim_radius, :δCP, :λ₁, :λ₂, :λ₃]
 
 #conditional_vars = Dict(:δCP=>0., :ca1=>args["ca"], :ca2=>args["ca"], :ca3=>args["ca"], :nutau_cc_norm=>1., :nc_norm=>1.)
@@ -115,16 +122,11 @@ vars_to_scan[:Δm²₃₁] = 11
 
 likelihood = Newtrinos.generate_likelihood(experiments);
 
-p = Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-
-
-
 
 priors = Newtrinos.condition(priors, conditional_vars, p)
 
-@reset priors.Δm²₃₁ = Uniform(0.0022, 0.0028)
-@reset priors.θ₂₃ = Uniform(pi/4-0.15, pi/4+0.15)
+@reset priors.Δm²₃₁ = Uniform(0.0018, 0.0028)
+@reset priors.θ₂₃ = Uniform(pi/4-0.2, pi/4+0.2)
     
 if lowercase(args["task"]) == "nestedsampling"
     #import NestedSamplers

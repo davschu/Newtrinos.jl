@@ -1,0 +1,436 @@
+module super_k
+
+using CSV, DataFrames
+using MonotonicSplines
+using Interpolations
+using CairoMakie
+using DataStructures
+using Distributions
+using DensityInterface
+using BAT
+using LaTeXStrings
+using Accessors
+using StatsBase
+using Printf
+using ..Newtrinos
+
+@kwdef struct SuperKAtm <: Newtrinos.Experiment
+    physics::NamedTuple
+    params::NamedTuple
+    priors::NamedTuple
+    assets::NamedTuple
+    forward_model::Function
+    plot::Function
+end
+
+function configure(physics)
+    physics = (;physics.osc, physics.atm_flux, physics.earth_layers, physics.xsec)
+    assets = get_assets(physics)
+    return SuperKAtm(
+        physics = physics,
+        params = get_params(),
+        priors = get_priors(),
+        assets = assets,
+        forward_model = get_forward_model(physics, assets),
+        plot = get_plot(physics, assets)
+    )
+end
+
+function read_sk_file(filepath::String)
+    df = CSV.read(filepath, DataFrame; delim=' ', ignorerepeated=true, comment="#", header=false)
+    rename!(df, [
+        :Counts, :EnergyAvg, :EnergyRMS, :EnergyQuantile2_3Percent, :EnergyQuantile15_9Percent,
+        :EnergyQuantile50_0Percent, :EnergyQuantile84_1Percent, :EnergyQuantile97_7Percent,
+        :CosZAvg, :CosZRMS, :CosZQuantile2_3Percent, :CosZQuantile15_9Percent,
+        :CosZQuantile50_0Percent, :CosZQuantile84_1Percent, :CosZQuantile97_7Percent
+    ])
+    return df
+end
+
+function make_log_e_cdf(bin)
+    log_e = log10.([bin.EnergyQuantile2_3Percent, bin.EnergyQuantile15_9Percent, bin.EnergyQuantile50_0Percent, bin.EnergyQuantile84_1Percent, bin.EnergyQuantile97_7Percent])  # extrapolate tails
+
+    log_energy_quantiles = [2*log_e[1] - log_e[2], log_e... , 2*log_e[end] - log_e[end-1]]  # extrapolate tails 
+    #log_energy_quantiles = [log_e[1] - mean(diff(log_e)), log_e... , log_e[end] + mean(diff(log_e))]  # extrapolate tails 
+    quantile_probs = [0.0, 0.023, 0.159, 0.5, 0.841, 0.977, 1.]  # corresponding probabilities
+
+    dy_dx = MonotonicSplines.estimate_dYdX(log_energy_quantiles, quantile_probs)
+    dy_dx[1] = 0
+    dy_dx[end] = 0
+    f = RQSpline(log_energy_quantiles, quantile_probs, dy_dx)
+
+
+    f_save = x -> begin
+        if x < log_energy_quantiles[1]
+            return 0.0
+        elseif x > log_energy_quantiles[end]
+            return 1.0
+        else
+            return f(x)
+        end
+    end
+
+    return f_save
+end
+
+
+function make_cosz_cdf(bin)
+    cosz = [bin.CosZQuantile2_3Percent, bin.CosZQuantile15_9Percent, bin.CosZQuantile50_0Percent, bin.CosZQuantile84_1Percent, bin.CosZQuantile97_7Percent]  # extrapolate tails
+
+    cosz_quantiles = [-1, cosz..., 1]  # extrapolate tails 
+    cosz_quantiles = [min(-1, 2*cosz[1] - cosz[2]), cosz... , max(1, 2*cosz[end] - cosz[end-1])]  # extrapolate tails 
+    quantile_probs = [0., 0.023, 0.159, 0.5, 0.841, 0.977, 1.]  # corresponding probabilities
+
+    dy_dx = MonotonicSplines.estimate_dYdX(cosz_quantiles, quantile_probs)
+    #dy_dx[1] = 0
+    #dy_dx[end] = 0
+    f = RQSpline(cosz_quantiles, quantile_probs, dy_dx)
+    f_save = x -> begin
+        if x <= cosz_quantiles[1]
+            return 0.0
+        elseif x > cosz_quantiles[end]
+            return 1.0
+        else
+            return f(x)
+        end
+    end
+
+    return f_save
+end
+
+function make_response_matrix(MC_component, logE_grid, cosZ_grid)
+    n_bins = size(MC_component, 1)
+    n_logE = length(logE_grid)
+    n_cosZ = length(cosZ_grid)
+
+    response_matrix = zeros(Float32, n_bins, n_logE-1, n_cosZ-1)
+
+    for bin_idx in 1:n_bins
+        bin = MC_component[bin_idx, :]
+
+        if bin.Counts == 0
+            continue
+        end
+
+        log_e_cdf = make_log_e_cdf(bin)
+        cosz_cdf = make_cosz_cdf(bin)
+
+        for logE_idx in 1:(n_logE-1)
+            e_low = logE_grid[logE_idx]
+            e_high = logE_grid[logE_idx+1]
+            p_e = (log_e_cdf(e_high) - log_e_cdf(e_low))
+
+            for cosZ_idx in 1:(n_cosZ-1)
+                cosz_low = cosZ_grid[cosZ_idx]
+                cosz_high = cosZ_grid[cosZ_idx+1]
+                p_cosz = cosz_cdf(cosz_high) - cosz_cdf(cosz_low)
+
+                response_matrix[bin_idx, logE_idx, cosZ_idx] = p_e * p_cosz
+            end
+        end
+        sum_response = sum(response_matrix[bin_idx, :, :])
+        if sum_response == 0
+            continue
+        end
+        response_matrix[bin_idx, :, :] .= response_matrix[bin_idx, :, :] ./ sum_response #* bin.Counts
+    end
+    return response_matrix
+end
+
+function calc_weights(params, assets, physics)
+
+    E = 10. .^midpoints(assets.loge_grid)
+
+    p = physics.osc.osc_prob(E, assets.paths, assets.layers, params);
+    p_anti = physics.osc.osc_prob(E, assets.paths, assets.layers, params, anti=true);
+
+    flux = physics.atm_flux.sys_flux(assets.flux_nominal, params)
+
+    R = assets.R
+
+    s = (size(p)[1], size(p)[2])
+
+    p_flux(out) = reshape(reshape(flux.nue, s) .* p[:, :, 1, out] .+ reshape(flux.numu, s) .* p[:, :, 2, out], 1, s...)
+    p_flux_anti(out) = reshape(reshape(flux.nuebar, s) .* p_anti[:, :, 1, out] .+ reshape(flux.numubar, s) .* p_anti[:, :, 2, out], 1, s...)
+
+    nue = sum(R.nue .* p_flux(1) .* reshape(physics.xsec.scale(E, :nue, :CC, false, params), (1, :, 1)), dims=(2,3))
+    numu = sum(R.numu .* p_flux(2) .* reshape(physics.xsec.scale(E, :numu, :CC, false, params), (1, :, 1)), dims=(2,3))
+    nutau = sum(R.nutau .* (p_flux(3).* reshape(physics.xsec.scale(E, :nutau, :CC, false, params), (1, :, 1)) .+ p_flux_anti(3).* reshape(physics.xsec.scale(E, :nutau, :CC, true, params), (1, :, 1))), dims=(2,3))
+    nuebar = sum(R.nuebar .* p_flux_anti(1).* reshape(physics.xsec.scale(E, :nue, :CC, true, params), (1, :, 1)), dims=(2,3))
+    numubar = sum(R.numubar .* p_flux_anti(2).* reshape(physics.xsec.scale(E, :numu, :CC, true, params), (1, :, 1)), dims=(2,3))
+    nunc = sum(R.nunc .* physics.xsec.scale(E, :nue, :NC, false, params), dims=(2,3))
+    
+    return (; nue, numu, nutau, nuebar, numubar, nunc)
+end
+
+function get_assets(physics; datadir = @__DIR__)
+    @info "Loading Super-K Data"
+
+    bininfo = CSV.read(joinpath(datadir, "bins/sk_2023_BinInfo.txt"), DataFrame; delim=' ', ignorerepeated=true, comment="#", header=false);
+    rename!(bininfo, [:Sample, :logPMin, :logPMax, :CosZMin, :CosZMax]);
+    bad_entries = findall(bininfo.CosZMin .> bininfo.CosZMax)
+
+    bininfo[bad_entries[1], :].CosZMax = 0.0
+    bininfo[bad_entries[2], :].CosZMax = 0.0
+    bininfo[bad_entries[3], :].CosZMax = 1.0    
+
+    masks = (
+        fc = occursin.("_fc_", bininfo.Sample),
+        pc = occursin.("_pc_", bininfo.Sample),
+        upmu = occursin.("_upmu_", bininfo.Sample),
+        pc_stop = occursin.("_pc_stop", bininfo.Sample),
+        pc_thru = occursin.("_pc_thru", bininfo.Sample),
+        umpmu_stop = occursin.("_upmu_stop", bininfo.Sample),
+        upmu_thru = occursin.("_upmu_thru", bininfo.Sample),
+        upmu_shower = occursin.(r"_upmu_.*_showering",  bininfo.Sample),
+        upmu_nonshower = occursin.(r"_upmu_.*_nonshowering", bininfo.Sample),
+        mu_indices = occursin.("_numu", bininfo.Sample),
+        sk_i_iii_elike_0decay_e = occursin.(r"sk1-3_.*elike_0decaye", bininfo.Sample),
+        sk_i_iii_elike_1decay_e = occursin.(r"sk1-3_.*elike_1decaye", bininfo.Sample),
+        sk_i_iii_mulike_0decay_e = occursin.(r"sk1-3_.*mulike_0decaye", bininfo.Sample),
+        sk_i_iii_mulike_1decay_e = occursin.(r"sk1-3_.*mulike_1decaye", bininfo.Sample),
+        sk_i_iii_mulike_2decay_e = occursin.(r"sk1-3_.*mulike_2decaye", bininfo.Sample),
+        sk_iv_v_0decay_e = occursin.(r"sk4-5_fc_.*_nuebarlike",  bininfo.Sample),
+        sk_iv_v_1decay_e = occursin.(r"sk4-5_fc_.*_nuelike",  bininfo.Sample),
+        sk_iv_v_subgev_0neutron = occursin.(r"sk4-5_fc_subgev.*(_0neutron|numulike)", bininfo.Sample),
+        sk_iv_v_subgev_1neutron = occursin.(r"sk4-5_fc_subgev.*(_1neutron|numubarlike)", bininfo.Sample),
+        sk_iv_v_multigev_0neutron = occursin.(r"sk4-5_fc_multigev.*(_0neutron|numulike)", bininfo.Sample),
+        sk_iv_v_multigev_1neutron = occursin.(r"sk4-5_fc_multigev.*(_1neutron|numubarlike)", bininfo.Sample),
+        sk_i_v_multigev_multiring_nue = occursin.("sk1-5_fc_multigev_multiring_nuelike", bininfo.Sample),
+        sk_i_v_multigev_multiring_nuebar = occursin.("sk1-5_fc_multigev_multiring_nuebarlike", bininfo.Sample),
+        sk_i_v_multigev_multiring_mu = occursin.("sk1-5_fc_multigev_multiring_mulike", bininfo.Sample),
+        sk_i_v_multigev_multiring_other = occursin.("sk1-5_fc_multigev_multiring_other", bininfo.Sample),
+    )
+
+    data = CSV.read(joinpath(datadir, "bins/sk_2023_Data.txt"), DataFrame; delim=' ', ignorerepeated=true, comment="#", header=false)
+    observed = round.(data.Column1);
+
+    MC = (nue=read_sk_file(joinpath(datadir, "bins/normal/sk_2023_MCNueNO.txt")),
+        numu=read_sk_file(joinpath(datadir, "bins/normal/sk_2023_MCNumuNO.txt")),
+        nutau=read_sk_file(joinpath(datadir, "bins/normal/sk_2023_MCNutauNO.txt")),
+        nuebar=read_sk_file(joinpath(datadir, "bins/normal/sk_2023_MCNueBarNO.txt")),
+        numubar=read_sk_file(joinpath(datadir, "bins/normal/sk_2023_MCNumuBarNO.txt")),
+        nunc=read_sk_file(joinpath(datadir, "bins/normal/sk_2023_MCNCNO.txt")))
+
+        
+    loge_grid = LinRange(-1,3,201)
+    cz_grid = LinRange(-1.0,1.0,101)
+
+    R = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))
+
+    # Bestfit from SK atm 2023 paper
+    params_nominal = Newtrinos.get_params(physics)
+    @reset params_nominal.Δm²₃₁ = 2.475e-3
+    @reset params_nominal.θ₂₃ = asin(sqrt(0.45))
+    @reset params_nominal.θ₁₃ = asin(sqrt(0.02))
+    @reset params_nominal.δCP = -1.89
+
+    layers = physics.earth_layers.compute_layers()
+    paths = physics.earth_layers.compute_paths(midpoints(cz_grid), layers)
+
+    flux_nominal = physics.atm_flux.nominal_flux(10. .^midpoints(loge_grid), midpoints(cz_grid))
+
+    
+    nominal_weights = calc_weights(params_nominal, (;R, flux_nominal, paths, layers, loge_grid), physics)
+
+    return (; MC, R, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)
+
+end
+
+
+    
+function get_params()
+    params = (
+        sk_fc_norm = 1.0,
+        sk_pc_norm = 1.0,
+        sk_upmu_norm = 1.0,
+        sk_fiducial_norm = 1.0,
+        sk_nc_mu_norm = 1.0,
+        sk_pc_stopping_vs_througoing = 1.0,
+        sk_upmu_stopping_vs_througoing = 1.0,
+        sk_upmu_nonshower_vs_shower = 1.0,
+        sk_i_iii_decay_e_tag_eff = 1.0,
+        sk_iv_v_decay_e_tag_eff = 1.0,
+        sk_iv_v_subgev_neutron_tag_eff = 1.0,
+        sk_iv_v_multigev_neutron_tag_eff = 1.0,
+        sk_i_v_btd_1 = 1.0,
+        sk_i_v_btd_2 = 1.0,
+        sk_i_v_btd_3 = 1.0,
+        )
+end
+
+function get_priors()
+    priors = (
+        sk_fc_norm = Normal(1.0, 0.05),
+        sk_pc_norm = Normal(1.0, 0.05),
+        sk_upmu_norm = Normal(1.0, 0.05),
+        sk_fiducial_norm = Normal(1.0, 0.02),
+        sk_nc_mu_norm = Normal(1.0, 0.1),
+        sk_pc_stopping_vs_througoing = Normal(1.0, 0.2),
+        sk_upmu_stopping_vs_througoing = Normal(1.0, 0.01),
+        sk_upmu_nonshower_vs_shower = Normal(1.0, 0.04),
+        sk_i_iii_decay_e_tag_eff = Normal(1.0, 0.015),
+        sk_iv_v_decay_e_tag_eff = Normal(1.0, 0.008),
+        sk_iv_v_subgev_neutron_tag_eff = Normal(1.0, 0.12),
+        sk_iv_v_multigev_neutron_tag_eff = Normal(1.0, 0.12),
+        sk_i_v_btd_1 = Normal(1, 0.05),
+        sk_i_v_btd_2 = Normal(1, 0.05),
+        sk_i_v_btd_3 = Normal(1, 0.05),
+        )
+end
+
+
+safe_div(a, b) = b == 0 ? 1.0 : a / b
+
+function reweight(params, physics, assets)
+    weights = calc_weights(params, assets, physics)
+    return NamedTuple(key => assets.MC[key].Counts .* safe_div.(vec(weights[key]), vec(assets.nominal_weights[key])) for key in keys(assets.MC))
+end
+
+function get_factor(mask, factor)
+    mask * factor .+ .!mask 
+end
+
+function get_double_factor(total, mask1, mask2, factor1)
+    total1 = sum(total[mask1])
+    total2 = sum(total[mask2])
+    new_total1 = factor1 * total1
+    new_total2 = total2 + total1 - new_total1
+    factor2 = new_total2 / total2
+
+    factor = (mask1 * factor1 .+ .!mask1) .* (mask2 * factor2 .+ .!mask2)
+
+    return factor
+end
+
+function get_all_factors(params, assets, total)
+    return (
+        get_factor(assets.masks.fc, params.sk_fc_norm * params.sk_fiducial_norm) .*
+        get_factor(assets.masks.pc, params.sk_pc_norm * params.sk_fiducial_norm) .*
+        get_factor(assets.masks.upmu, params.sk_upmu_norm) .*
+        get_double_factor(total, assets.masks.pc_stop, assets.masks.pc_thru, params.sk_pc_stopping_vs_througoing) .*
+        get_double_factor(total, assets.masks.umpmu_stop, assets.masks.upmu_thru, params.sk_upmu_stopping_vs_througoing) .*
+        get_double_factor(total, assets.masks.upmu_nonshower, assets.masks.upmu_shower, params.sk_upmu_nonshower_vs_shower) .* 
+        get_double_factor(total, assets.masks.sk_i_iii_elike_1decay_e, assets.masks.sk_i_iii_elike_0decay_e, params.sk_i_iii_decay_e_tag_eff) .*
+        get_double_factor(total, assets.masks.sk_i_iii_mulike_1decay_e, assets.masks.sk_i_iii_mulike_0decay_e, params.sk_i_iii_decay_e_tag_eff) .*
+        get_double_factor(total, assets.masks.sk_i_iii_mulike_2decay_e, assets.masks.sk_i_iii_mulike_1decay_e, params.sk_i_iii_decay_e_tag_eff) .*
+        get_double_factor(total, assets.masks.sk_iv_v_1decay_e, assets.masks.sk_iv_v_0decay_e, params.sk_iv_v_decay_e_tag_eff) .*
+        get_double_factor(total, assets.masks.sk_iv_v_subgev_0neutron, assets.masks.sk_iv_v_subgev_1neutron, params.sk_iv_v_subgev_neutron_tag_eff) .*
+        get_double_factor(total, assets.masks.sk_iv_v_multigev_0neutron, assets.masks.sk_iv_v_multigev_1neutron, params.sk_iv_v_multigev_neutron_tag_eff) .*
+        get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_nuebar, assets.masks.sk_i_v_multigev_multiring_nue, params.sk_i_v_btd_1) .*
+        get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_nue, assets.masks.sk_i_v_multigev_multiring_mu, params.sk_i_v_btd_2) .*
+        get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_mu, assets.masks.sk_i_v_multigev_multiring_other, params.sk_i_v_btd_3)
+    )
+end
+
+function get_expected(params, physics, assets)
+    expected = reweight(params, physics, assets)
+
+    total = sum([expected[key] for key in keys(expected)])
+
+    factors = get_all_factors(params, assets, total)
+
+    nunc = expected.nunc .* factors .* get_factor(assets.masks.mu_indices, params.sk_nc_mu_norm) #* params.nc_norm 
+    
+    nue = expected.nue .* factors
+    numu = expected.numu .* factors
+    nutau = expected.nutau .* factors #.* params.nutau_cc_norm
+    nuebar = expected.nuebar .* factors
+    numubar = expected.numubar .* factors
+
+    return (; nue, numu, nutau, nuebar, numubar, nunc)
+end
+
+function get_forward_model(physics, assets)
+    function fwd_model(params)
+        expected = get_expected(params, physics, assets)
+        total = sum(expected[key] for key in keys(expected))
+        clamped = max.(1e-3, total)
+        distprod(Poisson.(clamped))
+    end
+end
+
+
+function get_plot(physics, assets)
+
+    function format_plot_title(raw::String)
+        # Replace underscores with spaces
+        title = replace(raw, "_" => " ")
+
+        # Replace known abbreviations with readable forms
+        replacements = Dict(
+            "fc" => "FC",
+            "pc" => "PC",
+            "subgev" => "Sub-GeV",
+            "multigev" => "Multi-GeV",
+            "1ring" => "1-Ring",
+            "decaye" => "Decay-e",
+            "sk1-3" => "SKI-III",
+            "sk1-5" => "SKI-V",
+            "sk4-5" => "SKIV-V",
+            "nuelike" => "νe-like",
+            "nuebarlike" => "νe-bar-like",
+            "numubarlike" => "‾νμ-bar-like",
+            "numulike" => "νμ-like",
+        )
+
+        for (key, val) in replacements
+            title = replace(title, key => val)
+        end
+
+        # Capitalize first letter of each word
+        #title = join(uppercasefirst.(split(title)), " ")
+
+        return title
+    end
+
+    plot_order = [:nunc, :numubar, :nuebar, :nutau, :numu, :nue]
+    plot_color = Dict(zip(plot_order, [:gray80, :paleturquoise, :lightpink, :purple, :steelblue3, :red3]))
+    plot_labels = Dict(zip(plot_order, [L"NC", L"$\bar{\nu}_\mu$", L"$\bar{\nu}_e$", L"$\nu_\tau$", L"$\nu_\mu$", L"$\nu_e$"]))
+
+    function plot(params, data=assets.observed)
+
+        bininfo = assets.bininfo
+        expected = get_expected(params, physics, assets)
+
+        fig = Figure()
+        for (i,sample) in enumerate(unique(bininfo.Sample))
+            grid_idx = (Int(floor((i-1)/5))+1, (i-1)%5+1)
+            inds = findall(bininfo.Sample .== sample)
+            e = NamedTuple(key => expected[key][inds] for key in keys(expected))
+            o = data[inds]
+            ax = Axis(fig[grid_idx...]; title=format_plot_title(sample), width = 200, height = 150, titlesize=10)
+            if all(bininfo.CosZMin[inds] .== -1.0)
+                bins = vcat(bininfo.logPMin[inds], [bininfo.logPMax[inds][end]])
+                bottom = first(e) * 0.0
+                for key in plot_order
+                    hist!(ax, midpoints(bins), bins=bins, weights=e[key], offset=bottom, label=plot_labels[key], color=plot_color[key])
+                    bottom .+= e[key]
+                end
+                scatter!(ax, midpoints(bins), o, color=:black)
+            else
+                bins = vcat(unique(bininfo.CosZMin[inds]), [bininfo.CosZMax[inds][end]])
+                bottom = fit(Histogram, bininfo.CosZMin[inds], weights(first(e)), bins).weights * 0.0
+
+                for key in plot_order
+                    hist!(ax, bininfo.CosZMin[inds], bins=bins, weights=e[key], offset=bottom, label=plot_labels[key], color=plot_color[key])
+                    bottom .+= fit(Histogram, bininfo.CosZMin[inds], weights(e[key]), bins).weights
+                end
+                h = fit(Histogram, bininfo.CosZMin[inds], weights(o), bins)
+                scatter!(ax, midpoints(bins), h.weights, color=:black, label="Data")
+            end
+
+            total_e = sum(e[key] for key in keys(e))
+            t_e = sum(total_e)
+            t_o = sum(o)
+            chi2_ndf = sum((total_e .- o).^2 ./ total_e) / size(o)[1]
+            text!(ax, 0, 1, text = @sprintf("χ²/n.d.f = %.2f\nTotal MC: %.1f\nTotal Data: %.1f", chi2_ndf, t_e, t_o), space=:relative, fontsize=10, align = (:left, :top), offset = (4, -2))
+
+        end
+        Legend(fig[6,5], fig.content[1]; position=:rb, nbanks=2)
+        resize_to_layout!(fig)
+        fig
+    end
+end
+
+end

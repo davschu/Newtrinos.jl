@@ -45,19 +45,23 @@ end
 
 function get_params(cfg::Barr)
     params = (
-        atm_flux_nunubar_sigma = 0.,
+        atm_flux_nuenuebar_sigma = 0.,
+        atm_flux_numunumubar_sigma = 0.,
         atm_flux_nuenumu_sigma = 0.,
         atm_flux_delta_spectral_index = 0.,
         atm_flux_uphorizonzal_sigma = 0.,
+        atm_flux_updown_sigma = 0.,
         )
 end
 
 function get_priors(cfg::Barr)
     priors = (
-        atm_flux_nunubar_sigma = Truncated(Normal(0., 1.), -3, 3),
+        atm_flux_nuenuebar_sigma = Truncated(Normal(0., 1.), -3, 3),
+        atm_flux_numunumubar_sigma = Truncated(Normal(0., 1.), -3, 3),
         atm_flux_nuenumu_sigma = Truncated(Normal(0., 1.), -3, 3),
         atm_flux_delta_spectral_index = Truncated(Normal(0., 0.1), -0.3, 0.3),
         atm_flux_uphorizonzal_sigma = Truncated(Normal(0., 1.), -3, 3),
+        atm_flux_updown_sigma = Truncated(Normal(0., 1.), -3, 3),
         )
 end
 
@@ -122,44 +126,56 @@ function uphorizontal(coszen, rel_error)
     1 / sqrt((b^2 - a^2) * coszen^2 + a^2)
 end
 
+function updown(coszen, up_down_ratio)
+    # Smooth transition function: ranges from -1 (down) to +1 (up)
+    transition = tanh.(3 * coszen)
+    # Interpolate between 1/up_down_ratio and up_down_ratio
+    scale = (1 ./ up_down_ratio).^(0.5 * (1 .- transition)) .* (up_down_ratio).^(0.5 * (1 .+ transition))
+    return scale
+end
+
 function get_sys_flux(cfg::Barr)
     function sys_flux(flux, params)
     
         e = flux.true_energy
         log10e = flux.log10_true_energy
         cz = flux.true_coszen
-    
+
         # spectral
         f_spectral_shift = (e ./ 24.0900951261) .^ params.atm_flux_delta_spectral_index
-    
+
         # all coefficients below come from fits to the Figs. 7 & 9 in Uncertainties in Atmospheric Neutrino Fluxes by Barr & Robbins
         
         # nue - nuebar
         uncert = ((0.73 * e) .^(0.59) .+ 4.8) / 100.
-        flux_nue1, flux_nuebar1 = scale_flux(flux.nue, flux.nuebar, 1. .+ (params.atm_flux_nunubar_sigma .* uncert))
+        flux_nue1, flux_nuebar1 = scale_flux(flux.nue, flux.nuebar, 1. .+ (params.atm_flux_nuenuebar_sigma .* uncert))
         
         # numu - numubar
         uncert = ((9.6 * e) .^(0.41) .-0.8) / 100.
-        flux_numu1, flux_numubar1 = scale_flux(flux.numu, flux.numubar, 1. .+ (params.atm_flux_nunubar_sigma .* uncert))        
-    
+        flux_numu1, flux_numubar1 = scale_flux(flux.numu, flux.numubar, 1. .+ (params.atm_flux_numunumubar_sigma .* uncert))        
+
         # nue - numu
         uncert = ((0.051 * e) .^(0.63) .+ 0.73) / 100.
         flux_nue2, flux_numu2 = scale_flux(flux_nue1, flux_numu1, 1. .- (params.atm_flux_nuenumu_sigma .* uncert))
         flux_nuebar2, flux_numubar2 = scale_flux(flux_nuebar1, flux_numubar1, 1. .- (params.atm_flux_nuenumu_sigma .* uncert))
-    
+
+        #up/down
+        uncert = max.(0., 7 ./ (1 .+ (e./0.5) .^2)) / 100.
+        f_updown = updown(cz, 1 .+ uncert * params.atm_flux_updown_sigma)   
+
         # up/horizontal
         # nue
         uncert = (-0.43*log10e.^5 .+ 1.17*log10e.^4 .+ 0.89*log10e.^3 .- 0.36*log10e.^2 .- 1.59*log10e .+ 1.96) / 100.
         f_uphorizontal = uphorizontal.(cz, 1 .+ uncert * params.atm_flux_uphorizonzal_sigma) 
-        flux_nue3 = flux_nue2 .* f_spectral_shift .* f_uphorizontal
-        flux_nuebar3 = flux_nuebar2 .* f_spectral_shift .* f_uphorizontal
+        flux_nue3 = flux_nue2 .* f_spectral_shift .* f_uphorizontal .* f_updown
+        flux_nuebar3 = flux_nuebar2 .* f_spectral_shift .* f_uphorizontal .* f_updown
         
         #numu
         uncert = (-0.16*log10e.^5 .+ 0.45*log10e.^4 .+ 0.48*log10e.^3 .+ 0.17*log10e.^2 .- 1.88*log10e .+ 1.88) / 100.
         f_uphorizontal = uphorizontal.(cz, 1 .+ uncert * params.atm_flux_uphorizonzal_sigma) 
-        flux_numu3 = flux_numu2 .* f_spectral_shift .* f_uphorizontal
-        flux_numubar3 = flux_numubar2 .* f_spectral_shift .* f_uphorizontal
-    
+        flux_numu3 = flux_numu2 .* f_spectral_shift .* f_uphorizontal .* f_updown
+        flux_numubar3 = flux_numubar2 .* f_spectral_shift .* f_uphorizontal .* f_updown
+
         return (nue=flux_nue3, numu=flux_numu3, nuebar=flux_nuebar3, numubar=flux_numubar3)
     
     end
