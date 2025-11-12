@@ -18,6 +18,7 @@ include("physics/xsec.jl")
 include("analysis/analysis_tools.jl")
 include("analysis/molewhacker.jl")
 include("utils/plotting.jl")
+include("utils/plotting_bat.jl")
 include("utils/autodiff.jl")
 
 include("experiments/daya_bay/daya_bay_3158days/dayabay.jl")
