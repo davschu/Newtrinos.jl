@@ -58,7 +58,7 @@ function build_params_and_priors(isotopes)
     )
     for iso in isotopes
         param_dict[iso.Rn_key] = iso.Rn_nom
-        prior_dict[iso.Rn_key] = Uniform(iso.Rn_nom, iso.Rn_nom + 2 * 1)
+        prior_dict[iso.Rn_key] = Uniform(0.0, iso.Rn_nom + 2 * 1)
     end
     return ((; param_dict...), (; prior_dict...))
 end
