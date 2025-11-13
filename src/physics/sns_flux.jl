@@ -17,9 +17,6 @@ const me = 0.510998
 const mmu = 105.6
 const mtau = 1776.86
 const mpi = 139.57
-const sw2 = 0.231
-const gu = 1/2 - 2*2/3*sw2
-const gd = -(1/2) + 2*1/3*sw2
 const alph = 1/137
 const ep = (mpi^2 - mmu^2) / (2*mpi)
 
