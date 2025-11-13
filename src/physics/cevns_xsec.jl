@@ -11,6 +11,14 @@ using ..Newtrinos
     diff_xsec::Function
 end
 
+const gf=1.1663787e-11
+const me = 0.510998
+const mmu = 105.6
+const mtau=1776.86
+const mpi = 139.57
+const alph = 1/137
+const ep= (mpi^2-mmu^2)/(2*mpi)
+
 # Only keep the dynamic configure (isotope_keys) and the (params, priors) version
 function configure(isotopes, er_centers, enu_centers)
     # Build assets from isotopes
@@ -39,30 +47,21 @@ function build_params_and_priors(isotopes)
         :cevns_xsec_b => 0.0,
         :cevns_xsec_c => 0.0,
         :cevns_xsec_d => 0.0,
+        :sin2thetaW => 0.231,
     )
     prior_dict = Dict{Symbol, Distributions.Distribution}(
         :cevns_xsec_a => Uniform(-2, 2),
         :cevns_xsec_b => Uniform(-2000.0, 2000.0),
         :cevns_xsec_c => Uniform(-3, 3),
         :cevns_xsec_d => Uniform(-1e6, 1e6),
+        :sin2thetaW => truncated(Normal(0.231, 0.00013), 0.2, 0.26),
     )
     for iso in isotopes
         param_dict[iso.Rn_key] = iso.Rn_nom
-        prior_dict[iso.Rn_key] = truncated(Normal(iso.Rn_nom, 1), 0.0, iso.Rn_nom + 3 * 1)
+        prior_dict[iso.Rn_key] = Uniform(iso.Rn_nom, iso.Rn_nom + 2 * 1)
     end
-    return (NamedTuple(param_dict), NamedTuple(prior_dict))
+    return ((; param_dict...), (; prior_dict...))
 end
-
-const gf=1.1663787e-11
-const me = 0.510998
-const mmu = 105.6
-const mtau=1776.86
-const mpi = 139.57
-const sw2 = 0.231
-const gu = 1/2 - 2*2/3*sw2
-const gd = -(1/2) + 2*1/3*sw2
-const alph = 1/137
-const ep= (mpi^2-mmu^2)/(2*mpi)
 
 function get_assets(isotopes, er_centers, enu_centers)
     # Extract isotope data into a structured format
@@ -102,7 +101,7 @@ function ds(er, enu, params, nupar, Rn_key)
     Z  = nupar[2]
     N  = nupar[3]
     rn = params[Rn_key]
-
+    sw2 = params.sin2thetaW
     # Per-Er prefactor (n_er,)
     C1d = (gf^2 / (4 * pi)) .* ffsq.(er, mN, rn)
 
