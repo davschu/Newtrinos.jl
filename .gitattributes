@@ -1,0 +1,10 @@
+# Treat all Julia files as Julia
+*.jl linguist-language=Julia
+*.jl linguist-detectable=true
+
+# Treat all Jupyter notebooks as Jupyter Notebook
+*.ipynb linguist-language=Jupyter Notebook
+*.ipynb linguist-detectable=true
+
+# Ignore everything else
+* linguist-detectable=false
