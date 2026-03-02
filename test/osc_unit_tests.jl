@@ -155,9 +155,28 @@ using StaticArrays
         #@test check result_simple values
         #test osc_kernel with low pass filter
         result_lowpass=Newtrinos.osc.osc_kernel(U, H, e, l, σₑ)
-        @test size(result_lowpass) == (3,3)
+        @test length(result_lowpass) == 2
+        @test size(result_lowpass[1]) == (3, 3)
+        @test size(result_lowpass[2]) == (3,)
         @test result_lowpass' * result_lowpass ≈ I atol=1e-12 
-        #@test check result_lowpass values
+        #test matrix elements against results from rigorous calculation
+        u11,u22,u33, u12,u13,u21,u23,u31,u32 = U[1,1], U[2,2], U[3,3], U[1,2], U[1,3], U[2,1], U[2,3], U[3,1], U[3,2]
+        phi_simple = -F_units * 1im * (l / e) .* H
+        phi_decay = - 2 * abs.(-1im*phi_simple) * σₑ^2
+        phi_lowpass = phi_simple + phi_decay
+        
+        for phi in [phi_simple, phi_lowpass] 
+            expected_kernel_matrix= [
+                u11^2*exp(phi[1])+u12^2*exp(phi[2])+u13^2*exp(phi[3])           u11*u21*exp(phi[1])+u12*u22*exp(phi[2])+u13*u23*exp(phi[3])     u11*u31*exp(phi[1])+u12*u32*exp(phi[2])+u13*u33*exp(phi[3])
+                u21*u11*exp(phi[1])+u22*u12*exp(phi[2])+u23*u13*exp(phi[3])     u21^2*exp(phi[1])+u22^2*exp(phi[2])+u23^2*exp(phi[3])           u21*u31*exp(phi[1])+u22*u32*exp(phi[2])+u23*u33*exp(phi[3])
+                u31*u11*exp(phi[1])+u32*u12*exp(phi[2])+u33*u13*exp(phi[3])     u31*u21*exp(phi[1])+u32*u22*exp(phi[2])+u33*u23*exp(phi[3])     u31^2*exp(phi[1])+u32^2*exp(phi[2])+u33^2*exp(phi[3])]
+            if phi == phi_simple
+                @test collect(Newtrinos.osc.osc_kernel(U, H, e, l)) ≈ expected_kernel_matrix atol=5e-6
+            elseif phi == phi_lowpass
+                @test collect(Newtrinos.osc.osc_kernel(U, H, e, l, σₑ)[1]) ≈ expected_kernel_matrix atol=5e-6
+                @test Newtrinos.osc.osc_kernel(U, H, e, l, σₑ)[2] ≈ exp.(phi_decay) atol=5e-6
+            end
+        end
 
         #test compute_matter_matrices()
         #TODO: understand first and then test!
