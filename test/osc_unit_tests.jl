@@ -179,11 +179,34 @@ using StaticArrays
         end
 
         #test compute_matter_matrices()
-        #TODO: understand first and then test!
+        H_eff = [1.0 0.2 0.1; 0.2 2.0 0.3; 0.1 0.3 3.0] #example hamiltonian
+        static_H_eff = SMatrix{3,3}(H_eff)
+        layer = Newtrinos.osc.Layer(6371.0, 2.0, 1.5) #radius earth and example proton/neutron densities
+        e = 1.5 #energy value
         
-        #=@test compute_matter_matrices()#two variants
-        @test osc_reduce() #two variants
-        @test matter_osc_per_e() #two variants
+        vecs, vals = Newtrinos.osc.compute_matter_matrices(H_eff, e, layer, false, Newtrinos.osc.SI())
+        vecs_anti, vals_anti = Newtrinos.osc.compute_matter_matrices(H_eff, e, layer, true, Newtrinos.osc.SI())
+        static_vecs, static_vals = Newtrinos.osc.compute_matter_matrices(static_H_eff, e, layer, false, Newtrinos.osc.SI())
+        @test size(vecs) == (3, 3)
+        @test size(vals) == (3,)
+        #test compatibility of the two implementations (static vs non-static)
+        @test vals ≈ static_vals atol=1e-6
+        @test abs.(vecs) ≈ abs.(static_vecs) atol=1e-6 # we can only compare the absolute values, because the eigenvectors are not uniquely defined (phase and order)
+        #compare to expected values
+        A, f, n_p, n_n = Newtrinos.osc.A, e*1e9, layer.p_density, layer.n_density
+        H = [1.0+2*A*n_p*f-A*n_n*f 0.2 0.1; 0.2 2.0-A*n_n*f 0.3; 0.1 0.3 3.0-A*n_n*f] #anti = false
+        expected_vals = eigvals(H)
+        expected_vecs = eigvecs(H)
+        #print(expected_vals, expected_vecs, "\n")
+        #print(vals, vecs)
+        @test collect(vals) ≈ collect(expected_vals) atol=1e-6
+        @test collect(vecs) ≈ collect(expected_vecs) atol=1e-6 
+        
+        #test osc_reduce()
+        #@test osc_reduce() #two variants
+
+
+        #=@test matter_osc_per_e() #two variants
         @test select() #two variants
         @test propagate() #five variants
         @test get_osc_prob() 
