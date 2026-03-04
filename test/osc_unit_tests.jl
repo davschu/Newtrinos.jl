@@ -157,11 +157,10 @@ using StaticArrays
         result_lowpass=Newtrinos.osc.osc_kernel(U, H, e, l, σₑ)
         @test length(result_lowpass) == 2
         @test size(result_lowpass[1]) == (3, 3)
-        @test size(result_lowpass[2]) == (3,)
-        @test result_lowpass' * result_lowpass ≈ I atol=1e-12 
+        @test size(result_lowpass[2]) == (3,) 
         #test matrix elements against results from rigorous calculation
         u11,u22,u33, u12,u13,u21,u23,u31,u32 = U[1,1], U[2,2], U[3,3], U[1,2], U[1,3], U[2,1], U[2,3], U[3,1], U[3,2]
-        phi_simple = -F_units * 1im * (l / e) .* H
+        phi_simple = -Newtrinos.osc.F_units * 1im * (l / e) .* H
         phi_decay = - 2 * abs.(-1im*phi_simple) * σₑ^2
         phi_lowpass = phi_simple + phi_decay
         
@@ -183,7 +182,7 @@ using StaticArrays
         static_H_eff = SMatrix{3,3}(H_eff)
         layer = Newtrinos.osc.Layer(6371.0, 2.0, 1.5) #radius earth and example proton/neutron densities
         e = 1.5 #energy value
-        
+
         vecs, vals = Newtrinos.osc.compute_matter_matrices(H_eff, e, layer, false, Newtrinos.osc.SI())
         vecs_anti, vals_anti = Newtrinos.osc.compute_matter_matrices(H_eff, e, layer, true, Newtrinos.osc.SI())
         static_vecs, static_vals = Newtrinos.osc.compute_matter_matrices(static_H_eff, e, layer, false, Newtrinos.osc.SI())
@@ -195,15 +194,36 @@ using StaticArrays
         #compare to expected values
         A, f, n_p, n_n = Newtrinos.osc.A, e*1e9, layer.p_density, layer.n_density
         H = [1.0+2*A*n_p*f-A*n_n*f 0.2 0.1; 0.2 2.0-A*n_n*f 0.3; 0.1 0.3 3.0-A*n_n*f] #anti = false
-        expected_vals = eigvals(H)
-        expected_vecs = eigvecs(H)
-        #print(expected_vals, expected_vecs, "\n")
-        #print(vals, vecs)
+        expected_vals, expected_vecs = eigvals(H), eigvecs(H)
         @test collect(vals) ≈ collect(expected_vals) atol=1e-6
         @test collect(vecs) ≈ collect(expected_vecs) atol=1e-6 
         
         #test osc_reduce()
-        #@test osc_reduce() #two variants
+        #take matter matrices and energy e=1.5 (GeV) from above
+        matter_matrices = [(vecs, vals), (static_vecs, static_vals)] 
+        path = [(layer_idx = 1, length = 5.0), (layer_idx = 2, length = 10.0)] #define path through matter (here: path ~ 5 km through abstr. matter matrix, and then 10 km through matter Smatrix)
+        #with basic propagation
+        U_expected_1 = Newtrinos.osc.osc_kernel(matter_matrices[1][1], matter_matrices[1][2], e, path[1].length) 
+        U_expected_2 = Newtrinos.osc.osc_kernel(matter_matrices[2][1], matter_matrices[2][2], e, path[2].length)
+        P_expected= abs2.(U_expected_1 * U_expected_2) #expected probability matrix for the given path through matter
+        P_result_Basic = Newtrinos.osc.osc_reduce(matter_matrices, path, e, Newtrinos.osc.Basic())
+        #with damping propagation: sigma_e = 0.1
+        #get decay factor for each layer from the osc_kernel with lowpass filter for both matter matrices
+        res1 = Newtrinos.osc.osc_kernel(matter_matrices[1][1], matter_matrices[1][2], e, path[1].length, Newtrinos.osc.Damping().σₑ)
+        res2 = Newtrinos.osc.osc_kernel(matter_matrices[2][1], matter_matrices[2][2], e, path[2].length, Newtrinos.osc.Damping().σₑ)
+        #use bold approximation: coherent neutrino behaves as if it was influenced by an average weighted damping factor for the entire path 
+        #-> matter_matrix_avg = sum(Length_i * matrix_i) / sum(Lenght_i) 
+        matter_matrix_avg = (path[1].length * abs2.(matter_matrices[1][1]) + path[2].length * abs2.(matter_matrices[2][1])) / (path[1].length + path[2].length)
+        #combine coherent and incoherent parts to account for damping effects in the probability matrix 
+        P_expected_Damping = abs2.(res1[1] * res2[1]) .+ matter_matrix_avg * Diagonal(1 .- abs2.(res1[2] .* res2[2])) * matter_matrix_avg' 
+        P_result_Damping = Newtrinos.osc.osc_reduce(matter_matrices, path, e, Newtrinos.osc.Damping())
+        #@test collect(Newtrinos.osc.osc_reduce(matter_matrices, path, e, Newtrinos.osc.Basic())) ≈ P_expected atol=1e-6
+        @test size(P_result_Basic) == size(matter_matrices[1][1])
+        @test size(P_result_Damping) == size(matter_matrices[1][1])
+        @test all(P_result_Basic .>= 0) && all(P_result_Basic .<= 1)
+        @test all(P_result_Damping .>= 0) && all(P_result_Damping .<= 1)
+        @test P_result_Basic ≈ P_expected atol=1e-6
+        @test P_result_Damping ≈ P_expected_Damping atol=1e-6
 
 
         #=@test matter_osc_per_e() #two variants
