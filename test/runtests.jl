@@ -9,4 +9,5 @@ using Test
     include("test_analysis.jl")
     include("test_autodiff.jl")
     include("test_regression.jl")
+    include("osc_unit_tests.jl")
 end
