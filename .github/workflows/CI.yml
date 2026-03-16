@@ -23,7 +23,9 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.12'
+          - '1.10' # long-term support release
+          - '1'    # 1.X latest stable release
+          - 'pre'  # pre-release
         os:
           - ubuntu-latest
         arch:
@@ -37,3 +39,13 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with: 
+          coverage: ${{ matrix.version == '1' && matrix.os == 'ubuntu-latest' && matrix.arch == 'x64' }}
+      - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.version == '1' && matrix.os == 'ubuntu-latest' && matrix.arch == 'x64'
+      - uses: codecov/codecov-action@v5
+        if: matrix.version == '1' && matrix.os == 'ubuntu-latest' && matrix.arch == 'x64'
+        with:
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
