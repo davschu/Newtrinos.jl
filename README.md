@@ -1,4 +1,4 @@
-<--- badges of CI, coverage, license, docs(missing)-->
+<!--- badges of CI, coverage, license, docs(missing)-->
 [![CI](https://github.com/davschu/Newtrinos.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/davschu/Newtrinos.jl/actions/workflows/CI.yml)
 [![codecov](https://codecov.io/github/davschu/Newtrinos.jl/graph/badge.svg?token=OTXXQIR8GW)](https://codecov.io/github/davschu/Newtrinos.jl)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
