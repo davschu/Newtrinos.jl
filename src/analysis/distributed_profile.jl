@@ -8,15 +8,15 @@ function parse_command_line()
     s = ArgParseSettings()
 
     @add_arg_table s begin
-        # "--experiments"
-        # help = "List of experiments to run"
-        # nargs = '+'
-        # required = true
+        "--experiments"
+        help = "List of experiments to run"
+        nargs = '+'
+        required = true
 
-        # "--ordering"
-        # help = "NMO: either NO or IO"
-        # arg_type = String
-        # default = "NO"      
+        "--ordering"
+        help = "NMO: either NO or IO"
+        arg_type = String
+        default = "NO"      
 
         "--name"
         help = "Name for outputs"
@@ -36,11 +36,14 @@ function parse_command_line()
     return parse_args(s)
 end
 
+
 args = parse_command_line()
 
 addprocs(args["workers"])
-
 name = args["name"]
+
+@everywhere args = $args
+
 
 @everywhere begin
     using LinearAlgebra
@@ -55,7 +58,7 @@ name = args["name"]
     using Newtrinos
 
     osc_cfg = Newtrinos.osc.OscillationConfig(
-        flavour=Newtrinos.osc.ThreeFlavour(ordering=Symbol(:NO)),
+        flavour=Newtrinos.osc.ThreeFlavour(ordering=Symbol(args["ordering"])),
         propagation=Newtrinos.osc.Basic(),
         states=Newtrinos.osc.All(),
         interaction=Newtrinos.osc.SI()
@@ -69,7 +72,7 @@ name = args["name"]
     earth_layers = Newtrinos.earth_layers.configure()
     xsec=Newtrinos.xsec.configure(Newtrinos.xsec.Differential_H2O())
 
-    physics = (; osc, atm_flux, earth_layers, xsec);
+    physics = (; osc, xsec, atm_flux, earth_layers)#, xsec);
 
     # dynamically construct named tuple from experiment names
     function configure_experiments(experiment_list, physics)
@@ -77,7 +80,7 @@ name = args["name"]
         return (; pairs...)
     end
 
-    experiments = configure_experiments(["super_k",], physics)
+    experiments = configure_experiments(args["experiments"], physics)
     likelihood = Newtrinos.generate_likelihood(experiments)
 end
 
@@ -90,13 +93,13 @@ priors = Newtrinos.condition(priors, conditional_vars, params)
 @reset priors.Δm²₃₁ = Uniform(0.0018, 0.0028)
 @reset priors.θ₂₃ = Uniform(pi/4-0.2, pi/4+0.2)
 vars_to_scan = OrderedDict()
-vars_to_scan[:θ₂₃] = 11
-vars_to_scan[:Δm²₃₁] = 11
+vars_to_scan[:θ₂₃] = 3
+vars_to_scan[:Δm²₃₁] = 3
 values, scanpoints = Newtrinos.generate_scanpoints(vars_to_scan, priors)
 
 cache_dir = joinpath(@__DIR__, name)
 
-if isnothing(cache_dir)
+if !isdir(cache_dir)
     mkdir(cache_dir)
 end
 
