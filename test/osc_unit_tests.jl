@@ -122,7 +122,7 @@ using StaticArrays
         test_params_2 = (θ₁₂ = 0.6, θ₁₃ = 0.2, θ₂₃ = 0.7, δCP = 0.4)
         test_params_3 = (θ₁₂ = 0.4, θ₁₃ = 0.15, θ₂₃ = 0.9, δCP = -0.5)
 
-        #test get_PMNS
+        #TEST get_PMNS
         for params in [test_params_1,test_params_2, test_params_3]
             s12, c12 = sin(params.θ₁₂), cos(params.θ₁₂)
             s13, c13 = sin(params.θ₁₃), cos(params.θ₁₃)
@@ -139,12 +139,12 @@ using StaticArrays
             @test Newtrinos.osc.get_PMNS(params) isa SMatrix{3,3}
         end
 
-        #test get_abs_masses()
+        #TEST get_abs_masses()
         @test Newtrinos.osc.get_abs_masses((m₀=1.5, Δm²₂₁=2.3, Δm²₃₁=3.1)) isa Tuple
         @test collect(Newtrinos.osc.get_abs_masses((m₀=1.5, Δm²₂₁=2.3, Δm²₃₁=3.1))) ≈ [1.5, 2.1330729, 2.3130067] atol=1e-6
         @test collect(Newtrinos.osc.get_abs_masses((m₀=0.4, Δm²₂₁=1.2, Δm²₃₁=-2.4))) ≈ [1.6, 1.9390719, 0.4] atol=1e-6
         
-        #test osc_kernel()
+        #TEST osc_kernel()
         U = @SMatrix [cos(π/4) sin(π/4) 0; -sin(π/4) cos(π/4) 0; 0 0 1]
         H = @SVector [0.0, 2.5e-5, 1] 
         e, l, σₑ = 1.0, 100.0, 2       
@@ -152,7 +152,6 @@ using StaticArrays
         result_simple = Newtrinos.osc.osc_kernel(U, H, e, l)
         @test size(result_simple) == (3, 3)
         @test result_simple' * result_simple ≈ I atol=1e-12
-        #@test check result_simple values
         #test osc_kernel with low pass filter
         result_lowpass=Newtrinos.osc.osc_kernel(U, H, e, l, σₑ)
         @test length(result_lowpass) == 2
@@ -177,7 +176,7 @@ using StaticArrays
             end
         end
 
-        #test compute_matter_matrices()
+        #TEST compute_matter_matrices()
         H_eff = [1.0 0.2 0.1; 0.2 2.0 0.3; 0.1 0.3 3.0] #example hamiltonian
         static_H_eff = SMatrix{3,3}(H_eff)
         layer = Newtrinos.osc.Layer(6371.0, 2.0, 1.5) #radius earth and example proton/neutron densities
@@ -198,7 +197,7 @@ using StaticArrays
         @test collect(vals) ≈ collect(expected_vals) atol=1e-6
         @test collect(vecs) ≈ collect(expected_vecs) atol=1e-6 
         
-        #test osc_reduce()
+        #TEST osc_reduce()
         #take matter matrices and energy e=1.5 (GeV) from above
         matter_matrices = [(vecs, vals), (static_vecs, static_vals)] 
         path = [(layer_idx = 1, length = 5.0), (layer_idx = 2, length = 10.0)] #define path through matter (here: path ~ 5 km through abstr. matter matrix, and then 10 km through matter Smatrix)
@@ -213,9 +212,9 @@ using StaticArrays
         res2 = Newtrinos.osc.osc_kernel(matter_matrices[2][1], matter_matrices[2][2], e, path[2].length, Newtrinos.osc.Damping().σₑ)
         #use bold approximation: coherent neutrino behaves as if it was influenced by an average weighted damping factor for the entire path 
         #-> matter_matrix_avg = sum(Length_i * matrix_i) / sum(Lenght_i) 
-        matter_matrix_avg = (path[1].length * abs2.(matter_matrices[1][1]) + path[2].length * abs2.(matter_matrices[2][1])) / (path[1].length + path[2].length)
+        P_bold_avg = (path[1].length * abs2.(matter_matrices[1][1]) + path[2].length * abs2.(matter_matrices[2][1])) / (path[1].length + path[2].length)
         #combine coherent and incoherent parts to account for damping effects in the probability matrix 
-        P_expected_Damping = abs2.(res1[1] * res2[1]) .+ matter_matrix_avg * Diagonal(1 .- abs2.(res1[2] .* res2[2])) * matter_matrix_avg' 
+        P_expected_Damping = abs2.(res1[1] * res2[1]) .+ P_bold_avg * Diagonal(1 .- abs2.(res1[2] .* res2[2])) * P_bold_avg' 
         P_result_Damping = Newtrinos.osc.osc_reduce(matter_matrices, path, e, Newtrinos.osc.Damping())
         #@test collect(Newtrinos.osc.osc_reduce(matter_matrices, path, e, Newtrinos.osc.Basic())) ≈ P_expected atol=1e-6
         @test size(P_result_Basic) == size(matter_matrices[1][1])
@@ -225,9 +224,13 @@ using StaticArrays
         @test P_result_Basic ≈ P_expected atol=1e-6
         @test P_result_Damping ≈ P_expected_Damping atol=1e-6
 
+        #TEST matter_osc_per_e() 
+        #take H_eff, e, layer from above -> can take above matter matrices
+        #take path from above 
 
-        #=@test matter_osc_per_e() #two variants
-        @test select() #two variants
+        #@test Newtrinos.osc.matter_osc_per_e(H_eff, e, layer, path, false, Newtrinos.osc.SI()) 
+
+        #=@@test select() #two variants
         @test propagate() #five variants
         @test get_osc_prob() 
         @test osc_prob() #two variants=#
