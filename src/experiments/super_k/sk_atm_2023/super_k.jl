@@ -250,7 +250,7 @@ function get_assets(physics; datadir = @__DIR__)
     Fij = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
     for key in keys(R)
-        R_plus[key][:,:,1:50] .= R[key][:,1:50]
+        R_plus[key][:,:,1:50] .= R[key][:,:,1:50]
         R_minus[key][:,:,1:50] .= R[key][:,:,1:50]
     end
     weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
