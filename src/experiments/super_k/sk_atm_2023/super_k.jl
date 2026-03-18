@@ -111,7 +111,7 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
     n_logE = length(logE_grid)
     n_cosZ = length(cosZ_grid)
 
-    response_matrix = zeros(Float16, n_bins, n_logE-1, n_cosZ-1)
+    response_matrix = zeros(Float32, n_bins, n_logE-1, n_cosZ-1)
 
     for bin_idx in 1:n_bins
         bin = MC_component[bin_idx, :]
@@ -140,6 +140,15 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
     return response_matrix
 end
 
+function contract_R(R, weighted_flux)
+    # R is (n_bins, n_E, n_cz), weighted_flux is (n_E, n_cz)
+    # Contract over (E, cz) without broadcasting Dual numbers across R
+    n_bins = size(R, 1)
+    R_flat = reshape(R, n_bins, :)  # (n_bins, n_E*n_cz) — no copy, just reshape
+    flux_flat = vec(weighted_flux)   # (n_E*n_cz,)
+    R_flat * flux_flat               # (n_bins,) — matrix-vector multiply
+end
+
 function calc_weights(params, assets, physics)
 
     E = 10. .^midpoints(assets.loge_grid)
@@ -151,33 +160,33 @@ function calc_weights(params, assets, physics)
 
     s = (size(p)[1], size(p)[2])
 
-    xsec_nue     = reshape(physics.xsec.scale(E, :nue,   :CC, false, params), (1, :, 1))
-    xsec_numu    = reshape(physics.xsec.scale(E, :numu,  :CC, false, params), (1, :, 1))
-    xsec_nutau   = reshape(physics.xsec.scale(E, :nutau, :CC, false, params), (1, :, 1))
-    xsec_nuebar  = reshape(physics.xsec.scale(E, :nue,   :CC, true,  params), (1, :, 1))
-    xsec_numubar = reshape(physics.xsec.scale(E, :numu,  :CC, true,  params), (1, :, 1))
-    xsec_nutaubar= reshape(physics.xsec.scale(E, :nutau, :CC, true,  params), (1, :, 1))
+    xsec_nue     = physics.xsec.scale(E, :nue,   :CC, false, params)
+    xsec_numu    = physics.xsec.scale(E, :numu,  :CC, false, params)
+    xsec_nutau   = physics.xsec.scale(E, :nutau, :CC, false, params)
+    xsec_nuebar  = physics.xsec.scale(E, :nue,   :CC, true,  params)
+    xsec_numubar = physics.xsec.scale(E, :numu,  :CC, true,  params)
+    xsec_nutaubar= physics.xsec.scale(E, :nutau, :CC, true,  params)
     xsec_nc      = physics.xsec.scale(E, :nue,   :NC, false, params)
 
-    nue_flux   = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 1] .+
-                 reshape(flux.numu,   s) .* p[:, :, 2, 1], 1, s...)
-    numu_flux  = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 2] .+
-                 reshape(flux.numu,   s) .* p[:, :, 2, 2], 1, s...)
-    nutau_flux = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 3] .+
-                 reshape(flux.numu,   s) .* p[:, :, 2, 3], 1, s...)
-    nuebar_flux  = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 1] .+
-                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 1], 1, s...)
-    numubar_flux = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 2] .+
-                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 2], 1, s...)
-    nutaubar_flux  = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 3] .+
-                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 3], 1, s...)
+    nue_flux   = (reshape(flux.nue,    s) .* p[:, :, 1, 1] .+
+                  reshape(flux.numu,   s) .* p[:, :, 2, 1]) .* xsec_nue
+    numu_flux  = (reshape(flux.nue,    s) .* p[:, :, 1, 2] .+
+                  reshape(flux.numu,   s) .* p[:, :, 2, 2]) .* xsec_numu
+    nutau_flux = (reshape(flux.nue,    s) .* p[:, :, 1, 3] .+
+                  reshape(flux.numu,   s) .* p[:, :, 2, 3]) .* xsec_nutau
+    nuebar_flux  = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 1] .+
+                    reshape(flux.numubar, s) .* p_anti[:, :, 2, 1]) .* xsec_nuebar
+    numubar_flux = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 2] .+
+                    reshape(flux.numubar, s) .* p_anti[:, :, 2, 2]) .* xsec_numubar
+    nutaubar_flux = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 3] .+
+                     reshape(flux.numubar, s) .* p_anti[:, :, 2, 3]) .* xsec_nutaubar
 
-    nue = vec(sum(assets.R.nue .* nue_flux .* xsec_nue, dims=(2,3)))
-    numu = vec(sum(assets.R.numu .* numu_flux .* xsec_numu, dims=(2,3)))
-    nutau = vec(sum(assets.R.nutau .* nutau_flux .* xsec_nutau, dims=(2,3)))
-    nuebar = vec(sum(assets.R.nuebar .* nuebar_flux .* xsec_nuebar, dims=(2,3)))
-    numubar = vec(sum(assets.R.numubar .* numubar_flux .* xsec_numubar, dims=(2,3)))
-    nunc = vec(sum(assets.R.nunc .* xsec_nc, dims=(2,3)))
+    nue     = contract_R(assets.R.nue,     nue_flux)
+    numu    = contract_R(assets.R.numu,    numu_flux)
+    nutau   = contract_R(assets.R.nutau,   nutau_flux)
+    nuebar  = contract_R(assets.R.nuebar,  nuebar_flux)
+    numubar = contract_R(assets.R.numubar, numubar_flux)
+    nunc    = contract_R(assets.R.nunc,    ones(eltype(nue_flux), s) .* xsec_nc)
 
     return (; nue, numu, nutau, nuebar, numubar, nunc)
 end
