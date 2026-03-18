@@ -16,7 +16,7 @@ function parse_command_line()
         "--ordering"
         help = "NMO: either NO or IO"
         arg_type = String
-        default = "NO"      
+        default = "NO"
 
         "--name"
         help = "Name for outputs"
@@ -36,7 +36,6 @@ function parse_command_line()
     return parse_args(s)
 end
 
-
 args = parse_command_line()
 
 addprocs(args["workers"])
@@ -44,12 +43,10 @@ name = args["name"]
 
 @everywhere args = $args
 
-
 @everywhere begin
     using LinearAlgebra
     using Distributions
     using DensityInterface
-    using Base
     using ForwardDiff
     using BAT
     using IterTools
@@ -57,34 +54,13 @@ name = args["name"]
     using ADTypes
     using Newtrinos
 
-    osc_cfg = Newtrinos.osc.OscillationConfig(
-        flavour=Newtrinos.osc.ThreeFlavour(ordering=Symbol(args["ordering"])),
-        propagation=Newtrinos.osc.Basic(),
-        states=Newtrinos.osc.All(),
-        interaction=Newtrinos.osc.SI()
-        )
-    osc = Newtrinos.osc.configure(osc_cfg)
+    include(joinpath(@__DIR__, "cli_common.jl"))
 
-    atm_flux = Newtrinos.atm_flux.configure(
-            Newtrinos.atm_flux.AtmFluxConfig(nominal_model=Newtrinos.atm_flux.HKKM("kam-ally-20-01-mtn-solmin.d")
-            )
-        )
-    earth_layers = Newtrinos.earth_layers.configure()
-    xsec=Newtrinos.xsec.configure(Newtrinos.xsec.Differential_H2O())
-
-    physics = (; osc, xsec, atm_flux, earth_layers)#, xsec);
-
-    # dynamically construct named tuple from experiment names
-    function configure_experiments(experiment_list, physics)
-        pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)(physics) for exp in experiment_list)
-        return (; pairs...)
-    end
-
+    physics = configure_physics(args["ordering"])
     experiments = configure_experiments(args["experiments"], physics)
     likelihood = Newtrinos.generate_likelihood(experiments)
 end
 
-    
 params = Newtrinos.get_params(experiments)
 priors = Newtrinos.get_priors(experiments)
 conditional_vars = Dict(:θ₁₂=>params.θ₁₂, :δCP=>-1.89, :Δm²₂₁=>params.Δm²₂₁)
@@ -104,24 +80,10 @@ if !isdir(cache_dir)
 end
 
 t1 = time()
-results = Array{Any}(undef, size(scanpoints))
-llhs = Array{Any}(undef, size(scanpoints))
-log_posteriors = Array{Any}(undef, size(scanpoints))
-
 opt_results = pmap(x -> Newtrinos.find_mle_cached(likelihood, x, deepcopy(params), cache_dir), scanpoints)
-
-for (i, opt_result) in enumerate(opt_results)
-    llhs[i] = opt_result[1]
-    log_posteriors[i] = opt_result[2]
-    results[i] = opt_result[3]
-end
-
-s = OrderedDict(key=>[x[key] for x in results] for key in keys(first(results)))
-s[:llh] = llhs
-s[:log_posterior] = log_posteriors
-res = NamedTuple(s)
-
+res = Newtrinos.assemble_profile_results(opt_results, size(scanpoints))
 t2 = time()
+
 meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
 Newtrinos.add_meta!(meta)
 axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)

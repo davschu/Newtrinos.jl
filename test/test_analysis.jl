@@ -60,6 +60,26 @@ using DataStructures
         @test bf.x == 2.0  # axis value at best fit
     end
 
+    @testset "find_mle" begin
+        using Distributions, LinearAlgebra, DensityInterface, BAT, MeasureBase
+        function fwd(a, b)
+            return MvNormal([a,b], I(2))
+        end
+        likelihood = likelihoodof(splat(fwd), [0,0])
+        prior = distprod(a=Normal(0,1), b=Normal(0,1))
+        params = (a=0.5, b=-0.5)
+        llh, log_posterior, result = Newtrinos.find_mle(likelihood, prior, params)
+
+        @test isfinite(llh)
+        @test isfinite(log_posterior)
+        @test result isa NamedTuple
+        @test haskey(result, :a)
+        @test haskey(result, :b)
+        # MLE should be near (0, 0) for this problem
+        @test abs(result.a) < 0.1
+        @test abs(result.b) < 0.1
+    end
+
     @testset "get_params and get_priors" begin
         osc = Newtrinos.osc.configure()
 
