@@ -103,7 +103,7 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
     n_logE = length(logE_grid)
     n_cosZ = length(cosZ_grid)
 
-    response_matrix = zeros(Float32, n_bins, n_logE-1, n_cosZ-1)
+    response_matrix = zeros(Float16, n_bins, n_logE-1, n_cosZ-1)
 
     for bin_idx in 1:n_bins
         bin = MC_component[bin_idx, :]
@@ -115,19 +115,14 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
         log_e_cdf = make_log_e_cdf(bin)
         cosz_cdf = make_cosz_cdf(bin)
 
-        for logE_idx in 1:(n_logE-1)
-            e_low = logE_grid[logE_idx]
-            e_high = logE_grid[logE_idx+1]
-            p_e = (log_e_cdf(e_high) - log_e_cdf(e_low))
+        c_e = log_e_cdf.(logE_grid)
+        p_e = diff(c_e)
 
-            for cosZ_idx in 1:(n_cosZ-1)
-                cosz_low = cosZ_grid[cosZ_idx]
-                cosz_high = cosZ_grid[cosZ_idx+1]
-                p_cosz = cosz_cdf(cosz_high) - cosz_cdf(cosz_low)
+        c_cosz = cosz_cdf.(cosZ_grid)
+        p_cosz = diff(c_cosz)
 
-                response_matrix[bin_idx, logE_idx, cosZ_idx] = p_e * p_cosz
-            end
-        end
+        response_matrix[bin_idx, :, :] .= p_e * p_cosz'
+
         sum_response = sum(response_matrix[bin_idx, :, :])
         if sum_response == 0
             continue
@@ -146,22 +141,40 @@ function calc_weights(params, assets, physics)
 
     flux = physics.atm_flux.sys_flux(assets.flux_nominal, params)
 
-    R = assets.R
-
     s = (size(p)[1], size(p)[2])
 
-    p_flux(out) = reshape(reshape(flux.nue, s) .* p[:, :, 1, out] .+ reshape(flux.numu, s) .* p[:, :, 2, out], 1, s...)
-    p_flux_anti(out) = reshape(reshape(flux.nuebar, s) .* p_anti[:, :, 1, out] .+ reshape(flux.numubar, s) .* p_anti[:, :, 2, out], 1, s...)
+    xsec_nue     = reshape(physics.xsec.scale(E, :nue,   :CC, false, params), (1, :, 1))
+    xsec_numu    = reshape(physics.xsec.scale(E, :numu,  :CC, false, params), (1, :, 1))
+    xsec_nutau   = reshape(physics.xsec.scale(E, :nutau, :CC, false, params), (1, :, 1))
+    xsec_nuebar  = reshape(physics.xsec.scale(E, :nue,   :CC, true,  params), (1, :, 1))
+    xsec_numubar = reshape(physics.xsec.scale(E, :numu,  :CC, true,  params), (1, :, 1))
+    xsec_nutaubar= reshape(physics.xsec.scale(E, :nutau, :CC, true,  params), (1, :, 1))
+    xsec_nc      = physics.xsec.scale(E, :nue,   :NC, false, params)
 
-    nue = sum(R.nue .* p_flux(1) .* reshape(physics.xsec.scale(E, :nue, :CC, false, params), (1, :, 1)), dims=(2,3))
-    numu = sum(R.numu .* p_flux(2) .* reshape(physics.xsec.scale(E, :numu, :CC, false, params), (1, :, 1)), dims=(2,3))
-    nutau = sum(R.nutau .* (p_flux(3).* reshape(physics.xsec.scale(E, :nutau, :CC, false, params), (1, :, 1)) .+ p_flux_anti(3).* reshape(physics.xsec.scale(E, :nutau, :CC, true, params), (1, :, 1))), dims=(2,3))
-    nuebar = sum(R.nuebar .* p_flux_anti(1).* reshape(physics.xsec.scale(E, :nue, :CC, true, params), (1, :, 1)), dims=(2,3))
-    numubar = sum(R.numubar .* p_flux_anti(2).* reshape(physics.xsec.scale(E, :numu, :CC, true, params), (1, :, 1)), dims=(2,3))
-    nunc = sum(R.nunc .* physics.xsec.scale(E, :nue, :NC, false, params), dims=(2,3))
-    
+    nue_flux   = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 1] .+
+                 reshape(flux.numu,   s) .* p[:, :, 2, 1], 1, s...)
+    numu_flux  = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 2] .+
+                 reshape(flux.numu,   s) .* p[:, :, 2, 2], 1, s...)
+    nutau_flux = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 3] .+
+                 reshape(flux.numu,   s) .* p[:, :, 2, 3], 1, s...)
+    nuebar_flux  = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 1] .+
+                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 1], 1, s...)
+    numubar_flux = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 2] .+
+                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 2], 1, s...)
+    nutaubar_flux  = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 3] .+
+                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 3], 1, s...)
+
+    nue = vec(sum(assets.R.nue .* nue_flux .* xsec_nue, dims=(2,3)))
+    numu = vec(sum(assets.R.numu .* numu_flux .* xsec_numu, dims=(2,3)))
+    nutau = vec(sum(assets.R.nutau .* nutau_flux .* xsec_nutau, dims=(2,3)))
+    nuebar = vec(sum(assets.R.nuebar .* nuebar_flux .* xsec_nuebar, dims=(2,3)))
+    numubar = vec(sum(assets.R.numubar .* numubar_flux .* xsec_numubar, dims=(2,3)))
+    nunc = vec(sum(assets.R.nunc .* xsec_nc, dims=(2,3)))
+
     return (; nue, numu, nutau, nuebar, numubar, nunc)
 end
+
+safe_div(a, b, ε=1e-10) = a / (b + ε)
 
 function get_assets(physics; datadir = @__DIR__)
     @info "Loading Super-K Data"
@@ -216,8 +229,6 @@ function get_assets(physics; datadir = @__DIR__)
     loge_grid = LinRange(-1,3,201)
     cz_grid = LinRange(-1.0,1.0,101)
 
-    R = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))
-
     # Bestfit from SK atm 2023 paper
     params_nominal = Newtrinos.get_params(physics)
     @reset params_nominal.Δm²₃₁ = 2.475e-3
@@ -227,20 +238,36 @@ function get_assets(physics; datadir = @__DIR__)
 
     layers = physics.earth_layers.compute_layers()
     paths = physics.earth_layers.compute_paths(midpoints(cz_grid), layers)
-
     flux_nominal = physics.atm_flux.nominal_flux(10. .^midpoints(loge_grid), midpoints(cz_grid))
 
-    
-    nominal_weights = calc_weights(params_nominal, (;R, flux_nominal, paths, layers, loge_grid), physics)
+    R = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))    
+    nominal_weights = calc_weights(merge(params_nominal, (sk_energy_scale=1.0,)), (;R, flux_nominal, paths, layers, loge_grid), physics)
 
-    return (; MC, R, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)
+    R_plus = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(1.02), cz_grid) for key in keys(MC))
+    R_minus = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(0.98), cz_grid) for key in keys(MC))
+    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=R_minus, flux_nominal, paths, layers, loge_grid), physics)
+    Fij = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
+
+    for key in keys(R)
+        R_plus[key][:,:,1:50] .= R[key][:,1:50]
+        R_minus[key][:,:,1:50] .= R[key][:,:,1:50]
+    end
+    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=R_minus, flux_nominal, paths, layers, loge_grid), physics)
+    Fij_updown = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
+
+    return (; MC, R, Fij, Fij_updown, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)
 
 end
+
 
 
     
 function get_params()
     params = (
+        sk_energy_scale = 1.0,
+        sk_updown_energy_scale = 1.0,
         sk_fc_norm = 1.0,
         sk_pc_norm = 1.0,
         sk_upmu_norm = 1.0,
@@ -261,6 +288,8 @@ end
 
 function get_priors()
     priors = (
+        sk_energy_scale = Normal(1.0, 0.025),
+        sk_updown_energy_scale = Normal(1.0, 0.01),
         sk_fc_norm = Normal(1.0, 0.05),
         sk_pc_norm = Normal(1.0, 0.05),
         sk_upmu_norm = Normal(1.0, 0.05),
@@ -280,11 +309,9 @@ function get_priors()
 end
 
 
-safe_div(a, b) = b == 0 ? 1.0 : a / b
-
 function reweight(params, physics, assets)
     weights = calc_weights(params, assets, physics)
-    return NamedTuple(key => assets.MC[key].Counts .* safe_div.(vec(weights[key]), vec(assets.nominal_weights[key])) for key in keys(assets.MC))
+    return NamedTuple(key => assets.MC[key].Counts .* safe_div.(weights[key], assets.nominal_weights[key]) for key in keys(assets.MC))
 end
 
 function get_factor(mask, factor)
@@ -319,8 +346,12 @@ function get_all_factors(params, assets, total)
         get_double_factor(total, assets.masks.sk_iv_v_multigev_0neutron, assets.masks.sk_iv_v_multigev_1neutron, params.sk_iv_v_multigev_neutron_tag_eff) .*
         get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_nuebar, assets.masks.sk_i_v_multigev_multiring_nue, params.sk_i_v_btd_1) .*
         get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_nue, assets.masks.sk_i_v_multigev_multiring_mu, params.sk_i_v_btd_2) .*
-        get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_mu, assets.masks.sk_i_v_multigev_multiring_other, params.sk_i_v_btd_3)
+        get_double_factor(total, assets.masks.sk_i_v_multigev_multiring_mu, assets.masks.sk_i_v_multigev_multiring_other, params.sk_i_v_btd_3) 
     )
+end
+
+function get_Fij_factor(Fij, param)
+    factor = 1 .+ Fij .* (1 - param)
 end
 
 function get_expected(params, physics, assets)
@@ -330,13 +361,13 @@ function get_expected(params, physics, assets)
 
     factors = get_all_factors(params, assets, total)
 
-    nunc = expected.nunc .* factors .* get_factor(assets.masks.mu_indices, params.sk_nc_mu_norm) #* params.nc_norm 
+    nunc = expected.nunc .* factors .* get_factor(assets.masks.mu_indices, params.sk_nc_mu_norm) .* get_Fij_factor(assets.Fij.nunc, params.sk_energy_scale) .* get_Fij_factor(assets.Fij_updown.nunc, params.sk_updown_energy_scale)
     
-    nue = expected.nue .* factors
-    numu = expected.numu .* factors
-    nutau = expected.nutau .* factors #.* params.nutau_cc_norm
-    nuebar = expected.nuebar .* factors
-    numubar = expected.numubar .* factors
+    nue = expected.nue .* factors .* get_Fij_factor(assets.Fij.nue, params.sk_energy_scale) .* get_Fij_factor(assets.Fij_updown.nue, params.sk_updown_energy_scale)
+    numu = expected.numu .* factors .* get_Fij_factor(assets.Fij.numu, params.sk_energy_scale) .* get_Fij_factor(assets.Fij_updown.numu, params.sk_updown_energy_scale)
+    nutau = expected.nutau .* factors .* get_Fij_factor(assets.Fij.nutau, params.sk_energy_scale) .* get_Fij_factor(assets.Fij_updown.nutau, params.sk_updown_energy_scale)
+    nuebar = expected.nuebar .* factors .* get_Fij_factor(assets.Fij.nuebar, params.sk_energy_scale) .* get_Fij_factor(assets.Fij_updown.nuebar, params.sk_updown_energy_scale)
+    numubar = expected.numubar .* factors .* get_Fij_factor(assets.Fij.numubar, params.sk_energy_scale) .* get_Fij_factor(assets.Fij_updown.numubar, params.sk_updown_energy_scale)
 
     return (; nue, numu, nutau, nuebar, numubar, nunc)
 end
