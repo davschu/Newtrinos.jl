@@ -349,22 +349,18 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end   
 
-function compute_matter_matrices(H_eff::SMatrix, e, layer, anti, interaction::SI)
-    H_mat = zeros(typeof(e), size(H_eff))
+function compute_matter_matrices(H_eff::SMatrix{N,N}, e, layer, anti, interaction::SI) where N
+    T = typeof(A * layer.p_density * e)
     if anti
-        H_mat[1,1] -= A * layer.p_density * 2 * e * 1e9
-        for i in 1:3
-            H_mat[i,i] += A * layer.n_density * e * 1e9
-        end
+        d1 = -A * layer.p_density * 2 * e * 1e9 + A * layer.n_density * e * 1e9
+        dn = A * layer.n_density * e * 1e9
     else
-        H_mat[1,1] += A * layer.p_density * 2 * e * 1e9
-        for i in 1:3
-            H_mat[i,i] -= A * layer.n_density * e * 1e9
-        end
+        d1 = A * layer.p_density * 2 * e * 1e9 - A * layer.n_density * e * 1e9
+        dn = -A * layer.n_density * e * 1e9
     end
+    H_mat = SMatrix{N,N}(ifelse(i == j, ifelse(i == 1, d1, dn), zero(T)) for i in 1:N, j in 1:N)
     H = Hermitian(H_eff + H_mat)
     tmp = eigen(H)
-    #tmp = fast_eigen(H)
     tmp.vectors, tmp.values
 end   
 
@@ -372,7 +368,8 @@ function osc_reduce(matter_matrices, path, e, propagation::Damping)
     res = map(section -> osc_kernel(matter_matrices[section.layer_idx]..., e, section.length, propagation.σₑ), path)
     decay = abs2.(reduce(.*, last.(res)))
     # taking an average mixing matrix along the path to compute the decoherent sum, which is a bold approximation
-    P_ave  = mean([abs2.(matter_matrices[section.layer_idx][1]) for section in path], weights([section.length for section in path]))
+    w = weights([section.length for section in path])
+    P_ave  = mean([abs2.(matter_matrices[section.layer_idx][1]) for section in path], w)
     p = abs2.(reduce(*, first.(res))) .+ P_ave * Diagonal(1 .- decay) * P_ave'
 end
 
@@ -391,32 +388,32 @@ function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent
     matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction))
     n = size(H_eff, 1)
     RT = real(eltype(H_eff))
+    CT = eltype(H_eff)
     ps = Matrix{RT}[]
     for path in paths
         P = zeros(RT, n, n)  # P[β, α]
-        v = one(H_eff)
-        
-        for α in 1:size(v)[1]
-            # Initial flavor state density matrix |να⟩⟨να|
-            eα = v[α, :]
-            ρ = eα * eα'
-        
+
+        for α in 1:n
+            # Initial flavor state density matrix |να⟩⟨να| = sparse, only (α,α) = 1
+            # Start with identity-like ρ: zero everywhere except ρ[α,α] = 1
+            ρ = zeros(CT, n, n)
+            ρ[α, α] = one(CT)
+
             # Propagate through each layer
             for section in path
-            #for (L_km, H_flavor) in layer_Hs
                 l = section.length
-        
+
                 # Diagonalize Hamiltonian
                 U, h = matter_matrices[section.layer_idx]
-        
+
                 # Step 1: Transform to eigenbasis
                 ρ_eig = U' * ρ * U
-        
+
                 # Step 2: Coherent evolution
                 phases = exp.(-F_units * 1im * (l / e) .* h)
                 U_phase = Diagonal(phases)
                 ρ_eig = U_phase * ρ_eig * U_phase'
-        
+
                 # Step 3: Decoherence damping
                 Δφ = abs.(h .- h') * (l / e) * F_units
                 D = exp.(-2 .* Δφ .* propagation.σₑ^2)
@@ -426,10 +423,9 @@ function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent
                 ρ = U * ρ_eig * U'
             end
 
-            # Fill in transition probabilities to each final flavor β
-            for β in 1:size(v)[1]
-                eβ = v[β, :]
-                P[β, α] = real(eβ' * ρ * eβ)  # P(ν_α → ν_β)
+            # P[β, α] = real(ρ[β, β]) since eβ is a standard basis vector
+            for β in 1:n
+                P[β, α] = real(ρ[β, β])
             end
         end
         push!(ps, P)
@@ -462,42 +458,40 @@ end
 
 function propagate(U, h, E, L, propagation::Damping)
     res = broadcast((e, l) -> osc_kernel(U, h, e, l, propagation.σₑ), E, L')
-    p = stack(map(x -> abs2.(first(x)) + abs2.(U) * Diagonal(1 .- abs2.(last(x))) * abs2.(U)', res))
+    U2 = abs2.(U)
+    p = stack(map(x -> abs2.(first(x)) + U2 * Diagonal(1 .- abs2.(last(x))) * U2', res))
 end
 
 function propagate(U, h, E, L, propagation::Decoherent)
     n = size(U, 1)
     RT = real(eltype(U))
+    CT = eltype(U)
 
     function kernel(e,l)
         P = zeros(RT, n, n)  # P[β, α]
-        v = Matrix{eltype(U)}(I, n, n)
+
+        # Precompute phase and damping (same for all α)
+        phases = exp.(-F_units * 1im * (l / e) .* h)
+        U_phase = Diagonal(phases)
+        Δφ = abs.(h .- h') * (l / e) * F_units
+        D = exp.(-2 .* Δφ .* propagation.σₑ^2)
 
         for α in 1:n
-            # Initial flavor state density matrix |να⟩⟨να|
-            eα = v[:, α]
-            ρ = eα * eα'
+            # ρ_eig = U' * |α⟩⟨α| * U, so ρ_eig[i,j] = conj(U[α,i]) * U[α,j]
+            ρ_eig = U[α:α, :]' * U[α:α, :]
 
-            # Step 1: Transform to eigenbasis
-            ρ_eig = U' * ρ * U
-
-            # Step 2: Coherent evolution
-            phases = exp.(-F_units * 1im * (l / e) .* h)
-            U_phase = Diagonal(phases)
+            # Coherent evolution
             ρ_eig = U_phase * ρ_eig * U_phase'
 
-            # Step 3: Decoherence damping
-            Δφ = abs.(h .- h') * (l / e) * F_units
-            D = exp.(-2 .* Δφ .* propagation.σₑ^2)
+            # Decoherence damping
             ρ_eig = ρ_eig .* D
 
-            # Step 4: Transform back to flavor basis
+            # Transform back to flavor basis
             ρ = U * ρ_eig * U'
 
-            # Fill in transition probabilities to each final flavor β
+            # P[β, α] = real(ρ[β, β]) since eβ is a standard basis vector
             for β in 1:n
-                eβ = v[:, β]
-                P[β, α] = real(eβ' * ρ * eβ)  # P(ν_α → ν_β)
+                P[β, α] = real(ρ[β, β])
             end
         end
         P
@@ -507,13 +501,13 @@ function propagate(U, h, E, L, propagation::Decoherent)
 end
 
 function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Vacuum, anti::Bool)
-    L = [sum([segment.length for segment in path]) for path in paths]
+    L = [sum(segment.length for segment in path) for path in paths]
     propagate(U, h, E, L, propagation)
 end
 
 function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool)
     if anti
-        H_eff = conj.(U) * Diagonal(h) * adjoint(conj.(U))
+        H_eff = conj.(U) * Diagonal(h) * transpose(U)
     else
         H_eff = U * Diagonal(h) * adjoint(U)
     end
