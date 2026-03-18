@@ -21,7 +21,12 @@ import ..Newtrinos
     plot::Function
 end
 
-function configure(physics; livetime_years = 6.0)
+function default_physics()
+    osc = Newtrinos.osc.configure()
+    (; osc,)
+end
+
+function configure(physics=default_physics(); livetime_years = 6.0)
     physics = (;physics.osc)
     assets = get_assets(physics, livetime_years)
     return JUNO(

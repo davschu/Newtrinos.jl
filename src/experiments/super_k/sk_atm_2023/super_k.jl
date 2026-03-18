@@ -23,7 +23,15 @@ using ..Newtrinos
     plot::Function
 end
 
-function configure(physics)
+function default_physics()
+    osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(interaction=Newtrinos.osc.SI()))
+    atm_flux = Newtrinos.atm_flux.configure()
+    earth_layers = Newtrinos.earth_layers.configure()
+    xsec = Newtrinos.xsec.configure()
+    (; osc, atm_flux, earth_layers, xsec)
+end
+
+function configure(physics=default_physics())
     physics = (;physics.osc, physics.atm_flux, physics.earth_layers, physics.xsec)
     assets = get_assets(physics)
     return SuperKAtm(
