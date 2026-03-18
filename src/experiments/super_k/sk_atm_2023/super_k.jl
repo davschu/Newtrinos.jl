@@ -111,7 +111,7 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
     n_logE = length(logE_grid)
     n_cosZ = length(cosZ_grid)
 
-    response_matrix = zeros(Float32, n_bins, n_logE-1, n_cosZ-1)
+    response_matrix = zeros(Float64, n_bins, n_logE-1, n_cosZ-1)
 
     for bin_idx in 1:n_bins
         bin = MC_component[bin_idx, :]
@@ -177,14 +177,12 @@ function calc_weights(params, assets, physics)
     nutaubar_flux = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 3] .+
                      reshape(flux.numubar, s) .* p_anti[:, :, 2, 3]) .* xsec_nutaubar
 
-    Rf = haskey(assets, :R_flat) ? assets.R_flat : NamedTuple(k => reshape(assets.R[k], size(assets.R[k], 1), :) for k in keys(assets.R))
-
-    nue     = contract_R(Rf.nue,     nue_flux)
-    numu    = contract_R(Rf.numu,    numu_flux)
-    nutau   = contract_R(Rf.nutau,   nutau_flux)
-    nuebar  = contract_R(Rf.nuebar,  nuebar_flux)
-    numubar = contract_R(Rf.numubar, numubar_flux)
-    nunc    = contract_R(Rf.nunc,    ones(eltype(nue_flux), s) .* xsec_nc)
+    nue     = contract_R(assets.R.nue,     nue_flux)
+    numu    = contract_R(assets.R.numu,    numu_flux)
+    nutau   = contract_R(assets.R.nutau,   nutau_flux)
+    nuebar  = contract_R(assets.R.nuebar,  nuebar_flux)
+    numubar = contract_R(assets.R.numubar, numubar_flux)
+    nunc    = contract_R(assets.R.nunc,    ones(eltype(nue_flux), s) .* xsec_nc)
 
     return (; nue, numu, nutau, nuebar, numubar, nunc)
 end
@@ -255,27 +253,27 @@ function get_assets(physics; datadir = @__DIR__)
     paths = physics.earth_layers.compute_paths(midpoints(cz_grid), layers)
     flux_nominal = physics.atm_flux.nominal_flux(10. .^midpoints(loge_grid), midpoints(cz_grid))
 
-    R = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))    
+    flatten_R(R3d) = NamedTuple(key => reshape(R3d[key], size(R3d[key], 1), :) for key in keys(R3d))
+
+    R_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))
+    R = flatten_R(R_3d)
     nominal_weights = calc_weights(merge(params_nominal, (sk_energy_scale=1.0,)), (;R, flux_nominal, paths, layers, loge_grid), physics)
 
-    R_plus = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(1.02), cz_grid) for key in keys(MC))
-    R_minus = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(0.98), cz_grid) for key in keys(MC))
-    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
-    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=R_minus, flux_nominal, paths, layers, loge_grid), physics)
+    R_plus_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(1.02), cz_grid) for key in keys(MC))
+    R_minus_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(0.98), cz_grid) for key in keys(MC))
+    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
     Fij = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
-    for key in keys(R)
-        R_plus[key][:,:,1:50] .= R[key][:,:,1:50]
-        R_minus[key][:,:,1:50] .= R[key][:,:,1:50]
+    for key in keys(R_3d)
+        R_plus_3d[key][:,:,1:50] .= R_3d[key][:,:,1:50]
+        R_minus_3d[key][:,:,1:50] .= R_3d[key][:,:,1:50]
     end
-    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
-    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=R_minus, flux_nominal, paths, layers, loge_grid), physics)
+    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
     Fij_updown = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
-    # Precompute flattened Float64 R matrices for fast matrix-vector multiply in calc_weights
-    R_flat = NamedTuple(key => Float64.(reshape(R[key], size(R[key], 1), :)) for key in keys(R))
-
-    return (; MC, R, R_flat, Fij, Fij_updown, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)
+    return (; MC, R, Fij, Fij_updown, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)
 
 end
 
