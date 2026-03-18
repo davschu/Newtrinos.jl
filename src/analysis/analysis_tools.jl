@@ -7,7 +7,7 @@ import ForwardDiff
 import PolyesterForwardDiff
 using BAT
 using Optimization
-using Optim
+#using Optim
 using IterTools
 using DataStructures
 using ADTypes
@@ -136,6 +136,17 @@ function find_mle(likelihood, prior, params; adsel = AutoPolyesterForwardDiff())
         end
     end
 
+end
+
+function test_find_mle()
+    function fwd(a, b)
+        return MvNormal([a,b], I(2))
+    end
+    likelihood = likelihoodof(splat(fwd), [0,0])
+    prior = distprod(a=Normal(0,1), b=Normal(0,1))
+    params = (a=0.5, b=-0.5)
+    res = find_mle(likelihood, prior, params)
+    println(res)
 end
 
 
