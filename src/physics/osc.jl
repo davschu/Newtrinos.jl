@@ -349,16 +349,17 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end   
 
-function compute_matter_matrices(H_eff::SMatrix{N,N}, e, layer, anti, interaction::SI) where N
-    T = typeof(A * layer.p_density * e)
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::SI)
+    ve = A * e * 1e9
     if anti
-        d1 = -A * layer.p_density * 2 * e * 1e9 + A * layer.n_density * e * 1e9
-        dn = A * layer.n_density * e * 1e9
+        d1 = ve * (-2 * layer.p_density + layer.n_density)
+        dn = ve * layer.n_density
     else
-        d1 = A * layer.p_density * 2 * e * 1e9 - A * layer.n_density * e * 1e9
-        dn = -A * layer.n_density * e * 1e9
+        d1 = ve * (2 * layer.p_density - layer.n_density)
+        dn = ve * (-layer.n_density)
     end
-    H_mat = SMatrix{N,N}(ifelse(i == j, ifelse(i == 1, d1, dn), zero(T)) for i in 1:N, j in 1:N)
+    z = zero(d1)
+    H_mat = @SMatrix [d1 z z; z dn z; z z dn]
     H = Hermitian(H_eff + H_mat)
     tmp = eigen(H)
     tmp.vectors, tmp.values
@@ -453,23 +454,41 @@ end
 
 
 function propagate(U, h, E, L, propagation::Basic)
-    p = stack(broadcast((e, l) -> abs2.(osc_kernel(U, h, e, l)), E, L'))
+    n = size(U, 1)
+    RT = real(promote_type(eltype(U), eltype(h), eltype(E), eltype(L)))
+    # Write directly in (n_flav, n_flav, n_E, n_L) layout — avoids permutedims
+    p = Array{RT}(undef, n, n, length(E), length(L))
+    for (j, l) in enumerate(L), (i, e) in enumerate(E)
+        result = abs2.(osc_kernel(U, h, e, l))
+        for b in 1:n, a in 1:n
+            p[a, b, i, j] = result[a, b]
+        end
+    end
+    p
 end
 
 function propagate(U, h, E, L, propagation::Damping)
-    res = broadcast((e, l) -> osc_kernel(U, h, e, l, propagation.σₑ), E, L')
+    n = size(U, 1)
+    RT = real(promote_type(eltype(U), eltype(h), eltype(E), eltype(L)))
     U2 = abs2.(U)
-    p = stack(map(x -> abs2.(first(x)) + U2 * Diagonal(1 .- abs2.(last(x))) * U2', res))
+    p = Array{RT}(undef, n, n, length(E), length(L))
+    for (j, l) in enumerate(L), (i, e) in enumerate(E)
+        amp, decay = osc_kernel(U, h, e, l, propagation.σₑ)
+        result = abs2.(amp) + U2 * Diagonal(1 .- abs2.(decay)) * U2'
+        for b in 1:n, a in 1:n
+            p[a, b, i, j] = result[a, b]
+        end
+    end
+    p
 end
 
 function propagate(U, h, E, L, propagation::Decoherent)
     n = size(U, 1)
-    RT = real(eltype(U))
-    CT = eltype(U)
+    RT = real(promote_type(eltype(U), eltype(h), eltype(E), eltype(L)))
 
-    function kernel(e,l)
-        P = zeros(RT, n, n)  # P[β, α]
+    p = Array{RT}(undef, n, n, length(E), length(L))
 
+    for (j, l) in enumerate(L), (i, e) in enumerate(E)
         # Precompute phase and damping (same for all α)
         phases = exp.(-F_units * 1im * (l / e) .* h)
         U_phase = Diagonal(phases)
@@ -491,13 +510,11 @@ function propagate(U, h, E, L, propagation::Decoherent)
 
             # P[β, α] = real(ρ[β, β]) since eβ is a standard basis vector
             for β in 1:n
-                P[β, α] = real(ρ[β, β])
+                p[β, α, i, j] = real(ρ[β, β])
             end
         end
-        P
     end
-
-    res = stack(broadcast((e, l) -> kernel(e, l), E, L'))
+    p
 end
 
 function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Vacuum, anti::Bool)
@@ -505,7 +522,29 @@ function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{L
     propagate(U, h, E, L, propagation)
 end
 
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool)
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Union{Basic, Damping}, interaction::Union{SI, NSI}, anti::Bool)
+    if anti
+        H_eff = conj.(U) * Diagonal(h) * transpose(U)
+    else
+        H_eff = U * Diagonal(h) * adjoint(U)
+    end
+    n = size(H_eff, 1)
+    RT = real(eltype(H_eff))
+    # Write directly in (n_flav, n_flav, n_E, n_cz) layout — avoids permutedims
+    p = Array{RT}(undef, n, n, length(E), length(paths))
+    for (i, e) in enumerate(E)
+        matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction))
+        for (j, path) in enumerate(paths)
+            result = osc_reduce(matter_matrices, path, e, propagation)
+            for b in 1:n, a in 1:n
+                p[a, b, i, j] = result[a, b]
+            end
+        end
+    end
+    p
+end
+
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Decoherent, interaction::Union{SI, NSI}, anti::Bool)
     if anti
         H_eff = conj.(U) * Diagonal(h) * transpose(U)
     else
@@ -515,34 +554,44 @@ function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{L
     permutedims(p, (1, 2, 4, 3))
 end
 
+# Fuse rest addition + permutedims(p, (3,4,1,2)) into one pass
+function _add_rest_and_permute(p_raw, rest)
+    n1, n2, n3, n4 = size(p_raw)
+    result = similar(p_raw, n3, n4, n1, n2)
+    @inbounds for b in 1:n2, a in 1:n1, j in 1:n4, i in 1:n3
+        result[i, j, a, b] = p_raw[a, b, i, j] + (rest isa AbstractArray ? rest[a, b] : rest)
+    end
+    result
+end
+
 function get_osc_prob(cfg::OscillationConfig)
 
     function osc_prob(E::AbstractVector{<:Real}, L::AbstractVector{<:Real}, params::NamedTuple; anti=false)
         U, h_raw = get_matrices(cfg.flavour)(params)
         h = h_raw .- minimum(h_raw)
         Uc = anti ? conj.(U) : U
-    
+
         U, h, rest = select(Uc, h, cfg.states)
-        
-        p = propagate(U, h, E, L, cfg.propagation)
-            
-        # results
-        p = p .+ rest
-        return permutedims(p, (3, 4, 1, 2))
+
+        # propagate returns (n_flav, n_flav, n_E, n_L)
+        p_raw = propagate(U, h, E, L, cfg.propagation)
+
+        # fuse rest addition + permutedims into (n_E, n_L, n_flav, n_flav)
+        return _add_rest_and_permute(p_raw, rest)
     end
 
     function osc_prob(E::AbstractVector{<:Real}, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, params::NamedTuple; anti=false)
         U, h_raw = get_matrices(cfg.flavour)(params)
         h = h_raw .- minimum(h_raw)
         Uc = anti ? conj.(U) : U
-    
+
         U, h, rest = select(Uc, h, cfg.states)
-    
-        p = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti)
-        
-        # results
-        p = p .+ rest
-        return permutedims(p, (3, 4, 1, 2))
+
+        # propagate returns (n_flav, n_flav, n_E, n_cz)
+        p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti)
+
+        # fuse rest addition + permutedims into (n_E, n_cz, n_flav, n_flav)
+        return _add_rest_and_permute(p_raw, rest)
     end
 
     return osc_prob
