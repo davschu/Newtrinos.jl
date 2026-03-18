@@ -1,9 +1,6 @@
-using LinearAlgebra
 using Distributions
 using DensityInterface
-using ForwardDiff
 using BAT
-using IterTools
 using DataStructures
 using MeasureBase
 using ADTypes
@@ -22,11 +19,6 @@ function parse_command_line()
         help = "List of experiments to run"
         nargs = '+'
         required = true
-
-        "--ordering"
-        help = "NMO: either NO or IO"
-        arg_type = String
-        default = "NO"
 
         "--name"
         help = "Name for outputs"
@@ -53,8 +45,21 @@ context = set_batcontext(ad = adsel)
 
 name = args["name"]
 
-physics = configure_physics(args["ordering"])
-experiments = configure_experiments(args["experiments"], physics)
+##### PHYSICS CONFIG #####
+# To use defaults:
+experiments = configure_experiments(args["experiments"])
+
+# To override physics (e.g. for IO, sterile models, custom flux, etc.), uncomment and modify:
+# osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(
+#     flavour=Newtrinos.osc.ThreeFlavour(ordering=:IO),
+#     interaction=Newtrinos.osc.SI(),
+# ))
+# atm_flux = Newtrinos.atm_flux.configure()
+# earth_layers = Newtrinos.earth_layers.configure()
+# xsec = Newtrinos.xsec.configure()
+# physics = (; osc, atm_flux, earth_layers, xsec)
+# experiments = configure_experiments(args["experiments"], physics)
+
 p = Newtrinos.get_params(experiments)
 priors = Newtrinos.get_priors(experiments)
 

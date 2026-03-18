@@ -13,11 +13,6 @@ function parse_command_line()
         nargs = '+'
         required = true
 
-        "--ordering"
-        help = "NMO: either NO or IO"
-        arg_type = String
-        default = "NO"
-
         "--name"
         help = "Name for outputs"
         arg_type = String
@@ -44,20 +39,30 @@ name = args["name"]
 @everywhere args = $args
 
 @everywhere begin
-    using LinearAlgebra
     using Distributions
     using DensityInterface
-    using ForwardDiff
     using BAT
-    using IterTools
     using MeasureBase
     using ADTypes
     using Newtrinos
 
     include(joinpath(@__DIR__, "cli_common.jl"))
 
-    physics = configure_physics(args["ordering"])
-    experiments = configure_experiments(args["experiments"], physics)
+    ##### PHYSICS CONFIG #####
+    # To use defaults:
+    experiments = configure_experiments(args["experiments"])
+
+    # To override physics, uncomment and modify:
+    # osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(
+    #     flavour=Newtrinos.osc.ThreeFlavour(ordering=:IO),
+    #     interaction=Newtrinos.osc.SI(),
+    # ))
+    # atm_flux = Newtrinos.atm_flux.configure()
+    # earth_layers = Newtrinos.earth_layers.configure()
+    # xsec = Newtrinos.xsec.configure()
+    # physics = (; osc, atm_flux, earth_layers, xsec)
+    # experiments = configure_experiments(args["experiments"], physics)
+
     likelihood = Newtrinos.generate_likelihood(experiments)
 end
 

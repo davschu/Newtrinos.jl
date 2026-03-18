@@ -1,17 +1,8 @@
 using ArgParse
 using BenchmarkTools
-using LinearAlgebra
-using Distributions
 using DensityInterface
-using BAT
-using MeasureBase
-using ADTypes
-using DataStructures
-using Accessors
 using Newtrinos
 import ForwardDiff
-
-include(joinpath(@__DIR__, "..", "src", "analysis", "cli_common.jl"))
 
 function parse_command_line()
     s = ArgParseSettings()
@@ -21,11 +12,6 @@ function parse_command_line()
         help = "List of experiments to run"
         nargs = '+'
         required = true
-
-        "--ordering"
-        help = "NMO: either NO or IO"
-        arg_type = String
-        default = "NO"
     end
 
     return parse_args(s)
@@ -33,13 +19,15 @@ end
 
 args = parse_command_line()
 
-println("Configuring physics and experiments...")
-physics = configure_physics(args["ordering"])
-experiments = configure_experiments(args["experiments"], physics)
+println("Configuring experiments...")
+function configure_experiments(experiment_list)
+    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)() for exp in experiment_list)
+    return (; pairs...)
+end
+
+experiments = configure_experiments(args["experiments"])
 
 params = Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-
 likelihood = Newtrinos.generate_likelihood(experiments)
 
 println()
@@ -47,7 +35,6 @@ println("=" ^60)
 println("LIKELIHOOD BENCHMARK")
 println("=" ^60)
 println("  Experiments: ", join(args["experiments"], ", "))
-println("  Ordering:    ", args["ordering"])
 println("  Parameters:  ", length(keys(params)))
 println()
 
