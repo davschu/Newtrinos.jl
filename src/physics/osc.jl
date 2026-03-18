@@ -389,9 +389,11 @@ end
 
 function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction)
     matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction))
-    ps = []
+    n = size(H_eff, 1)
+    RT = real(eltype(H_eff))
+    ps = Matrix{RT}[]
     for path in paths
-        P = Matrix(abs.(zero(H_eff)))  # P[β, α]
+        P = zeros(RT, n, n)  # P[β, α]
         v = one(H_eff)
         
         for α in 1:size(v)[1]
@@ -418,12 +420,12 @@ function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent
                 # Step 3: Decoherence damping
                 Δφ = abs.(h .- h') * (l / e) * F_units
                 D = exp.(-2 .* Δφ .* propagation.σₑ^2)
-                ρ_eig .= ρ_eig .* D
-        
+                ρ_eig = ρ_eig .* D
+
                 # Step 4: Transform back to flavor basis
                 ρ = U * ρ_eig * U'
             end
-        
+
             # Fill in transition probabilities to each final flavor β
             for β in 1:size(v)[1]
                 eβ = v[β, :]
@@ -440,13 +442,14 @@ function select(U, h, cfg::All)
 end
 
 function select(U, h, cfg::Cut)
-    mask = sqrt.(abs.(h)) .< cfg.cutoff;
-    if any(.!mask)
-        h = h[mask];
-        U_rest = U[:, .!mask]
-        U = U[:, mask];
+    mask = sqrt.(abs.(h)) .< cfg.cutoff
+    notmask = .!mask
+    if any(notmask)
+        h = h[mask]
+        U_rest = U[:, notmask]
+        U = U[:, mask]
     else
-        U_rest = 0
+        U_rest = U[:, Int[]]
     end
 
     return U, h, abs2.(U_rest) * abs2.(U_rest)'
@@ -463,36 +466,37 @@ function propagate(U, h, E, L, propagation::Damping)
 end
 
 function propagate(U, h, E, L, propagation::Decoherent)
+    n = size(U, 1)
+    RT = real(eltype(U))
 
     function kernel(e,l)
-        P = Matrix(abs.(zero(U*U')))  # P[β, α]
-        v = one(U*U')
-        
-        for α in 1:size(v)[1]
+        P = zeros(RT, n, n)  # P[β, α]
+        v = Matrix{eltype(U)}(I, n, n)
+
+        for α in 1:n
             # Initial flavor state density matrix |να⟩⟨να|
-            eα = v[α, :]
+            eα = v[:, α]
             ρ = eα * eα'
-        
+
             # Step 1: Transform to eigenbasis
             ρ_eig = U' * ρ * U
-    
+
             # Step 2: Coherent evolution
             phases = exp.(-F_units * 1im * (l / e) .* h)
             U_phase = Diagonal(phases)
             ρ_eig = U_phase * ρ_eig * U_phase'
-    
+
             # Step 3: Decoherence damping
             Δφ = abs.(h .- h') * (l / e) * F_units
             D = exp.(-2 .* Δφ .* propagation.σₑ^2)
-            ρ_eig .= ρ_eig .* D
-    
+            ρ_eig = ρ_eig .* D
+
             # Step 4: Transform back to flavor basis
             ρ = U * ρ_eig * U'
 
-        
             # Fill in transition probabilities to each final flavor β
-            for β in 1:size(v)[1]
-                eβ = v[β, :]
+            for β in 1:n
+                eβ = v[:, β]
                 P[β, α] = real(eβ' * ρ * eβ)  # P(ν_α → ν_β)
             end
         end
@@ -608,21 +612,16 @@ function get_matrices(cfg::ADD)
     
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-    
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-    
+
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.ADD_radius * MD[i, j] * umev
             end
         end
-        
+
         for n in 1:cfg.N_KK
             for i in 1:3
                 for j in 1:3
@@ -630,14 +629,14 @@ function get_matrices(cfg::ADD)
                 end
             end
         end
-    
+
         for i in 1:cfg.N_KK
             aM2[3*i + 1, 3*i + 1] = i
             aM2[3*i + 2, 3*i + 2] = i
             aM2[3*i + 3, 3*i + 3] = i
         end
-    
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
     
         h, U = eigen(aaMM)
@@ -772,21 +771,16 @@ function get_matrices(cfg::Darkdim_Lambda)
         # Initialize aM1 matrix
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-      
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         # Fill in the aM1 matrix for the first term
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.Darkdim_radius * MDc00[i, j] * umev
             end
         end
-  
+
         # Update aM1 matrix for the second term
         for n in 1:cfg.N_KK
             MDcoff = PMNS * Diagonal([
@@ -800,7 +794,7 @@ function get_matrices(cfg::Darkdim_Lambda)
                 end
             end
         end
-  
+
         # Fill in the aM2 matrix
         for n in 1:cfg.N_KK
             aMD2 = PMNS * Diagonal([
@@ -814,12 +808,12 @@ function get_matrices(cfg::Darkdim_Lambda)
                 end
             end
         end
-  
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
-  
+
         h, U = eigen(aaMM)
-        h = h / (params.Darkdim_radius^2 * umev^2) 
+        h = h / (params.Darkdim_radius^2 * umev^2)
         return U, h
     end
 end
@@ -830,11 +824,11 @@ function get_matrices(cfg::Darkdim_Masses)
         x = 2 * π * ca
         b = x == 0. ? 1. : sqrt(x / (expm1(x)))
     end
-    
+
     cas = LinRange(10, -10, 300)
     masses = get_mass.(cas)
     get_ca = LinearInterpolation(masses, cas; extrapolation_bc=Line())
-    
+
     function matrices(params::NamedTuple)
         MP = 2.435e18 # GeV
         M5 = 1.055e9 * (1/(2π * params.Darkdim_radius))^(1/3) # GeV
@@ -843,36 +837,31 @@ function get_matrices(cfg::Darkdim_Masses)
         m1_MD, m2_MD, m3_MD = (vev * M5 / MP) .* lambda_list
 
         m1, m2, m3 = get_abs_masses(params)
-        
+
         ca1 = get_ca(m1 / m1_MD)
         ca2 = get_ca(m2 / m2_MD)
         ca3 = get_ca(m3 / m3_MD)
-        
-        PMNS = get_PMNS(params)    
-      
+
+        PMNS = get_PMNS(params)
+
         #MD is the Dirac mass matrix that appears in the Lagrangian. Note the difference with ADD through the multiplication by c.
-      
+
         # Compute MDc00
         MDc00 = PMNS * Diagonal([m1, m2, m3]) * adjoint(PMNS)
-  
+
         # Initialize aM1 matrix
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-      
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         # Fill in the aM1 matrix for the first term
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.Darkdim_radius * MDc00[i, j] * umev
             end
         end
-  
+
         # Update aM1 matrix for the second term
         for n in 1:cfg.N_KK
             MDcoff = PMNS * Diagonal([
@@ -886,7 +875,7 @@ function get_matrices(cfg::Darkdim_Masses)
                 end
             end
         end
-  
+
         # Fill in the aM2 matrix
         for n in 1:cfg.N_KK
             aMD2 = PMNS * Diagonal([
@@ -900,12 +889,12 @@ function get_matrices(cfg::Darkdim_Masses)
                 end
             end
         end
-  
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
-  
+
         h, U = eigen(aaMM)
-        h = h / (params.Darkdim_radius^2 * umev^2) 
+        h = h / (params.Darkdim_radius^2 * umev^2)
         return U, h
     end
 end
@@ -918,10 +907,10 @@ function get_matrices(cfg::Darkdim_cas)
         vev = 174e9 # eV
         MD = (vev * M5 / MP)
         x = 2 * π * ca
-        b = x == 0. ? 1. : sqrt(x / (expm1(x)))
+        b = iszero(x) ? one(x) : sqrt(x / (expm1(x)))
         m / (MD * b)
     end
-    
+
     function matrices(params::NamedTuple)
         MP = 2.435e18 # GeV
         M5 = 1e6 # GeV
@@ -932,7 +921,7 @@ function get_matrices(cfg::Darkdim_cas)
         ca1 = params.ca1
         ca2 = params.ca2
         ca3 = params.ca3
-        
+
         λ₁ = get_lambda(ca1, m1)
         λ₂ = get_lambda(ca2, m2)
         λ₃ = get_lambda(ca3, m3)
@@ -940,32 +929,27 @@ function get_matrices(cfg::Darkdim_cas)
         lambda_list = [λ₁, λ₂, λ₃]
 
         m1_MD, m2_MD, m3_MD = (vev * M5 / MP) .* lambda_list
-        
-        PMNS = get_PMNS(params)    
-      
+
+        PMNS = get_PMNS(params)
+
         #MD is the Dirac mass matrix that appears in the Lagrangian. Note the difference with ADD through the multiplication by c.
-      
+
         # Compute MDc00
         MDc00 = PMNS * Diagonal([m1, m2, m3]) * adjoint(PMNS)
-  
+
         # Initialize aM1 matrix
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-      
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         # Fill in the aM1 matrix for the first term
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.Darkdim_radius * MDc00[i, j] * umev
             end
         end
-  
+
         # Update aM1 matrix for the second term
         for n in 1:cfg.N_KK
             MDcoff = PMNS * Diagonal([
@@ -979,7 +963,7 @@ function get_matrices(cfg::Darkdim_cas)
                 end
             end
         end
-  
+
         # Fill in the aM2 matrix
         for n in 1:cfg.N_KK
             aMD2 = PMNS * Diagonal([
@@ -993,12 +977,12 @@ function get_matrices(cfg::Darkdim_cas)
                 end
             end
         end
-  
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
-  
+
         h, U = eigen(aaMM)
-        h = h / (params.Darkdim_radius^2 * umev^2) 
+        h = h / (params.Darkdim_radius^2 * umev^2)
         return U, h
     end
 end

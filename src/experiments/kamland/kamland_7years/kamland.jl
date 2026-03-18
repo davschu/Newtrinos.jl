@@ -102,11 +102,11 @@ end
 
 function smear(E, p, sigma, weights; width=10, E_scale=1.0, E_bias=0.0)
     l = length(p)
-    out = similar(p, l)
+    T_acc = promote_type(eltype(E), eltype(p), eltype(sigma), typeof(E_scale))
+    out = zeros(T_acc, l)
     for i in 1:l
-        out[i] = 0.
         e = E[i] * E_scale + E_bias
-        norm = 0.0
+        norm = zero(T_acc)
         for j in max(1, i - width):min(l, i + width)
             coeff = 1 / sigma[j] * exp(-0.5 * ((e - E[j]) / sigma[j])^2)
             norm += coeff * weights[j]
@@ -114,7 +114,7 @@ function smear(E, p, sigma, weights; width=10, E_scale=1.0, E_bias=0.0)
         end
         out[i] /= norm
     end
-    return copy(out)
+    return out
 end
 
 function get_expected(params, physics, assets)

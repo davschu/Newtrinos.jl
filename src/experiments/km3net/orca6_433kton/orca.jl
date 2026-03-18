@@ -110,9 +110,7 @@ end
 
 function make_hist(e_idx, c_idx, p_idx, t_idx, w, size=(8,8,2,2))
     hist = similar(w, size)
-    for i in 1:prod(size)
-        hist[i] = 0.
-    end
+    fill!(hist, zero(eltype(hist)))
     for i in 1:length(w)
         hist[e_idx[i], c_idx[i], p_idx[i], t_idx[i]] += w[i]
     end

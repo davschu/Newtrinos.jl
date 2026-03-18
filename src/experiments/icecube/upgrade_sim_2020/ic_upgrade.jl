@@ -123,9 +123,7 @@ end
 
 function make_hist(e_idx, c_idx, p_idx, t_idx, w, size=(15,15,2,2))
     hist = similar(w, size)
-    for i in 1:prod(size)
-        hist[i] = 0.
-    end
+    fill!(hist, zero(eltype(hist)))
     for i in 1:length(w)
         if (e_idx[i] < 1) | (e_idx[i] > 15)
             continue
