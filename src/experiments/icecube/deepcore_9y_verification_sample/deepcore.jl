@@ -37,7 +37,7 @@ end
 
 function default_physics()
     osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(interaction=Newtrinos.osc.SI()))
-    atm_flux = Newtrinos.atm_flux.configure()
+    atm_flux = Newtrinos.atm_flux.configure(Newtrinos.atm_flux.AtmFluxConfig(nominal_model=Newtrinos.atm_flux.HKKM("spl-nu-20-01-000.d")))
     earth_layers = Newtrinos.earth_layers.configure()
     xsec = Newtrinos.xsec.configure()
     (; osc, atm_flux, earth_layers, xsec)
