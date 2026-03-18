@@ -522,29 +522,7 @@ function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{L
     propagate(U, h, E, L, propagation)
 end
 
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Union{Basic, Damping}, interaction::Union{SI, NSI}, anti::Bool)
-    if anti
-        H_eff = conj.(U) * Diagonal(h) * transpose(U)
-    else
-        H_eff = U * Diagonal(h) * adjoint(U)
-    end
-    n = size(H_eff, 1)
-    RT = real(eltype(H_eff))
-    # Write directly in (n_flav, n_flav, n_E, n_cz) layout — avoids permutedims
-    p = Array{RT}(undef, n, n, length(E), length(paths))
-    for (i, e) in enumerate(E)
-        matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction))
-        for (j, path) in enumerate(paths)
-            result = osc_reduce(matter_matrices, path, e, propagation)
-            for b in 1:n, a in 1:n
-                p[a, b, i, j] = result[a, b]
-            end
-        end
-    end
-    p
-end
-
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Decoherent, interaction::Union{SI, NSI}, anti::Bool)
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool)
     if anti
         H_eff = conj.(U) * Diagonal(h) * transpose(U)
     else
