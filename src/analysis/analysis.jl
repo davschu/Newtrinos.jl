@@ -1,4 +1,5 @@
 using Distributions
+using Distributed
 using DensityInterface
 using BAT
 using DataStructures
@@ -33,6 +34,16 @@ function parse_command_line()
         "--plot"
         help = "Enable plotting"
         action = :store_true
+
+        "--workers"
+        help = "Number of distributed workers (default: 1, no distributed)"
+        arg_type = Int
+        default = 1
+
+        "--threads"
+        help = "Number of threads per worker (only used when --workers > 1)"
+        arg_type = Int
+        default = 1
     end
 
     return parse_args(s)
@@ -40,14 +51,57 @@ end
 
 args = parse_command_line()
 
-adsel = AutoForwardDiff()
-context = set_batcontext(ad = adsel)
-
 name = args["name"]
+n_workers = args["workers"]
+n_threads = args["threads"]
+use_distributed = n_workers > 1
+
+# Set up distributed workers if requested
+map_func = nothing
+if use_distributed
+    addprocs(n_workers; exeflags="--threads=$n_threads")
+
+    @everywhere args = $args
+
+    @everywhere begin
+        using Distributions
+        using DensityInterface
+        using BAT
+        using MeasureBase
+        using ADTypes
+        using Newtrinos
+
+        include(joinpath(@__DIR__, "cli_common.jl"))
+
+        ##### PHYSICS CONFIG #####
+        # To use defaults:
+        experiments = configure_experiments(args["experiments"])
+
+        # To override physics (e.g. for IO, sterile models, custom flux, etc.), uncomment and modify:
+        # osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(
+        #     flavour=Newtrinos.osc.ThreeFlavour(ordering=:IO),
+        #     interaction=Newtrinos.osc.SI(),
+        # ))
+        # atm_flux = Newtrinos.atm_flux.configure()
+        # earth_layers = Newtrinos.earth_layers.configure()
+        # xsec = Newtrinos.xsec.configure()
+        # physics = (; osc, atm_flux, earth_layers, xsec)
+        # experiments = configure_experiments(args["experiments"], physics)
+
+        likelihood = Newtrinos.generate_likelihood(experiments)
+    end
+
+    map_func = pmap
+else
+    adsel = AutoForwardDiff()
+    context = set_batcontext(ad = adsel)
+end
 
 ##### PHYSICS CONFIG #####
 # To use defaults:
-experiments = configure_experiments(args["experiments"])
+if !use_distributed
+    experiments = configure_experiments(args["experiments"])
+end
 
 # To override physics (e.g. for IO, sterile models, custom flux, etc.), uncomment and modify:
 # osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(
@@ -73,7 +127,9 @@ vars_to_scan[:Δm²₃₁] = 11
 
 ###### END CONFIG ######
 
-likelihood = Newtrinos.generate_likelihood(experiments);
+if !use_distributed
+    likelihood = Newtrinos.generate_likelihood(experiments);
+end
 
 priors = Newtrinos.condition(priors, conditional_vars, p)
 
@@ -91,34 +147,26 @@ elseif lowercase(args["task"]) == "importancesampling"
     prior = distprod(;priors...)
     posterior = PosteriorMeasure(likelihood, prior)
 
-    seed_points = load("darkdim_seeds.jld2")["df"]
-    seed_points = seed_points[seed_points.ca3 .< 0, :]
-    init_samples = make_init_samples(posterior, seed_points[1:10, :], 10_000)
+    #seed_points = load("darkdim_seeds.jld2")["df"]
+    #seed_points = seed_points[seed_points.ca3 .< 0, :]
+    #init_samples = make_init_samples(posterior, seed_points[1:10, :], 10_000)
+    init_samples = make_init_samples(posterior, 10, 1_000)
 
     FileIO.save(name * "_init_samples.jld2", Dict(String(a)=>init_samples[a] for a in keys(init_samples)))
-    whack_samples = whack_many_moles(posterior, init_samples, target_samplesize=100_000, cache_dir=name)
+    whack_samples = whack_many_moles(posterior, init_samples, target_samplesize=10_000, cache_dir=name)
     FileIO.save(name * ".jld2", Dict(String(a)=>whack_samples[a] for a in keys(whack_samples)))
 else
     if lowercase(args["task"]) == "profile"
-        result = Newtrinos.profile(likelihood, priors, vars_to_scan, p, cache_dir=name)
+        result = Newtrinos.profile(likelihood, priors, vars_to_scan, p; cache_dir=name, map_func=map_func)
     elseif lowercase(args["task"]) == "scan"
         result = Newtrinos.scan(likelihood, priors, vars_to_scan, p)
     end
-    FileIO.save(name * ".jld2", Dict("result" => result))
+
+    save_result(result, name)
 
     if args["plot"]
         using CairoMakie
-        fig = Figure()
-        ax = Axis(fig[1,1])
-        plot!(ax, result)
-        ax.xlabel = String(collect(keys(vars_to_scan))[1])
-
-        if length(vars_to_scan) == 1
-            ax.ylabel = "-2ΔLLH"
-        else
-            ax.ylabel = String(collect(keys(vars_to_scan))[2])
-        end
-        ax.title = args["task"] * ": " * join(args["experiments"], " + ")
-        save(name * ".png", fig)
+        title = args["task"] * ": " * join(args["experiments"], " + ")
+        plot_result(result, name, vars_to_scan; title=title)
     end
 end

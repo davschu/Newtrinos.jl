@@ -283,15 +283,20 @@ end
 
 # ── Scanning & Profiling ────────────────────────────────────────────
 
-function generate_scanpoints(vars_to_scan, priors)
+function _generate_grid(vars_to_scan, priors)
     vars = collect(keys(vars_to_scan))
     values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
     mesh = collect(IterTools.product(values...))
+    vars, values, mesh
+end
+
+function generate_scanpoints(vars_to_scan, priors)
+    vars, values, mesh = _generate_grid(vars_to_scan, priors)
     scanpoints = Array{Any}(undef, size(mesh))
 
     function make_prior(vals)
         p = deepcopy(priors)
-        for i in 1:length(vars_to_scan)
+        for i in 1:length(vars)
             @reset p[vars[i]] = vals[i]
         end
         distprod(;p...)
@@ -320,16 +325,26 @@ function assemble_profile_results(opt_results, result_size)
     NamedTuple(s)
 end
 
-function _profile(likelihood, scanpoints, params, cache_dir)
-    opt_results = Array{Any}(undef, size(scanpoints))
-    @showprogress Threads.@threads for i in eachindex(scanpoints)
-        opt_results[i] = find_mle_cached(likelihood, scanpoints[i], deepcopy(params), cache_dir)
+function _profile(likelihood, scanpoints, params, cache_dir; map_func=nothing)
+    do_work(i) = find_mle_cached(likelihood, scanpoints[i], deepcopy(params), cache_dir)
+
+    if isnothing(map_func)
+        # Default: threaded execution
+        opt_results = Array{Any}(undef, size(scanpoints))
+        @showprogress Threads.@threads for i in eachindex(scanpoints)
+            opt_results[i] = do_work(i)
+        end
+    else
+        # Custom map (e.g., pmap for distributed)
+        work = collect(eachindex(scanpoints))
+        opt_results_flat = map_func(do_work, work)
+        opt_results = reshape(opt_results_flat, size(scanpoints))
     end
     assemble_profile_results(opt_results, size(scanpoints))
 end
 
 "Run Profile llh scan"
-function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
+function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, map_func=nothing)
     t1 = time()
     # check if there is actually any variable to be profiled over, or if they are all just Numbers
     if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
@@ -339,20 +354,12 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
     values, scanpoints = generate_scanpoints(vars_to_scan, priors)
     if !isnothing(cache_dir)
         if isdir(cache_dir)
-            while true
-                print("Cache dir `$(cache_dir)` exists and results may be reused; continue? [y/n]: ")
-                answer = readline(stdin)
-                if lowercase(answer) in ["y", "yes"]
-                    break
-                else
-                    exit()
-                end
-            end
+            @info "Reusing cache dir `$(cache_dir)`"
         else
             mkdir(cache_dir)
         end
     end
-    res = _profile(likelihood, scanpoints, params, cache_dir)
+    res = _profile(likelihood, scanpoints, params, cache_dir; map_func=map_func)
     t2 = time()
     meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
     add_meta!(meta)
@@ -363,14 +370,12 @@ end
 "Run simple llh scan"
 function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
     t1 = time()
-    vars = collect(keys(vars_to_scan))
-    values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
-    mesh = collect(IterTools.product(values...))
+    vars, values, mesh = _generate_grid(vars_to_scan, priors)
     scanpoints = Array{Any}(undef, size(mesh))
 
     function make_params(vals)
         p = deepcopy(params)
-        for i in 1:length(vars_to_scan)
+        for i in 1:length(vars)
             @reset p[vars[i]] = vals[i]
         end
         return p
