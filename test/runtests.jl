@@ -8,4 +8,5 @@ using Test
     include("test_xsec.jl")
     include("test_analysis.jl")
     include("test_autodiff.jl")
+    include("test_regression.jl")
 end
