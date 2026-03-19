@@ -1,0 +1,42 @@
+# Newtrinos.jl
+
+**Newtrinos.jl** is a Julia package for the **global analysis of neutrino data**, fully open source and free to use under the MIT license.
+
+## Overview
+
+The package is built to support flexible and modular analysis of neutrino physics, combining experimental data with physics models and inference tools. It supports both **Frequentist** (profile likelihood) and **Bayesian** (nested sampling, importance sampling) inference methods.
+
+## Key Features
+
+- **11 experiments**: IceCube DeepCore, Daya Bay, KamLAND, MINOS, Super-Kamiokande, ORCA, JUNO, TAO, COHERENT CsI/LAr, IceCube Upgrade
+- **Modular physics**: Oscillations (3-flavour, sterile, ADD, dark dimensions), matter effects (SI, NSI), atmospheric fluxes, cross-sections
+- **Fully differentiable**: All code supports ForwardDiff automatic differentiation for gradient-based optimization
+- **Scalable**: Threaded and distributed parallelism for profile likelihood scans
+
+## Quick Example
+
+```julia
+using Newtrinos
+using DensityInterface
+
+# Configure experiments with default physics
+experiments = (
+    deepcore = Newtrinos.deepcore.configure(),
+    dayabay  = Newtrinos.dayabay.configure(),
+)
+
+# Build joint likelihood
+likelihood = Newtrinos.generate_likelihood(experiments)
+params = Newtrinos.get_params(experiments)
+
+# Evaluate
+logdensityof(likelihood, params)
+```
+
+## References
+
+Newtrinos.jl has been used to produce the results presented in:
+
+- [Testing the number of neutrino species with a global fit of neutrino data](https://arxiv.org/abs/2402.00490) — Phys.Rev.D 109 (2024) 9, 095016
+- [Constraints on non-unitary neutrino mixing in light of atmospheric and reactor neutrino data](https://arxiv.org/abs/2407.20388) — JHEP 05 (2025) 130
+- [A neutrino data analysis of extra-dimensional theories with massive bulk fields](https://arxiv.org/abs/2508.04274) — Phys.Rev.D 112 (2025) 5, 055009

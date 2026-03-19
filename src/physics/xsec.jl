@@ -75,7 +75,7 @@ function get_scale(cfg::SimpleScaling)
         elseif flav == :nutau
             return params.nutau_cc_norm
         else
-            return 1.
+            return one(params.nc_norm)
         end
     end
 end

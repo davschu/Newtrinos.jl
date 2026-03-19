@@ -59,25 +59,26 @@ function get_compute_layers(cfg::PREM)
         layers = StructArray{Newtrinos.Layer}((radii, ave_densities .* cfg.p_fractions, ave_densities .* (1 .- cfg.p_fractions)))
     end
 end
-function ray_circle_path_length(r, y, cz)    
+function ray_circle_path_length(r, y, cz)
     # Compute the discriminant
     disc = r^2 - y^2 + (y * cz)^2
-    
+    T = typeof(disc)
+
     if disc < 0
-        return 0.0  # No intersection
+        return zero(T)  # No intersection
     end
 
     sqrt_disc = sqrt(disc)
-    
+
     # Compute intersection points
     t1 = - y * cz - sqrt_disc
     t2 = - y * cz + sqrt_disc
 
     # Compute path length, ensuring we only count positive t-values
-    L = max(0, t2 - max(0, t1))
+    L = max(zero(T), t2 - max(zero(T), t1))
 
     if L < 1
-        return 0.
+        return zero(T)
     end
     L
 end

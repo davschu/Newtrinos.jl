@@ -16,6 +16,7 @@ export All, Cut
 export Vacuum, SI, NSI
 export ThreeFlavour, ThreeFlavourXYCP, Sterile, ADD
 export OscillationConfig
+export EigenMethod, DefaultEigen, decompose
 export configure
 
 const ftype = Float64
@@ -64,6 +65,12 @@ struct Vacuum <: InteractionModel end
 struct NSI <: InteractionModel end
 struct SI <: InteractionModel end
 
+abstract type EigenMethod end
+struct DefaultEigen <: EigenMethod end
+
+decompose(H::Hermitian, ::DefaultEigen) = eigen(H)
+export DefaultEigen
+
 abstract type FlavourModel end
 @kwdef struct ThreeFlavour <: FlavourModel 
     ordering::Symbol = :NO
@@ -94,11 +101,12 @@ end
     N_KK::Int = 5
 end
 
-@kwdef struct OscillationConfig{F<:FlavourModel, I<:InteractionModel, P<:PropagationModel, S<:StateSelector}
+@kwdef struct OscillationConfig{F<:FlavourModel, I<:InteractionModel, P<:PropagationModel, S<:StateSelector, E<:EigenMethod}
     flavour::F = ThreeFlavour()
     interaction::I = Vacuum()
     propagation::P = Basic()
     states::S = All()
+    eigen_method::E = DefaultEigen()
 end
 
 @kwdef struct Osc <: Newtrinos.Physics
@@ -114,7 +122,7 @@ function configure(cfg::OscillationConfig=OscillationConfig())
         cfg=cfg,
         params = get_params(cfg),
         priors = get_priors(cfg),
-        matrices = get_matrices(cfg.flavour),
+        matrices = get_matrices(cfg.flavour, cfg.eigen_method),
         osc_prob = get_osc_prob(cfg)
     )
 end
@@ -331,7 +339,7 @@ function osc_kernel(U::AbstractMatrix{<:Number}, H::AbstractVector{<:Number}, e:
     U * Diagonal(exp.(1im * phase_factors) .* decay) * U', decay
 end
 
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI)
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     if anti
         H[1,1] -= A * layer.p_density * 2 * e * 1e9
@@ -345,26 +353,23 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
         end
     end
     H = Hermitian(H)
-    tmp = eigen(H)
+    tmp = decompose(H, eigen_method)
     tmp.vectors, tmp.values
-end   
+end
 
-function compute_matter_matrices(H_eff::SMatrix, e, layer, anti, interaction::SI)
-    H_mat = zeros(typeof(e), size(H_eff))
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen())
+    ve = A * e * 1e9
     if anti
-        H_mat[1,1] -= A * layer.p_density * 2 * e * 1e9
-        for i in 1:3
-            H_mat[i,i] += A * layer.n_density * e * 1e9
-        end
+        d1 = ve * (-2 * layer.p_density + layer.n_density)
+        dn = ve * layer.n_density
     else
-        H_mat[1,1] += A * layer.p_density * 2 * e * 1e9
-        for i in 1:3
-            H_mat[i,i] -= A * layer.n_density * e * 1e9
-        end
+        d1 = ve * (2 * layer.p_density - layer.n_density)
+        dn = ve * (-layer.n_density)
     end
+    z = zero(d1)
+    H_mat = @SMatrix [d1 z z; z dn z; z z dn]
     H = Hermitian(H_eff + H_mat)
-    tmp = eigen(H)
-    #tmp = fast_eigen(H)
+    tmp = decompose(H, eigen_method)
     tmp.vectors, tmp.values
 end   
 
@@ -372,7 +377,8 @@ function osc_reduce(matter_matrices, path, e, propagation::Damping)
     res = map(section -> osc_kernel(matter_matrices[section.layer_idx]..., e, section.length, propagation.σₑ), path)
     decay = abs2.(reduce(.*, last.(res)))
     # taking an average mixing matrix along the path to compute the decoherent sum, which is a bold approximation
-    P_ave  = mean([abs2.(matter_matrices[section.layer_idx][1]) for section in path], weights([section.length for section in path]))
+    w = weights([section.length for section in path])
+    P_ave  = mean([abs2.(matter_matrices[section.layer_idx][1]) for section in path], w)
     p = abs2.(reduce(*, first.(res))) .+ P_ave * Diagonal(1 .- decay) * P_ave'
 end
 
@@ -381,53 +387,54 @@ function osc_reduce(matter_matrices, path, e, propagation::Basic)
 end
     
 
-function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping}, interaction)
-    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction))
+function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping}, interaction, eigen_method::EigenMethod=DefaultEigen())
+    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction), Ref(eigen_method))
     p = stack(map(path -> osc_reduce(matter_matrices, path, e, propagation), paths))
 end
 
 
-function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction)
-    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction))
-    ps = []
+function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction, eigen_method::EigenMethod=DefaultEigen())
+    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction), Ref(eigen_method))
+    n = size(H_eff, 1)
+    RT = real(eltype(H_eff))
+    CT = eltype(H_eff)
+    ps = Matrix{RT}[]
     for path in paths
-        P = Matrix(abs.(zero(H_eff)))  # P[β, α]
-        v = one(H_eff)
-        
-        for α in 1:size(v)[1]
-            # Initial flavor state density matrix |να⟩⟨να|
-            eα = v[α, :]
-            ρ = eα * eα'
-        
+        P = zeros(RT, n, n)  # P[β, α]
+
+        for α in 1:n
+            # Initial flavor state density matrix |να⟩⟨να| = sparse, only (α,α) = 1
+            # Start with identity-like ρ: zero everywhere except ρ[α,α] = 1
+            ρ = zeros(CT, n, n)
+            ρ[α, α] = one(CT)
+
             # Propagate through each layer
             for section in path
-            #for (L_km, H_flavor) in layer_Hs
                 l = section.length
-        
+
                 # Diagonalize Hamiltonian
                 U, h = matter_matrices[section.layer_idx]
-        
+
                 # Step 1: Transform to eigenbasis
                 ρ_eig = U' * ρ * U
-        
+
                 # Step 2: Coherent evolution
                 phases = exp.(-F_units * 1im * (l / e) .* h)
                 U_phase = Diagonal(phases)
                 ρ_eig = U_phase * ρ_eig * U_phase'
-        
+
                 # Step 3: Decoherence damping
                 Δφ = abs.(h .- h') * (l / e) * F_units
                 D = exp.(-2 .* Δφ .* propagation.σₑ^2)
-                ρ_eig .= ρ_eig .* D
-        
+                ρ_eig = ρ_eig .* D
+
                 # Step 4: Transform back to flavor basis
                 ρ = U * ρ_eig * U'
             end
-        
-            # Fill in transition probabilities to each final flavor β
-            for β in 1:size(v)[1]
-                eβ = v[β, :]
-                P[β, α] = real(eβ' * ρ * eβ)  # P(ν_α → ν_β)
+
+            # P[β, α] = real(ρ[β, β]) since eβ is a standard basis vector
+            for β in 1:n
+                P[β, α] = real(ρ[β, β])
             end
         end
         push!(ps, P)
@@ -440,13 +447,14 @@ function select(U, h, cfg::All)
 end
 
 function select(U, h, cfg::Cut)
-    mask = sqrt.(abs.(h)) .< cfg.cutoff;
-    if any(.!mask)
-        h = h[mask];
-        U_rest = U[:, .!mask]
-        U = U[:, mask];
+    mask = sqrt.(abs.(h)) .< cfg.cutoff
+    notmask = .!mask
+    if any(notmask)
+        h = h[mask]
+        U_rest = U[:, notmask]
+        U = U[:, mask]
     else
-        U_rest = 0
+        U_rest = U[:, Int[]]
     end
 
     return U, h, abs2.(U_rest) * abs2.(U_rest)'
@@ -454,104 +462,129 @@ end
 
 
 function propagate(U, h, E, L, propagation::Basic)
-    p = stack(broadcast((e, l) -> abs2.(osc_kernel(U, h, e, l)), E, L'))
+    n = size(U, 1)
+    RT = real(promote_type(eltype(U), eltype(h), eltype(E), eltype(L)))
+    # Write directly in (n_flav, n_flav, n_E, n_L) layout — avoids permutedims
+    p = Array{RT}(undef, n, n, length(E), length(L))
+    for (j, l) in enumerate(L), (i, e) in enumerate(E)
+        result = abs2.(osc_kernel(U, h, e, l))
+        for b in 1:n, a in 1:n
+            p[a, b, i, j] = result[a, b]
+        end
+    end
+    p
 end
 
 function propagate(U, h, E, L, propagation::Damping)
-    res = broadcast((e, l) -> osc_kernel(U, h, e, l, propagation.σₑ), E, L')
-    p = stack(map(x -> abs2.(first(x)) + abs2.(U) * Diagonal(1 .- abs2.(last(x))) * abs2.(U)', res))
+    n = size(U, 1)
+    RT = real(promote_type(eltype(U), eltype(h), eltype(E), eltype(L)))
+    U2 = abs2.(U)
+    p = Array{RT}(undef, n, n, length(E), length(L))
+    for (j, l) in enumerate(L), (i, e) in enumerate(E)
+        amp, decay = osc_kernel(U, h, e, l, propagation.σₑ)
+        result = abs2.(amp) + U2 * Diagonal(1 .- abs2.(decay)) * U2'
+        for b in 1:n, a in 1:n
+            p[a, b, i, j] = result[a, b]
+        end
+    end
+    p
 end
 
 function propagate(U, h, E, L, propagation::Decoherent)
+    n = size(U, 1)
+    RT = real(promote_type(eltype(U), eltype(h), eltype(E), eltype(L)))
 
-    function kernel(e,l)
-        P = Matrix(abs.(zero(U*U')))  # P[β, α]
-        v = one(U*U')
-        
-        for α in 1:size(v)[1]
-            # Initial flavor state density matrix |να⟩⟨να|
-            eα = v[α, :]
-            ρ = eα * eα'
-        
-            # Step 1: Transform to eigenbasis
-            ρ_eig = U' * ρ * U
-    
-            # Step 2: Coherent evolution
-            phases = exp.(-F_units * 1im * (l / e) .* h)
-            U_phase = Diagonal(phases)
+    p = Array{RT}(undef, n, n, length(E), length(L))
+
+    for (j, l) in enumerate(L), (i, e) in enumerate(E)
+        # Precompute phase and damping (same for all α)
+        phases = exp.(-F_units * 1im * (l / e) .* h)
+        U_phase = Diagonal(phases)
+        Δφ = abs.(h .- h') * (l / e) * F_units
+        D = exp.(-2 .* Δφ .* propagation.σₑ^2)
+
+        for α in 1:n
+            # ρ_eig = U' * |α⟩⟨α| * U, so ρ_eig[i,j] = conj(U[α,i]) * U[α,j]
+            ρ_eig = U[α:α, :]' * U[α:α, :]
+
+            # Coherent evolution
             ρ_eig = U_phase * ρ_eig * U_phase'
-    
-            # Step 3: Decoherence damping
-            Δφ = abs.(h .- h') * (l / e) * F_units
-            D = exp.(-2 .* Δφ .* propagation.σₑ^2)
-            ρ_eig .= ρ_eig .* D
-    
-            # Step 4: Transform back to flavor basis
+
+            # Decoherence damping
+            ρ_eig = ρ_eig .* D
+
+            # Transform back to flavor basis
             ρ = U * ρ_eig * U'
 
-        
-            # Fill in transition probabilities to each final flavor β
-            for β in 1:size(v)[1]
-                eβ = v[β, :]
-                P[β, α] = real(eβ' * ρ * eβ)  # P(ν_α → ν_β)
+            # P[β, α] = real(ρ[β, β]) since eβ is a standard basis vector
+            for β in 1:n
+                p[β, α, i, j] = real(ρ[β, β])
             end
         end
-        P
     end
-
-    res = stack(broadcast((e, l) -> kernel(e, l), E, L'))
+    p
 end
 
 function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Vacuum, anti::Bool)
-    L = [sum([segment.length for segment in path]) for path in paths]
+    L = [sum(segment.length for segment in path) for path in paths]
     propagate(U, h, E, L, propagation)
 end
 
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool)
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool, eigen_method::EigenMethod=DefaultEigen())
     if anti
-        H_eff = conj.(U) * Diagonal(h) * adjoint(conj.(U))
+        H_eff = conj.(U) * Diagonal(h) * transpose(U)
     else
         H_eff = U * Diagonal(h) * adjoint(U)
     end
-    p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction), E))
+    p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, eigen_method), E))
     permutedims(p, (1, 2, 4, 3))
+end
+
+# Fuse rest addition + permutedims(p, (3,4,1,2)) into one pass
+function _add_rest_and_permute(p_raw, rest)
+    n1, n2, n3, n4 = size(p_raw)
+    result = similar(p_raw, n3, n4, n1, n2)
+    @inbounds for b in 1:n2, a in 1:n1, j in 1:n4, i in 1:n3
+        result[i, j, a, b] = p_raw[a, b, i, j] + (rest isa AbstractArray ? rest[a, b] : rest)
+    end
+    result
 end
 
 function get_osc_prob(cfg::OscillationConfig)
 
     function osc_prob(E::AbstractVector{<:Real}, L::AbstractVector{<:Real}, params::NamedTuple; anti=false)
-        U, h_raw = get_matrices(cfg.flavour)(params)
+        U, h_raw = get_matrices(cfg.flavour, cfg.eigen_method)(params)
         h = h_raw .- minimum(h_raw)
         Uc = anti ? conj.(U) : U
-    
+
         U, h, rest = select(Uc, h, cfg.states)
-        
-        p = propagate(U, h, E, L, cfg.propagation)
-            
-        # results
-        p = p .+ rest
-        return permutedims(p, (3, 4, 1, 2))
+
+        # propagate returns (n_flav, n_flav, n_E, n_L)
+        p_raw = propagate(U, h, E, L, cfg.propagation)
+
+        # fuse rest addition + permutedims into (n_E, n_L, n_flav, n_flav)
+        return _add_rest_and_permute(p_raw, rest)
     end
 
     function osc_prob(E::AbstractVector{<:Real}, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, params::NamedTuple; anti=false)
-        U, h_raw = get_matrices(cfg.flavour)(params)
+        U, h_raw = get_matrices(cfg.flavour, cfg.eigen_method)(params)
         h = h_raw .- minimum(h_raw)
         Uc = anti ? conj.(U) : U
-    
+
         U, h, rest = select(Uc, h, cfg.states)
-    
-        p = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti)
-        
-        # results
-        p = p .+ rest
-        return permutedims(p, (3, 4, 1, 2))
+
+        # propagate returns (n_flav, n_flav, n_E, n_cz)
+        p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti, cfg.eigen_method)
+
+        # fuse rest addition + permutedims into (n_E, n_cz, n_flav, n_flav)
+        return _add_rest_and_permute(p_raw, rest)
     end
 
     return osc_prob
 end
 
 
-function get_matrices(cfg::ThreeFlavour)
+function get_matrices(cfg::ThreeFlavour, eigen_method::EigenMethod=DefaultEigen())
     function matrices(params::NamedTuple)
         U = get_PMNS(params)
         T = promote_type(typeof(params.Δm²₂₁), typeof(params.Δm²₃₁))
@@ -561,7 +594,7 @@ function get_matrices(cfg::ThreeFlavour)
     end
 end
 
-function get_matrices(cfg::ThreeFlavourXYCP)
+function get_matrices(cfg::ThreeFlavourXYCP, eigen_method::EigenMethod=DefaultEigen())
     function matrices(params::NamedTuple)
 
         # norm = sqrt(params.δCPy^2 + params.δCPx^2)
@@ -580,7 +613,7 @@ function get_matrices(cfg::ThreeFlavourXYCP)
     end
 end
 
-function get_matrices(cfg::Sterile)
+function get_matrices(cfg::Sterile, eigen_method::EigenMethod=DefaultEigen())
     function matrices(params::NamedTuple)
         h = [0. ,params.Δm²₂₁, params.Δm²₃₁, params.Δm²₄₁]
      
@@ -596,7 +629,7 @@ function get_matrices(cfg::Sterile)
     end
 end
 
-function get_matrices(cfg::ADD)
+function get_matrices(cfg::ADD, eigen_method::EigenMethod=DefaultEigen())
     function matrices(params::NamedTuple)
         
         PMNS = get_PMNS(params)
@@ -608,21 +641,16 @@ function get_matrices(cfg::ADD)
     
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-    
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-    
+
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.ADD_radius * MD[i, j] * umev
             end
         end
-        
+
         for n in 1:cfg.N_KK
             for i in 1:3
                 for j in 1:3
@@ -630,17 +658,17 @@ function get_matrices(cfg::ADD)
                 end
             end
         end
-    
+
         for i in 1:cfg.N_KK
             aM2[3*i + 1, 3*i + 1] = i
             aM2[3*i + 2, 3*i + 2] = i
             aM2[3*i + 3, 3*i + 3] = i
         end
-    
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
     
-        h, U = eigen(aaMM)
+        h, U = decompose(aaMM, eigen_method)
         h = h / (params.ADD_radius^2 * umev^2.)
         return U, h
     end
@@ -721,7 +749,7 @@ end
 #         aM = copy(aM1) + copy(aM2)
 #         aaMM = Hermitian(conj(transpose(aM)) * aM)
     
-#         h, U = eigen(aaMM)
+#         h, U = decompose(aaMM, eigen_method)
 #         h = h / (params.Darkdim_radius^2 * umev^2)
     
 #         return U, h
@@ -748,7 +776,7 @@ end
 
 # end
 
-function get_matrices(cfg::Darkdim_Lambda)
+function get_matrices(cfg::Darkdim_Lambda, eigen_method::EigenMethod=DefaultEigen())
     function matrices(params::NamedTuple)
         MP = 2.435e18 # GeV
         #M5 = 1e6 # GeV
@@ -772,21 +800,16 @@ function get_matrices(cfg::Darkdim_Lambda)
         # Initialize aM1 matrix
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-      
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         # Fill in the aM1 matrix for the first term
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.Darkdim_radius * MDc00[i, j] * umev
             end
         end
-  
+
         # Update aM1 matrix for the second term
         for n in 1:cfg.N_KK
             MDcoff = PMNS * Diagonal([
@@ -800,7 +823,7 @@ function get_matrices(cfg::Darkdim_Lambda)
                 end
             end
         end
-  
+
         # Fill in the aM2 matrix
         for n in 1:cfg.N_KK
             aMD2 = PMNS * Diagonal([
@@ -814,27 +837,27 @@ function get_matrices(cfg::Darkdim_Lambda)
                 end
             end
         end
-  
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
-  
-        h, U = eigen(aaMM)
-        h = h / (params.Darkdim_radius^2 * umev^2) 
+
+        h, U = decompose(aaMM, eigen_method)
+        h = h / (params.Darkdim_radius^2 * umev^2)
         return U, h
     end
 end
 
-function get_matrices(cfg::Darkdim_Masses)
+function get_matrices(cfg::Darkdim_Masses, eigen_method::EigenMethod=DefaultEigen())
 
     function get_mass(ca)
         x = 2 * π * ca
         b = x == 0. ? 1. : sqrt(x / (expm1(x)))
     end
-    
+
     cas = LinRange(10, -10, 300)
     masses = get_mass.(cas)
     get_ca = LinearInterpolation(masses, cas; extrapolation_bc=Line())
-    
+
     function matrices(params::NamedTuple)
         MP = 2.435e18 # GeV
         M5 = 1.055e9 * (1/(2π * params.Darkdim_radius))^(1/3) # GeV
@@ -843,36 +866,31 @@ function get_matrices(cfg::Darkdim_Masses)
         m1_MD, m2_MD, m3_MD = (vev * M5 / MP) .* lambda_list
 
         m1, m2, m3 = get_abs_masses(params)
-        
+
         ca1 = get_ca(m1 / m1_MD)
         ca2 = get_ca(m2 / m2_MD)
         ca3 = get_ca(m3 / m3_MD)
-        
-        PMNS = get_PMNS(params)    
-      
+
+        PMNS = get_PMNS(params)
+
         #MD is the Dirac mass matrix that appears in the Lagrangian. Note the difference with ADD through the multiplication by c.
-      
+
         # Compute MDc00
         MDc00 = PMNS * Diagonal([m1, m2, m3]) * adjoint(PMNS)
-  
+
         # Initialize aM1 matrix
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-      
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         # Fill in the aM1 matrix for the first term
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.Darkdim_radius * MDc00[i, j] * umev
             end
         end
-  
+
         # Update aM1 matrix for the second term
         for n in 1:cfg.N_KK
             MDcoff = PMNS * Diagonal([
@@ -886,7 +904,7 @@ function get_matrices(cfg::Darkdim_Masses)
                 end
             end
         end
-  
+
         # Fill in the aM2 matrix
         for n in 1:cfg.N_KK
             aMD2 = PMNS * Diagonal([
@@ -900,17 +918,17 @@ function get_matrices(cfg::Darkdim_Masses)
                 end
             end
         end
-  
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
-  
-        h, U = eigen(aaMM)
-        h = h / (params.Darkdim_radius^2 * umev^2) 
+
+        h, U = decompose(aaMM, eigen_method)
+        h = h / (params.Darkdim_radius^2 * umev^2)
         return U, h
     end
 end
 
-function get_matrices(cfg::Darkdim_cas)
+function get_matrices(cfg::Darkdim_cas, eigen_method::EigenMethod=DefaultEigen())
 
     function get_lambda(ca, m)
         MP = 2.435e18 # GeV
@@ -918,10 +936,10 @@ function get_matrices(cfg::Darkdim_cas)
         vev = 174e9 # eV
         MD = (vev * M5 / MP)
         x = 2 * π * ca
-        b = x == 0. ? 1. : sqrt(x / (expm1(x)))
+        b = iszero(x) ? one(x) : sqrt(x / (expm1(x)))
         m / (MD * b)
     end
-    
+
     function matrices(params::NamedTuple)
         MP = 2.435e18 # GeV
         M5 = 1e6 # GeV
@@ -932,7 +950,7 @@ function get_matrices(cfg::Darkdim_cas)
         ca1 = params.ca1
         ca2 = params.ca2
         ca3 = params.ca3
-        
+
         λ₁ = get_lambda(ca1, m1)
         λ₂ = get_lambda(ca2, m2)
         λ₃ = get_lambda(ca3, m3)
@@ -940,32 +958,27 @@ function get_matrices(cfg::Darkdim_cas)
         lambda_list = [λ₁, λ₂, λ₃]
 
         m1_MD, m2_MD, m3_MD = (vev * M5 / MP) .* lambda_list
-        
-        PMNS = get_PMNS(params)    
-      
+
+        PMNS = get_PMNS(params)
+
         #MD is the Dirac mass matrix that appears in the Lagrangian. Note the difference with ADD through the multiplication by c.
-      
+
         # Compute MDc00
         MDc00 = PMNS * Diagonal([m1, m2, m3]) * adjoint(PMNS)
-  
+
         # Initialize aM1 matrix
         aM1 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
         aM2 = similar(PMNS, 3*(cfg.N_KK+1), 3*(cfg.N_KK+1))
-        # init buffers
-        for i in 1:3*(cfg.N_KK+1)
-            for j in 1:3*(cfg.N_KK+1)
-                aM1[i,j] = 0.
-                aM2[i,j] = 0.
-            end
-        end
-      
+        fill!(aM1, zero(eltype(aM1)))
+        fill!(aM2, zero(eltype(aM2)))
+
         # Fill in the aM1 matrix for the first term
         for i in 1:3
             for j in 1:3
                 aM1[i, j] = params.Darkdim_radius * MDc00[i, j] * umev
             end
         end
-  
+
         # Update aM1 matrix for the second term
         for n in 1:cfg.N_KK
             MDcoff = PMNS * Diagonal([
@@ -979,7 +992,7 @@ function get_matrices(cfg::Darkdim_cas)
                 end
             end
         end
-  
+
         # Fill in the aM2 matrix
         for n in 1:cfg.N_KK
             aMD2 = PMNS * Diagonal([
@@ -993,12 +1006,12 @@ function get_matrices(cfg::Darkdim_cas)
                 end
             end
         end
-  
-        aM = copy(aM1) + copy(aM2)
+
+        aM = aM1 + aM2
         aaMM = Hermitian(conj(transpose(aM)) * aM)
-  
-        h, U = eigen(aaMM)
-        h = h / (params.Darkdim_radius^2 * umev^2) 
+
+        h, U = decompose(aaMM, eigen_method)
+        h = h / (params.Darkdim_radius^2 * umev^2)
         return U, h
     end
 end

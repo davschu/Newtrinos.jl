@@ -23,7 +23,15 @@ using ..Newtrinos
     plot::Function
 end
 
-function configure(physics)
+function default_physics()
+    osc = Newtrinos.osc.configure(Newtrinos.osc.OscillationConfig(interaction=Newtrinos.osc.SI()))
+    atm_flux = Newtrinos.atm_flux.configure(Newtrinos.atm_flux.AtmFluxConfig(nominal_model=Newtrinos.atm_flux.HKKM("kam-ally-20-01-mtn-solmin.d")))
+    earth_layers = Newtrinos.earth_layers.configure()
+    xsec = Newtrinos.xsec.configure(Newtrinos.xsec.Differential_H2O())
+    (; osc, atm_flux, earth_layers, xsec)
+end
+
+function configure(physics=default_physics())
     physics = (;physics.osc, physics.atm_flux, physics.earth_layers, physics.xsec)
     assets = get_assets(physics)
     return SuperKAtm(
@@ -103,7 +111,7 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
     n_logE = length(logE_grid)
     n_cosZ = length(cosZ_grid)
 
-    response_matrix = zeros(Float16, n_bins, n_logE-1, n_cosZ-1)
+    response_matrix = zeros(Float64, n_bins, n_logE-1, n_cosZ-1)
 
     for bin_idx in 1:n_bins
         bin = MC_component[bin_idx, :]
@@ -132,6 +140,11 @@ function make_response_matrix(MC_component, logE_grid, cosZ_grid)
     return response_matrix
 end
 
+function contract_R(R_flat, weighted_flux)
+    # R_flat is (n_bins, n_E*n_cz), weighted_flux is (n_E, n_cz)
+    R_flat * vec(weighted_flux)
+end
+
 function calc_weights(params, assets, physics)
 
     E = 10. .^midpoints(assets.loge_grid)
@@ -143,33 +156,33 @@ function calc_weights(params, assets, physics)
 
     s = (size(p)[1], size(p)[2])
 
-    xsec_nue     = reshape(physics.xsec.scale(E, :nue,   :CC, false, params), (1, :, 1))
-    xsec_numu    = reshape(physics.xsec.scale(E, :numu,  :CC, false, params), (1, :, 1))
-    xsec_nutau   = reshape(physics.xsec.scale(E, :nutau, :CC, false, params), (1, :, 1))
-    xsec_nuebar  = reshape(physics.xsec.scale(E, :nue,   :CC, true,  params), (1, :, 1))
-    xsec_numubar = reshape(physics.xsec.scale(E, :numu,  :CC, true,  params), (1, :, 1))
-    xsec_nutaubar= reshape(physics.xsec.scale(E, :nutau, :CC, true,  params), (1, :, 1))
+    xsec_nue     = physics.xsec.scale(E, :nue,   :CC, false, params)
+    xsec_numu    = physics.xsec.scale(E, :numu,  :CC, false, params)
+    xsec_nutau   = physics.xsec.scale(E, :nutau, :CC, false, params)
+    xsec_nuebar  = physics.xsec.scale(E, :nue,   :CC, true,  params)
+    xsec_numubar = physics.xsec.scale(E, :numu,  :CC, true,  params)
+    xsec_nutaubar= physics.xsec.scale(E, :nutau, :CC, true,  params)
     xsec_nc      = physics.xsec.scale(E, :nue,   :NC, false, params)
 
-    nue_flux   = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 1] .+
-                 reshape(flux.numu,   s) .* p[:, :, 2, 1], 1, s...)
-    numu_flux  = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 2] .+
-                 reshape(flux.numu,   s) .* p[:, :, 2, 2], 1, s...)
-    nutau_flux = reshape(reshape(flux.nue,    s) .* p[:, :, 1, 3] .+
-                 reshape(flux.numu,   s) .* p[:, :, 2, 3], 1, s...)
-    nuebar_flux  = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 1] .+
-                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 1], 1, s...)
-    numubar_flux = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 2] .+
-                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 2], 1, s...)
-    nutaubar_flux  = reshape(reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 3] .+
-                   reshape(flux.numubar, s) .* p_anti[:, :, 2, 3], 1, s...)
+    nue_flux   = (reshape(flux.nue,    s) .* p[:, :, 1, 1] .+
+                  reshape(flux.numu,   s) .* p[:, :, 2, 1]) .* xsec_nue
+    numu_flux  = (reshape(flux.nue,    s) .* p[:, :, 1, 2] .+
+                  reshape(flux.numu,   s) .* p[:, :, 2, 2]) .* xsec_numu
+    nutau_flux = (reshape(flux.nue,    s) .* p[:, :, 1, 3] .+
+                  reshape(flux.numu,   s) .* p[:, :, 2, 3]) .* xsec_nutau
+    nuebar_flux  = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 1] .+
+                    reshape(flux.numubar, s) .* p_anti[:, :, 2, 1]) .* xsec_nuebar
+    numubar_flux = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 2] .+
+                    reshape(flux.numubar, s) .* p_anti[:, :, 2, 2]) .* xsec_numubar
+    nutaubar_flux = (reshape(flux.nuebar,  s) .* p_anti[:, :, 1, 3] .+
+                     reshape(flux.numubar, s) .* p_anti[:, :, 2, 3]) .* xsec_nutaubar
 
-    nue = vec(sum(assets.R.nue .* nue_flux .* xsec_nue, dims=(2,3)))
-    numu = vec(sum(assets.R.numu .* numu_flux .* xsec_numu, dims=(2,3)))
-    nutau = vec(sum(assets.R.nutau .* nutau_flux .* xsec_nutau, dims=(2,3)))
-    nuebar = vec(sum(assets.R.nuebar .* nuebar_flux .* xsec_nuebar, dims=(2,3)))
-    numubar = vec(sum(assets.R.numubar .* numubar_flux .* xsec_numubar, dims=(2,3)))
-    nunc = vec(sum(assets.R.nunc .* xsec_nc, dims=(2,3)))
+    nue     = contract_R(assets.R.nue,     nue_flux)
+    numu    = contract_R(assets.R.numu,    numu_flux)
+    nutau   = contract_R(assets.R.nutau,   nutau_flux)
+    nuebar  = contract_R(assets.R.nuebar,  nuebar_flux)
+    numubar = contract_R(assets.R.numubar, numubar_flux)
+    nunc    = contract_R(assets.R.nunc,    ones(eltype(nue_flux), s) .* xsec_nc)
 
     return (; nue, numu, nutau, nuebar, numubar, nunc)
 end
@@ -240,21 +253,24 @@ function get_assets(physics; datadir = @__DIR__)
     paths = physics.earth_layers.compute_paths(midpoints(cz_grid), layers)
     flux_nominal = physics.atm_flux.nominal_flux(10. .^midpoints(loge_grid), midpoints(cz_grid))
 
-    R = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))    
-    nominal_weights = calc_weights(merge(params_nominal, (sk_energy_scale=1.0,)), (;R, flux_nominal, paths, layers, loge_grid), physics)
+    flatten_R(R3d) = NamedTuple(key => reshape(R3d[key], size(R3d[key], 1), :) for key in keys(R3d))
 
-    R_plus = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(1.02), cz_grid) for key in keys(MC))
-    R_minus = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(0.98), cz_grid) for key in keys(MC))
-    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
-    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=R_minus, flux_nominal, paths, layers, loge_grid), physics)
+    R_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))
+    R = flatten_R(R_3d)
+    nominal_weights = calc_weights(params_nominal, (;R, flux_nominal, paths, layers, loge_grid), physics)
+
+    R_plus_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(1.02), cz_grid) for key in keys(MC))
+    R_minus_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(0.98), cz_grid) for key in keys(MC))
+    weights_plus = calc_weights(params_nominal, (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(params_nominal, (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
     Fij = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
-    for key in keys(R)
-        R_plus[key][:,:,1:50] .= R[key][:,1:50]
-        R_minus[key][:,:,1:50] .= R[key][:,:,1:50]
+    for key in keys(R_3d)
+        R_plus_3d[key][:,:,1:50] .= R_3d[key][:,:,1:50]
+        R_minus_3d[key][:,:,1:50] .= R_3d[key][:,:,1:50]
     end
-    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=R_plus, flux_nominal, paths, layers, loge_grid), physics)
-    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=R_minus, flux_nominal, paths, layers, loge_grid), physics)
+    weights_plus = calc_weights(params_nominal, (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(params_nominal, (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
     Fij_updown = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
     return (; MC, R, Fij, Fij_updown, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)

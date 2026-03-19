@@ -67,7 +67,7 @@ end
 
 function get_hkkm_flux(filename)    
 
-    flux_chunks = []
+    flux_chunks = Matrix{Float32}[]
     for i in 19:-1:0
         idx = i*103 + 3: (i+1)*103
         push!(flux_chunks, Float32.(readdlm(filename)[idx, 2:5]))

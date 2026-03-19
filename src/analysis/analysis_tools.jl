@@ -2,12 +2,10 @@ using LinearAlgebra
 using Distributions
 using DensityInterface
 using InverseFunctions
-using Base
 import ForwardDiff
 import PolyesterForwardDiff
 using BAT
 using Optimization
-#using Optim
 using IterTools
 using DataStructures
 using ADTypes
@@ -29,290 +27,21 @@ using ..Newtrinos
 adsel = AutoForwardDiff()
 set_batcontext(ad = adsel)
 
+# ── Core Types ──────────────────────────────────────────────────────
+
+"""
+    NewtrinosResult(; axes, values, meta=Dict())
+
+Container for scan/profile results. `axes` holds the scan grid coordinates,
+`values` holds likelihood values and optimized parameters, `meta` holds execution metadata.
+"""
 @kwdef struct NewtrinosResult
     axes::NamedTuple
     values::NamedTuple
     meta::Dict = Dict()
 end
 
-# function build_optimizationfunction(f, adsel::AutoDiffOperators.ADSelector)
-#     adm = convert(ADTypes.AbstractADType, reverse_ad_selector(adsel))
-#     optimization_function = Optimization.OptimizationFunction(f, adm)
-#     return optimization_function
-# end
-
-# function build_optimizationfunction(f, adsel::BAT._NoADSelected)
-#     optimization_function = Optimization.OptimizationFunction(f)
-#     return optimization_function
-# end
-
-"Find Maximum Likelihood Estimator (MLE)"
-function find_mle(likelihood, prior, params; adsel = AutoPolyesterForwardDiff())
-    
-    try
-        
-        set_batcontext(ad = adsel)
-        
-        posterior = PosteriorMeasure(likelihood, prior)
-
-        #res = bat_findmode(posterior, OptimizationAlg(optalg=Optimization.LBFGS()))
-
-        msg = "Running Optimization for point "
-        
-        for key in keys(prior)
-            if prior[key] isa ValueShapes.ConstValueDist
-                value = prior[key].value
-                @reset params[key] = value
-                msg *= " $(key): $(value)"
-            end
-        end
-
-        @info msg
-        # THIS ONE WORKS:
-        res = bat_findmode(posterior, OptimizationAlg(optalg=Optimization.LBFGS(), init = ExplicitInit([params]), kwargs = (reltol=1e-7, maxiters=1000)))
-        #res = bat_findmode(posterior, OptimizationAlg(optalg=Optimization.LBFGS(), ))
-
-        # This one also works, and IS thread safe:
-
-        #res = bat_findmode(posterior, OptimAlg(optalg=Optim.LBFGS(), init = ExplicitInit([v_init]), kwargs = (g_tol=1e-5, iterations=100)))
-
-        
-        #res = bat_findmode(posterior, OptimizationAlg(optalg=Optimization.LBFGS(), kwargs = ()))#reltol=1e-7, maxiters=10000)))
-
-        # target = posterior
-        # context = get_batcontext()
-        # transformed_m, f_pretransform = BAT.transform_and_unshape(PriorToUniform(), target, context)
-        # target_uneval = BAT.unevaluated(target)
-        # inv_trafo = inverse(f_pretransform)
-        # initalg = BAT.apply_trafo_to_init(f_pretransform, InitFromTarget())
-        # x_init = collect(bat_initval(transformed_m, initalg, context).result)
-        # # Maximize density of original target, but run in transformed space, don't apply LADJ:
-        # f = BAT.fchain(inv_trafo, logdensityof(target_uneval), -)
-        # target_f = (x, p) -> f(x)
-        # adsel = BAT.get_adselector(context)
-        # optimization_function = build_optimizationfunction(target_f, adsel)
-        # optimization_problem = Optimization.OptimizationProblem(optimization_function, x_init, (), lb=zeros(size(x_init)), ub=ones(size(x_init)))
-        # #algopts = (maxiters = algorithm.maxiters, maxtime = algorithm.maxtime, abstol = algorithm.abstol, reltol = algorithm.reltol)
-        # # Not all algorithms support abstol, just filter all NaN-valued opts out:
-        # #filtered_algopts = NamedTuple(filter(p -> !isnan(p[2]), ))
-        # optimization_result = Optimization.solve(optimization_problem, Evolutionary.CMAES(μ = 40, λ = 100)) #NLopt.GN_CRS2_LM()) 
-        # transformed_mode =  optimization_result.u
-        # result_mode = inv_trafo(transformed_mode)
-        # res = (result = result_mode, result_trafo = transformed_mode, f_pretransform = f_pretransform, info = optimization_result)
-
-        #println(res)
-
-        #res = bat_findmode(posterior, OptimizationAlg(optalg=Optimization.LBFGS(), init = ExplicitInit([v_init]), kwargs = (reltol=1e-7, maxiters=10000)))
-        #res = bat_findmode(posterior, OptimAlg(optalg=Optim.LBFGS(), init = ExplicitInit([v_init]), kwargs = (f_tol=1e-7, iterations=10000)))
-        #res = bat_findmode(posterior, OptimAlg(optalg=Optim.LBFGS(), init = ExplicitInit([v_init]), kwargs = (f_tol=1e-7, iterations=10000)))
-        #res = bat_findmode(posterior, OptimizationAlg(optalg=NLopt.GN_CRS2_LM()))
-
-        return logdensityof(likelihood, res.result), logdensityof(posterior, res.result), res.result
-
-        # posterior = PosteriorMeasure(llh, prior)
-
-        # tr_pstr, f_trafo = bat_transform(PriorToGaussian(), posterior)
-
-        # v0 = mean(posterior.prior.dist)
-        # x0 = f_trafo(v0)
-
-        # tr_neg_log_likelihood = (-) ∘ logdensityof(posterior.likelihood) ∘ inverse(f_trafo)
-
-        # tr_neg_log_likelihood(x0)
-
-        # r = Optim.optimize(tr_neg_log_likelihood, x0, Optim.LBFGS(), Optim.Options(f_tol=1e-13), autodiff = :forward)
-
-        # x_opt = Optim.minimizer(r)
-        # v_opt = inverse(f_trafo)(x_opt)
-        # f_opt = -Optim.minimum(r)
-        # return f_opt, v_opt
-        
-    catch e
-        if e isa ArgumentError
-            return NaN, NaN, (; (k => NaN for k in keys(params))... )
-
-        else
-            rethrow(e)
-        end
-    end
-
-end
-
-function test_find_mle()
-    function fwd(a, b)
-        return MvNormal([a,b], I(2))
-    end
-    likelihood = likelihoodof(splat(fwd), [0,0])
-    prior = distprod(a=Normal(0,1), b=Normal(0,1))
-    params = (a=0.5, b=-0.5)
-    res = find_mle(likelihood, prior, params)
-    println(res)
-end
-
-
-function generate_scanpoints(vars_to_scan, priors)
-    vars = collect(keys(vars_to_scan))
-    values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
-    mesh = collect(IterTools.product(values...))
-    scanpoints = Array{Any}(undef, size(mesh))
-
-    function make_prior(vals)
-        p = deepcopy(priors)
-        for i in 1:length(vars_to_scan)
-            @reset p[vars[i]] = vals[i]
-        end
-        distprod(;p...)
-    end
-
-    for i in eachindex(mesh)
-        scanpoints[i] = make_prior(mesh[i])
-    end
-
-    values, scanpoints
-end
-
-function find_mle_cached(likelihood, prior, params, cache_dir)
-    opt_result = nothing
-
-    h = ContentHashes.hash([prior, params])
-
-    if !isnothing(cache_dir)
-        fname = joinpath(cache_dir, "$h.jld2")
-        if isfile(fname)
-            @info "using cached file $fname"
-            cached = FileIO.load(fname)
-            opt_result = (cached["llh"], cached["log_posterior"], cached["result"])
-        end
-    end
-    
-    if isnothing(opt_result)
-        opt_result = find_mle(likelihood, prior, params)
-    end
-
-    if !isnothing(cache_dir)
-        fname = joinpath(cache_dir, "$h.jld2")
-        FileIO.save(fname, OrderedDict("llh"=>opt_result[1], "log_posterior"=>opt_result[2], "result"=>opt_result[3]))
-    end
-
-    opt_result
-end
-
-function _profile(likelihood, scanpoints, params, cache_dir)
-    results = Array{Any}(undef, size(scanpoints))
-    llhs = Array{Any}(undef, size(scanpoints))
-    log_posteriors = Array{Any}(undef, size(scanpoints))
-
-    @showprogress Threads.@threads for i in eachindex(scanpoints)
-        opt_result = find_mle_cached(likelihood, scanpoints[i], deepcopy(params), cache_dir)
-        llhs[i] = opt_result[1]
-        log_posteriors[i] = opt_result[2]
-        results[i] = opt_result[3]
-    end
-    s = OrderedDict(key=>[x[key] for x in results] for key in keys(first(results)))
-    s[:llh] = llhs
-    s[:log_posterior] = log_posteriors
-    NamedTuple(s)
-end
-
-function add_meta!(meta)
-    meta["hostname"] = gethostname()
-    meta["username"] = get(ENV, "USER", get(ENV, "USERNAME", "unknown"))
-    meta["date"] = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
-    repo = dirname(dirname(pathof(Newtrinos)))
-    meta["repo"] = repo
-    meta["commit_hash"] = LibGit2.head(repo)
-    meta["repo_clean"] = !LibGit2.isdirty(LibGit2.GitRepo(repo))
-end
-
-"Run Profile llh scan"
-function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing)
-    t1 = time()
-    #check if there is actually any variable to be profiled over, or if they all or just Numbers
-    if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
-        # so all variables are just numbers and it reduces to a simple scan
-        return scan(likelihood, priors, vars_to_scan, params)
-    end
-    
-    values, scanpoints = generate_scanpoints(vars_to_scan, priors)
-    if !isnothing(cache_dir)
-        if isdir(cache_dir)
-            while true
-                print("Cache dir `$(cache_dir)` exists and results may be reused; continue? [y/n]: ")
-                answer = readline(stdin)
-                if lowercase(answer) in ["y", "yes"]
-                    break
-                else
-                    exit()
-                end
-            end
-        else
-            mkdir(cache_dir)
-        end
-    end
-    res = _profile(likelihood, scanpoints, params, cache_dir)
-    t2 = time()
-    meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
-    add_meta!(meta)
-    axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
-    result = NewtrinosResult(axes=axes, values=res, meta=meta)
-end
-
-"Run simple llh scan"
-function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
-    t1 = time()
-    vars = collect(keys(vars_to_scan))
-    values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
-    mesh = collect(IterTools.product(values...))
-    scanpoints = Array{Any}(undef, size(mesh))
-
-    function make_params(vals)
-        p = deepcopy(params)
-        for i in 1:length(vars_to_scan)
-            @reset p[vars[i]] = vals[i]
-        end
-        return p
-    end
-
-    for i in eachindex(mesh)
-        scanpoints[i] = make_params(mesh[i])
-    end
-
-    llhs = Array{Any}(undef, size(scanpoints))
-    if gradient_map
-        grads = Array{Any}(undef, size(scanpoints))
-    end
-
-    @showprogress Threads.@threads for i in eachindex(scanpoints)
-        p = scanpoints[i]
-        llhs[i] = logdensityof(likelihood, p)
-        if gradient_map
-            grads[i] = ForwardDiff.gradient(x -> logdensityof(likelihood, x),  p)
-        end
-    end
-
-    s = OrderedDict{Symbol, Array}(key=>Fill(params[key], size(mesh)) for key in setdiff(keys(params), keys(vars_to_scan)))
-    if gradient_map
-        g = OrderedDict(Symbol(key, "_grad")=>[x[key] for x in grads] for key in keys(first(grads)))
-        s = merge(s, g)
-    end
-    s[:llh] = llhs
-    s[:log_posterior] = llhs
-    res = NamedTuple(s)
-    t2 = time()
-    meta = Dict("task"=>"scan", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1,)
-    add_meta!(meta)
-    axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
-    result = NewtrinosResult(axes=axes, values=res, meta=meta)
-end
-
-function bestfit(result::NewtrinosResult)
-    idx = argmax(result.values.log_posterior)
-    bf = OrderedDict(var=>result.values[var][idx] for var in keys(result.values))
-    for i in 1:length(result.axes)
-        bf[keys(result.axes)[i]] = result.axes[i][idx[i]]
-    end
-    NamedTuple(bf)
-end
+# ── Utility Functions ───────────────────────────────────────────────
 
 function sort_nt(nt::NamedTuple)
     keys_sorted = sort(collect(keys(nt)))
@@ -320,10 +49,13 @@ function sort_nt(nt::NamedTuple)
     return NamedTuple{Tuple(keys_sorted)}(values_sorted)
 end
 
+"""
+    safe_merge(nt_list::NamedTuple...)
+
+Merge NamedTuples, checking that duplicate keys have equal values. Result is sorted by key.
+"""
 function safe_merge(nt_list::NamedTuple...)
-    """ Merge namedtuples such that duplicates are checked for consistentcy
-    """
-    merged = NamedTuple()  # start with an empty NamedTuple
+    merged = NamedTuple()
     for nt in nt_list
         for (k, v) in pairs(nt)
             if haskey(merged, k)
@@ -337,37 +69,24 @@ function safe_merge(nt_list::NamedTuple...)
     sort_nt(merged)
 end
 
+# ── Wrapper Type ─────────────────────────────────────────────────────
+# Defined before accessors since get_params/get_priors dispatch on it
 
 """
-This function takes in a namedtuple of prior dists, and an array of vars that will be replaces by a Mv Dist `dist`
+    Wrapper <: Experiment
+
+Wraps an experiment with parameter name aliases. The forward model and plot functions
+automatically translate between aliased and original parameter names.
 """
-function correlated_priors_vars(priors::NamedTuple, vars::Union{AbstractArray, Tuple}, dist::Distribution)
-    named_shapes = NamedTuple(var => ValueShapes.ScalarShape{Real}() for var in vars)
-    corr_prior = Returns(ValueShapes.ReshapedDist(dist, ValueShapes.NamedTupleShape(named_shapes)))
-    keys_to_keep = Tuple(k for k in keys(priors) if k ∉ vars)
-    other_prior =  distprod(;NamedTuple{keys_to_keep}(priors)...)
-    return corr_prior, other_prior
-    # the line below crashes the kernel :/ but if done outside the function it's happy
-    #return BAT.distbind(corr_prior, other_prior, merge)
-end
-
-
 struct Wrapper <: Newtrinos.Experiment
     x::Newtrinos.Experiment
     aliases::Dict{Symbol, Symbol}  # actual -> alias
-    translated_keys::Vector{Symbol} # translated field names
+    translated_keys::Vector{Symbol}
     reverse_lookup::Dict{Symbol, Symbol} # alias -> actual
 end
 
-function Wrapper(x::Newtrinos.Experiment, aliases::Dict{Symbol, Symbol})
-    original_keys = keys(get_params(x))
-    translated_keys = [get(aliases, k, k) for k in original_keys]
-    reverse_lookup = Dict(value => key for (key, value) in aliases)
-    return Wrapper(x, aliases, translated_keys, reverse_lookup)
-end
-
 function Base.getproperty(wrapper::Wrapper, name::Symbol)
-    if name ∈ (:x, :original_keys, :translated_keys, :reverse_lookup)
+    if name ∈ (:x, :aliases, :translated_keys, :reverse_lookup)
         return getfield(wrapper, name)
     end
     if name == :forward_model
@@ -389,33 +108,24 @@ function Base.getproperty(wrapper::Wrapper, name::Symbol)
     return getfield(wrapper.x, name)
 end
 
-function get_priors(w::Newtrinos.Wrapper)
-    NamedTuple{Tuple(w.translated_keys)}(values(get_priors(w.x)))
-end
+# ── Parameter & Prior Accessors ─────────────────────────────────────
 
-function get_priors(x::Newtrinos.Experiment)
-    safe_merge(x.priors, get_priors(x.physics))
-end
+"""
+    get_params(x)
 
-function get_priors(x::Newtrinos.Physics)
-    sort_nt(x.priors)
-end
-
-function get_params(w::Newtrinos.Wrapper)
-    NamedTuple{Tuple(w.translated_keys)}(values(get_params(w.x)))
+Extract nominal parameter values as a sorted NamedTuple. Works on Physics, Experiment,
+Wrapper, or a NamedTuple of modules (merging all with conflict checking).
+"""
+function get_params(x::Newtrinos.Physics)
+    sort_nt(x.params)
 end
 
 function get_params(x::Newtrinos.Experiment)
     safe_merge(x.params, get_params(x.physics))
 end
 
-function get_params(x::Newtrinos.Physics)
-    sort_nt(x.params)
-end
-
-function get_priors(modules::NamedTuple)
-    all_priors = [get_priors(m) for m in modules]
-    safe_merge(all_priors...)
+function get_params(w::Newtrinos.Wrapper)
+    NamedTuple{Tuple(w.translated_keys)}(values(get_params(w.x)))
 end
 
 function get_params(modules::NamedTuple)
@@ -423,20 +133,35 @@ function get_params(modules::NamedTuple)
     safe_merge(all_params...)
 end
 
-function get_observed(experiments::NamedTuple)
-    NamedTuple{keys(experiments)}(e.assets.observed for e in experiments)
+"""
+    get_priors(x)
+
+Extract prior distributions as a sorted NamedTuple. Works on Physics, Experiment,
+Wrapper, or a NamedTuple of modules (merging all with conflict checking).
+"""
+function get_priors(x::Newtrinos.Physics)
+    sort_nt(x.priors)
 end
 
-function get_fwd_model(experiments::NamedTuple)
-    fwd_models = NamedTuple{keys(experiments)}(e.forward_model for e in experiments)
-    distprod ∘ ffanout(fwd_models)
+function get_priors(x::Newtrinos.Experiment)
+    safe_merge(x.priors, get_priors(x.physics))
 end
 
-function generate_likelihood(experiments::NamedTuple, observed=get_observed(experiments))
-    likelihoodof(get_fwd_model(experiments), observed)
+function get_priors(w::Newtrinos.Wrapper)
+    NamedTuple{Tuple(w.translated_keys)}(values(get_priors(w.x)))
 end
 
+function get_priors(modules::NamedTuple)
+    all_priors = [get_priors(m) for m in modules]
+    safe_merge(all_priors...)
+end
 
+"""
+    condition(priors, conditional_vars, params)
+
+Fix parameters to specific values by replacing their priors with constants.
+`conditional_vars` can be an Array of symbols (uses values from `params`) or a Dict mapping symbols to values.
+"""
 function condition(priors::NamedTuple, conditional_vars::AbstractArray, p)
     for var in conditional_vars
         @reset priors[var] = p[var]
@@ -455,36 +180,80 @@ function condition(priors::NamedTuple, conditional_vars::AbstractDict, p)
     priors
 end
 
+# Wrapper constructor (needs get_params defined above)
+function Wrapper(x::Newtrinos.Experiment, aliases::Dict{Symbol, Symbol})
+    original_keys = keys(get_params(x))
+    translated_keys = [get(aliases, k, k) for k in original_keys]
+    reverse_lookup = Dict(value => key for (key, value) in aliases)
+    return Wrapper(x, aliases, translated_keys, reverse_lookup)
+end
+
+# ── Experiment Utilities ────────────────────────────────────────────
+
+function get_observed(experiments::NamedTuple)
+    NamedTuple{keys(experiments)}(e.assets.observed for e in experiments)
+end
+
+function get_fwd_model(experiments::NamedTuple)
+    fwd_models = NamedTuple{keys(experiments)}(e.forward_model for e in experiments)
+    distprod ∘ ffanout(fwd_models)
+end
+
+"""
+    generate_likelihood(experiments[, observed])
+
+Construct a joint likelihood from a NamedTuple of configured experiments.
+Combines all forward models and observed data into a single likelihood object
+compatible with `DensityInterface.logdensityof`.
+"""
+function generate_likelihood(experiments::NamedTuple, observed=get_observed(experiments))
+    likelihoodof(get_fwd_model(experiments), observed)
+end
+
+"""
+    correlated_priors_vars(priors, vars, dist)
+
+Replace independent priors for `vars` with a correlated multivariate distribution `dist`.
+"""
+function correlated_priors_vars(priors::NamedTuple, vars::Union{AbstractArray, Tuple}, dist::Distribution)
+    named_shapes = NamedTuple(var => ValueShapes.ScalarShape{Real}() for var in vars)
+    corr_prior = Returns(ValueShapes.ReshapedDist(dist, ValueShapes.NamedTupleShape(named_shapes)))
+    keys_to_keep = Tuple(k for k in keys(priors) if k ∉ vars)
+    other_prior = distprod(;NamedTuple{keys_to_keep}(priors)...)
+    return corr_prior, other_prior
+end
+
+"""
+    generate_toy_data(experiment, params)
+    generate_toy_data(experiments::NamedTuple, params)
+
+Generate random toy data by sampling from the forward model distribution.
+"""
 function generate_toy_data(experiment::Newtrinos.Experiment, params::NamedTuple)
-    
-    model = experiment.forward_model
-    dist_obj = model(params)
-    toy_data = rand(dist_obj)
-
-    return toy_data       
-    
+    dist_obj = experiment.forward_model(params)
+    rand(dist_obj)
 end
 
-function generate_toy_data(experiments::NamedTuple, params::NamedTuple )
-    
-    final_data = map(experiments) do experiment
-    
-        model = experiment.forward_model
-        dist_obj = model(params)
-        toy_data = rand(dist_obj)
-
+function generate_toy_data(experiments::NamedTuple, params::NamedTuple)
+    map(experiments) do experiment
+        dist_obj = experiment.forward_model(params)
+        rand(dist_obj)
     end
-    
-    return final_data
-    
 end
 
+"""
+    generate_asimov_data(experiment, params)
+    generate_asimov_data(experiments::NamedTuple, params)
+
+Generate Asimov (expected) data from the forward model at the given parameters.
+Poisson-distributed observables are rounded to integers.
+"""
 function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTuple)
-    
-    model = experiment.forward_model
-    dist_obj = model(params)
+    dist_obj = experiment.forward_model(params)
     asimov_data_flt = mean(dist_obj)
-    check_dist(dist_obj) = (dist_obj isa Distributions.Poisson) | (dist_obj isa Distributions.ProductDistribution && !isempty(dist_obj.dists) && first(dist_obj.dists) isa Distributions.Poisson) | (dist_obj isa Distributions.Product && !isempty(dist_obj.v) && first(dist_obj.v) isa Distributions.Poisson)
+    check_dist(d) = (d isa Distributions.Poisson) |
+        (d isa Distributions.ProductDistribution && !isempty(d.dists) && first(d.dists) isa Distributions.Poisson) |
+        (d isa Distributions.Product && !isempty(d.v) && first(d.v) isa Distributions.Poisson)
 
     if dist_obj isa ValueShapes.NamedTupleDist
         for key in keys(dist_obj)
@@ -497,18 +266,265 @@ function generate_asimov_data(experiment::Newtrinos.Experiment, params::NamedTup
     end
     if check_dist(dist_obj)
         @info "Poisson-based model. Rounding Asimov data to nearest integer."
-        return round.(Int, asimov_data_flt)    
+        return round.(Int, asimov_data_flt)
     end
-    
+
     @info "Not Poisson-based model. Returning std floating-point Asimov data."
-    return asimov_data_flt  
-    
+    return asimov_data_flt
 end
 
 function generate_asimov_data(experiments::NamedTuple, params::NamedTuple)
-    final_data = map(experiments) do experiment
-        generate_asimov_data(experiment, params) 
-    end    
-    return final_data
+    map(experiments) do experiment
+        generate_asimov_data(experiment, params)
+    end
 end
-   
+
+# ── Optimization ────────────────────────────────────────────────────
+
+"""
+    find_mle(likelihood, prior, params; adsel=AutoPolyesterForwardDiff())
+
+Find the Maximum Likelihood Estimator using LBFGS optimization via BAT.
+Returns `(llh, log_posterior, optimized_params)`. Parameters with `ConstValueDist`
+priors are held fixed.
+"""
+function find_mle(likelihood, prior, params; adsel = AutoPolyesterForwardDiff())
+    try
+        set_batcontext(ad = adsel)
+        posterior = PosteriorMeasure(likelihood, prior)
+
+        msg = "Running Optimization for point "
+        for key in keys(prior)
+            if prior[key] isa ValueShapes.ConstValueDist
+                value = prior[key].value
+                @reset params[key] = value
+                msg *= " $(key): $(value)"
+            end
+        end
+
+        @info msg
+        res = bat_findmode(posterior, OptimizationAlg(optalg=Optimization.LBFGS(), init = ExplicitInit([params]), kwargs = (reltol=1e-7, maxiters=1000)))
+
+        return logdensityof(likelihood, res.result), logdensityof(posterior, res.result), res.result
+    catch e
+        if e isa ArgumentError
+            return NaN, NaN, (; (k => NaN for k in keys(params))... )
+        else
+            rethrow(e)
+        end
+    end
+end
+
+"""
+    find_mle_cached(likelihood, prior, params, cache_dir)
+
+Like [`find_mle`](@ref) but caches results to `cache_dir` using content hashing.
+Subsequent calls with the same prior and params skip the optimization.
+"""
+function find_mle_cached(likelihood, prior, params, cache_dir)
+    opt_result = nothing
+
+    h = ContentHashes.hash([prior, params])
+
+    if !isnothing(cache_dir)
+        fname = joinpath(cache_dir, "$h.jld2")
+        if isfile(fname)
+            @info "using cached file $fname"
+            cached = FileIO.load(fname)
+            opt_result = (cached["llh"], cached["log_posterior"], cached["result"])
+        end
+    end
+
+    if isnothing(opt_result)
+        opt_result = find_mle(likelihood, prior, params)
+    end
+
+    if !isnothing(cache_dir)
+        fname = joinpath(cache_dir, "$h.jld2")
+        FileIO.save(fname, OrderedDict("llh"=>opt_result[1], "log_posterior"=>opt_result[2], "result"=>opt_result[3]))
+    end
+
+    opt_result
+end
+
+# ── Scanning & Profiling ────────────────────────────────────────────
+
+function _generate_grid(vars_to_scan, priors)
+    vars = collect(keys(vars_to_scan))
+    values = [quantile(priors[var], collect(range(0,1,vars_to_scan[var]))) for var in vars]
+    mesh = collect(IterTools.product(values...))
+    vars, values, mesh
+end
+
+"""
+    generate_scanpoints(vars_to_scan, priors)
+
+Create a grid of prior distributions for scanning. `vars_to_scan` is an OrderedDict
+mapping parameter symbols to grid sizes. Grid points are placed at quantiles of the priors.
+Returns `(values, scanpoints)`.
+"""
+function generate_scanpoints(vars_to_scan, priors)
+    vars, values, mesh = _generate_grid(vars_to_scan, priors)
+    scanpoints = Array{Any}(undef, size(mesh))
+
+    function make_prior(vals)
+        p = deepcopy(priors)
+        for i in 1:length(vars)
+            @reset p[vars[i]] = vals[i]
+        end
+        distprod(;p...)
+    end
+
+    for i in eachindex(mesh)
+        scanpoints[i] = make_prior(mesh[i])
+    end
+
+    values, scanpoints
+end
+
+"""Assemble optimization results into a NamedTuple of arrays."""
+function assemble_profile_results(opt_results, result_size)
+    results = Array{Any}(undef, result_size)
+    llhs = Array{Float64}(undef, result_size)
+    log_posteriors = Array{Float64}(undef, result_size)
+    for (i, opt_result) in enumerate(opt_results)
+        llhs[i] = opt_result[1]
+        log_posteriors[i] = opt_result[2]
+        results[i] = opt_result[3]
+    end
+    s = OrderedDict(key=>[x[key] for x in results] for key in keys(first(results)))
+    s[:llh] = llhs
+    s[:log_posterior] = log_posteriors
+    NamedTuple(s)
+end
+
+function _profile(likelihood, scanpoints, params, cache_dir; map_func=nothing)
+    do_work(i) = find_mle_cached(likelihood, scanpoints[i], deepcopy(params), cache_dir)
+
+    if isnothing(map_func)
+        # Default: threaded execution
+        opt_results = Array{Any}(undef, size(scanpoints))
+        @showprogress Threads.@threads for i in eachindex(scanpoints)
+            opt_results[i] = do_work(i)
+        end
+    else
+        # Custom map (e.g., pmap for distributed)
+        work = collect(eachindex(scanpoints))
+        opt_results_flat = map_func(do_work, work)
+        opt_results = reshape(opt_results_flat, size(scanpoints))
+    end
+    assemble_profile_results(opt_results, size(scanpoints))
+end
+
+"""
+    profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, map_func=nothing)
+
+Run a profile likelihood scan. At each grid point defined by `vars_to_scan`,
+optimizes over all other parameters. Use `cache_dir` to cache and resume results.
+Use `map_func=pmap` for distributed parallelism (default: `Threads.@threads`).
+"""
+function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, map_func=nothing)
+    t1 = time()
+    # check if there is actually any variable to be profiled over, or if they are all just Numbers
+    if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
+        return scan(likelihood, priors, vars_to_scan, params)
+    end
+
+    values, scanpoints = generate_scanpoints(vars_to_scan, priors)
+    if !isnothing(cache_dir)
+        if isdir(cache_dir)
+            @info "Reusing cache dir `$(cache_dir)`"
+        else
+            mkdir(cache_dir)
+        end
+    end
+    res = _profile(likelihood, scanpoints, params, cache_dir; map_func=map_func)
+    t2 = time()
+    meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
+    add_meta!(meta)
+    axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
+    result = NewtrinosResult(axes=axes, values=res, meta=meta)
+end
+
+"""
+    scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
+
+Run a simple likelihood scan on a grid (no optimization over nuisance parameters).
+Faster than [`profile`](@ref) but does not account for nuisance parameter variations.
+Set `gradient_map=true` to also compute gradients at each point.
+"""
+function scan(likelihood, priors, vars_to_scan, params; gradient_map=false)
+    t1 = time()
+    vars, values, mesh = _generate_grid(vars_to_scan, priors)
+    scanpoints = Array{Any}(undef, size(mesh))
+
+    function make_params(vals)
+        p = deepcopy(params)
+        for i in 1:length(vars)
+            @reset p[vars[i]] = vals[i]
+        end
+        return p
+    end
+
+    for i in eachindex(mesh)
+        scanpoints[i] = make_params(mesh[i])
+    end
+
+    llhs = Array{Float64}(undef, size(scanpoints))
+    if gradient_map
+        grads = Array{Any}(undef, size(scanpoints))
+    end
+
+    @showprogress Threads.@threads for i in eachindex(scanpoints)
+        p = scanpoints[i]
+        llhs[i] = logdensityof(likelihood, p)
+        if gradient_map
+            grads[i] = ForwardDiff.gradient(x -> logdensityof(likelihood, x), p)
+        end
+    end
+
+    s = OrderedDict{Symbol, Array}(key=>Fill(params[key], size(mesh)) for key in setdiff(keys(params), keys(vars_to_scan)))
+    if gradient_map
+        g = OrderedDict(Symbol(key, "_grad")=>[x[key] for x in grads] for key in keys(first(grads)))
+        s = merge(s, g)
+    end
+    s[:llh] = llhs
+    s[:log_posterior] = llhs
+    res = NamedTuple(s)
+    t2 = time()
+    meta = Dict("task"=>"scan", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "exec_time"=>t2-t1,)
+    add_meta!(meta)
+    axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
+    result = NewtrinosResult(axes=axes, values=res, meta=meta)
+end
+
+# ── Results ─────────────────────────────────────────────────────────
+
+"""
+    bestfit(result::NewtrinosResult)
+
+Extract the best-fit parameter values from a scan/profile result (maximum log_posterior point).
+"""
+function bestfit(result::NewtrinosResult)
+    idx = argmax(result.values.log_posterior)
+    bf = OrderedDict(var=>result.values[var][idx] for var in keys(result.values))
+    for i in 1:length(result.axes)
+        bf[keys(result.axes)[i]] = result.axes[i][idx[i]]
+    end
+    NamedTuple(bf)
+end
+
+"""
+    add_meta!(meta::Dict)
+
+Populate a metadata dictionary with hostname, username, date, git repo path, commit hash, and repo cleanliness.
+"""
+function add_meta!(meta)
+    meta["hostname"] = gethostname()
+    meta["username"] = get(ENV, "USER", get(ENV, "USERNAME", "unknown"))
+    meta["date"] = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+    repo = dirname(dirname(pathof(Newtrinos)))
+    meta["repo"] = repo
+    meta["commit_hash"] = LibGit2.head(repo)
+    meta["repo_clean"] = !LibGit2.isdirty(LibGit2.GitRepo(repo))
+end
