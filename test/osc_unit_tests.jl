@@ -227,8 +227,65 @@ using StaticArrays
         #TEST matter_osc_per_e() 
         #take H_eff, e, layer from above -> can take above matter matrices
         #take path from above 
+        #TEST matter_osc_per_e() 
+        # reuse H_eff = [1.0 0.2 0.1; ...], e = 1.5 from above
+        layer2 = Newtrinos.osc.Layer(3480.0, 4.0, 3.0)
+        layers_test = [layer, layer2]   # layer already defined above
+        σ_decoh = Newtrinos.osc.Decoherent().σₑ
 
-        #@test Newtrinos.osc.matter_osc_per_e(H_eff, e, layer, path, false, Newtrinos.osc.SI()) 
+        # one single-layer path and one two-layer path
+        paths_test = [
+            [Newtrinos.osc.Path(5.0, 1)],
+            [Newtrinos.osc.Path(5.0, 1), Newtrinos.osc.Path(10.0, 2)]
+        ]
+
+        #test basic/damping propagation
+        mat = Newtrinos.osc.compute_matter_matrices.(Ref(H_eff), e, layers_test, false, Ref(Newtrinos.osc.SI()))
+        osc1 = Newtrinos.osc.osc_reduce(mat, paths_test[1], e, Newtrinos.osc.Damping())
+        osc2 = Newtrinos.osc.osc_reduce(mat, paths_test[2], e, Newtrinos.osc.Damping())
+        p = stack((osc1, osc2))
+        expected = Newtrinos.osc.matter_osc_per_e(H_eff, e, layers_test, paths_test, false, Newtrinos.osc.Damping(), Newtrinos.osc.SI())
+        @test size(Newtrinos.osc.matter_osc_per_e(H_eff, e, layers_test, paths_test, false, Newtrinos.osc.Damping(), Newtrinos.osc.SI())) == (3,3, length(paths_test)) #two paths, 3x3 probability matrices
+        @test p == expected 
+
+        #test decoherent propagation
+        U1, h1 = Newtrinos.osc.compute_matter_matrices(H_eff, e, layer,  false, Newtrinos.osc.SI())
+        U2, h2 = Newtrinos.osc.compute_matter_matrices(H_eff, e, layer2, false, Newtrinos.osc.SI())
+        matter_U = [U1, U2]; matter_h = [h1, h2]
+
+        function manual_decoherent(path_segs)
+            P = zeros(3, 3)
+            for α in 1:3
+                eα = [i==α ? 1.0 : 0.0 for i in 1:3]
+                ρ = eα * eα'
+                for seg in path_segs
+                    U, h = matter_U[seg.layer_idx], matter_h[seg.layer_idx]
+                    l = seg.length
+                    ρ_eig = U' * ρ * U
+                    phases = exp.(-Newtrinos.osc.F_units * 1im * (l/e) .* h)
+                    ρ_eig = Diagonal(phases) * ρ_eig * Diagonal(phases)'
+                    Δφ = abs.(h .- h') * (l/e) * Newtrinos.osc.F_units
+                    D = exp.(-2 .* Δφ .* σ_decoh^2)
+                    ρ_eig .= ρ_eig .* D
+                    ρ = U * ρ_eig * U'
+                end
+                for β in 1:3
+                    eβ = [i==β ? 1.0 : 0.0 for i in 1:3]
+                    P[β, α] = real(eβ' * ρ * eβ)
+                end
+            end
+            P
+        end
+
+        P_expected_path1 = manual_decoherent(paths_test[1])
+        P_expected_path2 = manual_decoherent(paths_test[2])
+
+        result_Decoherent = Newtrinos.osc.matter_osc_per_e(H_eff, e, layers_test, paths_test, false, Newtrinos.osc.Decoherent(), Newtrinos.osc.SI())
+
+        @test size(result_Decoherent) == (3, 3, 2)
+        @test all(result_Decoherent .>= 0) && all(result_Decoherent .<= 1)
+        @test result_Decoherent[:, :, 1] ≈ P_expected_path1 atol=1e-6
+        @test result_Decoherent[:, :, 2] ≈ P_expected_path2 atol=1e-6
 
         #=@@test select() #two variants
         @test propagate() #five variants
