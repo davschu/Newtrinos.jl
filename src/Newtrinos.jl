@@ -1,7 +1,24 @@
+"""
+    Newtrinos
+
+A Julia package for global analysis of neutrino data. Provides modular physics models,
+experimental likelihoods, and inference tools (profile likelihood, Bayesian sampling).
+"""
 module Newtrinos
 
+"""
+    Physics
 
+Abstract type for physics modules. Subtypes must have `params::NamedTuple` and `priors::NamedTuple` fields.
+"""
 abstract type Physics end
+
+"""
+    Experiment
+
+Abstract type for experiment modules. Subtypes must have `physics`, `params`, `priors`, `assets`,
+`forward_model`, and `plot` fields.
+"""
 abstract type Experiment end
 
 export Physics, Experiment
