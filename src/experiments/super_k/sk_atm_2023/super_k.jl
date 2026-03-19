@@ -257,20 +257,20 @@ function get_assets(physics; datadir = @__DIR__)
 
     R_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid, cz_grid) for key in keys(MC))
     R = flatten_R(R_3d)
-    nominal_weights = calc_weights(merge(params_nominal, (sk_energy_scale=1.0,)), (;R, flux_nominal, paths, layers, loge_grid), physics)
+    nominal_weights = calc_weights(params_nominal, (;R, flux_nominal, paths, layers, loge_grid), physics)
 
     R_plus_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(1.02), cz_grid) for key in keys(MC))
     R_minus_3d = NamedTuple(key => make_response_matrix(MC[key], loge_grid .+ log(0.98), cz_grid) for key in keys(MC))
-    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
-    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_plus = calc_weights(params_nominal, (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(params_nominal, (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
     Fij = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
     for key in keys(R_3d)
         R_plus_3d[key][:,:,1:50] .= R_3d[key][:,:,1:50]
         R_minus_3d[key][:,:,1:50] .= R_3d[key][:,:,1:50]
     end
-    weights_plus = calc_weights(merge(params_nominal, (sk_energy_scale=1.025,)), (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
-    weights_minus = calc_weights(merge(params_nominal, (sk_energy_scale=0.975,)), (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_plus = calc_weights(params_nominal, (;R=flatten_R(R_plus_3d), flux_nominal, paths, layers, loge_grid), physics)
+    weights_minus = calc_weights(params_nominal, (;R=flatten_R(R_minus_3d), flux_nominal, paths, layers, loge_grid), physics)
     Fij_updown = NamedTuple(key => safe_div.((weights_plus[key] .- weights_minus[key]), (2*0.02 .* nominal_weights[key])) for key in keys(nominal_weights))
 
     return (; MC, R, Fij, Fij_updown, flux_nominal, paths, layers, loge_grid, cz_grid, nominal_weights, observed, bininfo, masks)
