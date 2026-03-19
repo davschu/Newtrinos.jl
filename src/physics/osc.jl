@@ -16,7 +16,7 @@ export All, Cut
 export Vacuum, SI, NSI
 export ThreeFlavour, ThreeFlavourXYCP, Sterile, ADD
 export OscillationConfig
-export EigenMethod, DefaultEigen
+export EigenMethod, DefaultEigen, decompose
 export configure
 
 const ftype = Float64
