@@ -287,8 +287,15 @@ using StaticArrays
         @test result_Decoherent[:, :, 1] ≈ P_expected_path1 atol=1e-6
         @test result_Decoherent[:, :, 2] ≈ P_expected_path2 atol=1e-6
 
-        #=@@test select() #two variants
-        @test propagate() #five variants
+        
+        #TEST select()
+        @test Newtrinos.osc.select(U1, h1, Newtrinos.osc.All()) == Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut()) #same with out cut-off-value 
+        @test size(Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut(cutoff=0.5))[3]) == (3,3)
+        @test Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut(cutoff=0.5)) != Newtrinos.osc.select(U1, h1, Newtrinos.osc.All()) 
+        @test Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut(cutoff=0.5)) != Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut(cutoff=1)) #difference in cutoff
+        
+        
+        #=@test propagate() #five variants
         @test get_osc_prob() 
         @test osc_prob() #two variants=#
     end 
