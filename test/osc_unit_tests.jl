@@ -569,9 +569,214 @@ using StaticArrays
     end
 
 
-
     @testset "get matrices" begin
-        #test get_matrices for different model configurations
-        #@test get_matrices() 
+        # --- Shared parameter definitions ---
+        angles = (θ₁₂ = 0.58725, θ₁₃ = 0.14543, θ₂₃ = 0.85563)
+        NO_masses = (Δm²₂₁ = 7.53e-5, Δm²₃₁ = 2.4e-3 + 7.53e-5)
+        IO_masses = (Δm²₂₁ = 7.53e-5, Δm²₃₁ = -(2.4e-3 - 7.53e-5))
+        δCP_val = (δCP = 1.0,)
+
+        ThreeFlavour_Params_NO = merge(angles, NO_masses, δCP_val)
+        ThreeFlavour_Params_IO = merge(angles, IO_masses, δCP_val)
+        ThreeFlavourXYCP_Params = merge(angles, NO_masses, (δCPshell = [1.0, 0.0],))
+        Sterile_Params = merge(ThreeFlavour_Params_NO, (Δm²₄₁ = 1.0, θ₁₄ = 0.1, θ₂₄ = 0.1, θ₃₄ = 0.1))
+        ADD_Params = merge(ThreeFlavour_Params_NO, (m₀ = 0.01, ADD_radius = 1e-2))
+
+        # Independent PMNS construction (standard parametrization)
+        function reference_PMNS(θ₁₂, θ₁₃, θ₂₃, δCP)
+            s12, c12 = sin(θ₁₂), cos(θ₁₂)
+            s13, c13 = sin(θ₁₃), cos(θ₁₃)
+            s23, c23 = sin(θ₂₃), cos(θ₂₃)
+            cp = cis(δCP)
+            cp_conj = conj(cp)
+            [
+                c13*c12                     c13*s12                     s13*cp_conj
+                -c23*s12-s23*c12*s13*cp     c23*c12-s23*s12*s13*cp      s23*c13
+                s23*s12-c23*s13*c12*cp      -s23*c12-s12*s13*c23*cp     c23*c13
+            ]
+        end
+
+        #test for ThreeFlavour model
+        @testset "ThreeFlavour" begin
+            for (label, cfg, params) in [
+                ("NO", Newtrinos.osc.ThreeFlavour(ordering=:NO), ThreeFlavour_Params_NO),
+                ("IO", Newtrinos.osc.ThreeFlavour(ordering=:IO), ThreeFlavour_Params_IO),
+            ]
+                @testset "$label" begin
+                    matrices_fn = Newtrinos.osc.get_matrices(cfg)
+                    U, h = matrices_fn(params)
+
+                    # Shape and type
+                    @test U isa SMatrix{3,3}
+                    @test h isa SVector{3}
+                    @test size(U) == (3, 3)
+                    @test length(h) == 3
+
+                    # h values
+                    @test h[1] == 0.0
+                    @test h[2] ≈ params.Δm²₂₁ atol=1e-12
+                    @test h[3] ≈ params.Δm²₃₁ atol=1e-12
+
+                    # U against independent reference
+                    U_ref = reference_PMNS(params.θ₁₂, params.θ₁₃, params.θ₂₃, params.δCP)
+                    @test collect(U) ≈ U_ref atol=1e-10
+
+                    # Unitarity
+                    @test collect(U' * U) ≈ I(3) atol=1e-10
+                    @test collect(U * U') ≈ I(3) atol=1e-10
+                end
+            end
+        end
+
+        #test for ThreeFlavourXYCP model (should match ThreeFlavour with δCP from shell)
+        @testset "ThreeFlavourXYCP" begin
+            cfg = Newtrinos.osc.ThreeFlavourXYCP()
+            matrices_fn = Newtrinos.osc.get_matrices(cfg)
+            U, h = matrices_fn(ThreeFlavourXYCP_Params)
+
+            # Shape and type
+            @test U isa SMatrix{3,3}
+            @test h isa SVector{3}
+            @test size(U) == (3, 3)
+            @test length(h) == 3
+
+            # h values
+            @test h[1] == 0.0
+            @test h[2] ≈ ThreeFlavourXYCP_Params.Δm²₂₁ atol=1e-12
+            @test h[3] ≈ ThreeFlavourXYCP_Params.Δm²₃₁ atol=1e-12
+
+            # U against independent reference (δCP extracted from shell)
+            δCP_extracted = ThreeFlavourXYCP_Params.δCPshell[1]
+            U_ref = reference_PMNS(
+                ThreeFlavourXYCP_Params.θ₁₂, ThreeFlavourXYCP_Params.θ₁₃,
+                ThreeFlavourXYCP_Params.θ₂₃, δCP_extracted,
+            )
+            @test collect(U) ≈ U_ref atol=1e-10
+
+            # Unitarity
+            @test collect(U' * U) ≈ I(3) atol=1e-10
+
+            # Consistency with ThreeFlavour using same δCP
+            cfg_3f = Newtrinos.osc.ThreeFlavour()
+            equiv_params = (
+                θ₁₂=ThreeFlavourXYCP_Params.θ₁₂,
+                θ₁₃=ThreeFlavourXYCP_Params.θ₁₃,
+                θ₂₃=ThreeFlavourXYCP_Params.θ₂₃,
+                δCP=δCP_extracted,
+                Δm²₂₁=ThreeFlavourXYCP_Params.Δm²₂₁,
+                Δm²₃₁=ThreeFlavourXYCP_Params.Δm²₃₁,
+            )
+            U_3f, h_3f = Newtrinos.osc.get_matrices(cfg_3f)(equiv_params)
+            @test collect(U) ≈ collect(U_3f) atol=1e-12
+            @test collect(h) ≈ collect(h_3f) atol=1e-12
+        end
+
+        #test for Sterile model
+        @testset "Sterile" begin
+            cfg = Newtrinos.osc.Sterile()
+            matrices_fn = Newtrinos.osc.get_matrices(cfg)
+            U, h = matrices_fn(Sterile_Params)
+
+            # Shape and size
+            @test size(U) == (4, 4)
+            @test length(h) == 4
+
+            # h values
+            @test h[1] == 0.0
+            @test h[2] ≈ Sterile_Params.Δm²₂₁ atol=1e-12
+            @test h[3] ≈ Sterile_Params.Δm²₃₁ atol=1e-12
+            @test h[4] ≈ Sterile_Params.Δm²₄₁ atol=1e-12
+
+            # Independent reference: build 4x4 mixing matrix from scratch
+            PMNS_3x3 = reference_PMNS(
+                Sterile_Params.θ₁₂, Sterile_Params.θ₁₃,
+                Sterile_Params.θ₂₃, Sterile_Params.δCP,
+            )
+            U_embedded = hcat(vcat(PMNS_3x3, [0 0 0]), [0; 0; 0; 1])
+
+            θ₁₄, θ₂₄, θ₃₄ = Sterile_Params.θ₁₄, Sterile_Params.θ₂₄, Sterile_Params.θ₃₄
+            R14 = [cos(θ₁₄) 0 0 sin(θ₁₄); 0 1 0 0; 0 0 1 0; -sin(θ₁₄) 0 0 cos(θ₁₄)]
+            R24 = [1 0 0 0; 0 cos(θ₂₄) 0 sin(θ₂₄); 0 0 1 0; 0 -sin(θ₂₄) 0 cos(θ₂₄)]
+            R34 = [1 0 0 0; 0 1 0 0; 0 0 cos(θ₃₄) sin(θ₃₄); 0 0 -sin(θ₃₄) cos(θ₃₄)]
+
+            U_ref = R34 * R24 * R14 * U_embedded
+            @test U ≈ U_ref atol=1e-10
+
+            # Unitarity
+            @test U' * U ≈ I(4) atol=1e-10
+            @test U * U' ≈ I(4) atol=1e-10
+
+            # Zero sterile angles recover standard 3-flavour PMNS
+            params_zero_sterile = merge(Sterile_Params, (θ₁₄=0.0, θ₂₄=0.0, θ₃₄=0.0))
+            U_zero, _ = matrices_fn(params_zero_sterile)
+            @test U_zero[1:3, 1:3] ≈ PMNS_3x3 atol=1e-10
+            @test U_zero[4, 4] ≈ 1.0 atol=1e-10
+            @test U_zero[4, 1:3] ≈ [0.0, 0.0, 0.0] atol=1e-10
+            @test U_zero[1:3, 4] ≈ [0.0, 0.0, 0.0] atol=1e-10
+        end
+
+        #test for ADD model
+        @testset "ADD" begin
+            N_KK = 5
+            dim = 3 * (N_KK + 1)  # = 18
+            cfg = Newtrinos.osc.ADD()
+            matrices_fn = Newtrinos.osc.get_matrices(cfg)
+            U, h = matrices_fn(ADD_Params)
+
+            # Shape and size
+            @test size(U) == (dim, dim)
+            @test length(h) == dim
+
+            # Eigenvalues sorted and non-negative (from Hermitian M†M)
+            @test issorted(h)
+            @test all(h .>= -1e-10)
+
+            # Unitarity
+            @test U' * U ≈ I(dim) atol=1e-8
+            @test U * U' ≈ I(dim) atol=1e-8
+
+            # Independent reference calculation
+            umev = 5.067730716156395
+            PMNS = reference_PMNS(
+                ADD_Params.θ₁₂, ADD_Params.θ₁₃,
+                ADD_Params.θ₂₃, ADD_Params.δCP,
+            )
+            m1 = ADD_Params.m₀
+            m2 = sqrt(ADD_Params.Δm²₂₁ + ADD_Params.m₀^2)
+            m3 = sqrt(ADD_Params.Δm²₃₁ + ADD_Params.m₀^2)
+
+            MD = PMNS * Diagonal([m1, m2, m3]) * adjoint(PMNS)
+
+            aM1 = zeros(ComplexF64, dim, dim)
+            aM2 = zeros(Float64, dim, dim)
+
+            for i in 1:3, j in 1:3
+                aM1[i, j] = ADD_Params.ADD_radius * MD[i, j] * umev
+            end
+            for n in 1:N_KK, i in 1:3, j in 1:3
+                aM1[3*n + i, j] = sqrt(2) * ADD_Params.ADD_radius * MD[i, j] * umev
+            end
+            for i in 1:N_KK
+                aM2[3*i + 1, 3*i + 1] = i
+                aM2[3*i + 2, 3*i + 2] = i
+                aM2[3*i + 3, 3*i + 3] = i
+            end
+
+            aM = aM1 + aM2
+            aaMM = Hermitian(conj(transpose(aM)) * aM)
+            h_ref, U_ref = eigen(aaMM)
+            h_ref = h_ref / (ADD_Params.ADD_radius^2 * umev^2)
+
+            @test h ≈ h_ref atol=1e-8
+            # Eigenvectors defined up to phase — compare absolute values
+            @test abs.(U) ≈ abs.(U_ref) atol=1e-5
+
+            # Different N_KK produces correct dimensions
+            cfg_3 = Newtrinos.osc.ADD(N_KK=3)
+            dim_3 = 3 * (3 + 1)  # = 12
+            U_3, h_3 = Newtrinos.osc.get_matrices(cfg_3)(ADD_Params)
+            @test size(U_3) == (dim_3, dim_3)
+            @test length(h_3) == dim_3
+        end
     end
 end
