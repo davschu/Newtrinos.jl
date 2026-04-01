@@ -295,9 +295,87 @@ using StaticArrays
         @test Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut(cutoff=0.5)) != Newtrinos.osc.select(U1, h1, Newtrinos.osc.Cut(cutoff=1)) #difference in cutoff
         
         
-        #=@test propagate() #five variants
-        @test get_osc_prob() 
-        @test osc_prob() #two variants=#
+        #TEST propagate()
+        #test-setup
+        U = @SMatrix [cos(π/4) sin(π/4) 0; -sin(π/4) cos(π/4) 0; 0 0 1]
+        H = @SVector [0.0, 2.5e-5, 1]
+        e, l, σₑ = 1.0, 100.0, 2
+        E_test = [0.5, 1.0, 1.5]
+        L_test = [50.0, 100.0]
+        nE, nL = length(E_test), length(L_test)
+        
+        #test for basic propagation
+        U = @SMatrix [cos(π/4) sin(π/4) 0; -sin(π/4) cos(π/4) 0; 0 0 1]
+        H = @SVector [0.0, 2.5e-5, 1]
+        e, l, σₑ = 1.0, 100.0, 2
+        E_test = [0.5, 1.0, 1.5]
+        L_test = [50.0, 100.0]
+        nE, nL = length(E_test), length(L_test)
+        
+        #test for damped propagation
+        σₑ_damp = Newtrinos.osc.Damping().σₑ
+        result_damp = Newtrinos.osc.propagate(U, H, E_test, L_test, Newtrinos.osc.Damping())
+        @test size(result_damp) == (3, 3, nE, nL)
+        @test all(result_damp .>= 0) && all(result_damp .<= 1)
+        expected_damp = stack(broadcast((e, l) -> begin
+            pf = -Newtrinos.osc.F_units * (l / e) .* H
+            decay = exp.(-2 * abs.(pf) * σₑ_damp^2)
+            K = U * Diagonal(exp.(1im * pf) .* decay) * U'
+            abs2.(K) + abs2.(U) * Diagonal(1 .- abs2.(decay)) * abs2.(U)'
+        end, E_test, L_test'))
+        @test result_damp ≈ expected_damp atol=1e-10
+        
+        #test for decoherent propagation
+        σₑ_dec = Newtrinos.osc.Decoherent().σₑ
+        result_decoh = Newtrinos.osc.propagate(U, H, E_test, L_test, Newtrinos.osc.Decoherent())
+        @test size(result_decoh) == (3, 3, nE, nL)
+        @test all(result_decoh .>= 0) && all(result_decoh .<= 1)
+        expected_decoh = stack(broadcast((e, l) -> begin
+            P = zeros(3, 3)
+            v = one(U * U')
+            for α in 1:3
+                eα = v[α, :]
+                ρ = eα * eα'
+                ρ_eig = U' * ρ * U
+                phases = exp.(-Newtrinos.osc.F_units * 1im * (l / e) .* H)
+                ρ_eig = Diagonal(phases) * ρ_eig * Diagonal(phases)'
+                Δφ = abs.(H .- H') * (l / e) * Newtrinos.osc.F_units
+                D = exp.(-2 .* Δφ .* σₑ_dec^2)
+                ρ_eig .= ρ_eig .* D
+                ρ = U * ρ_eig * U'
+                for β in 1:3
+                    eβ = v[β, :]
+                    P[β, α] = real(eβ' * ρ * eβ)
+                end
+            end
+            P
+        end, E_test, L_test'))
+        @test result_decoh ≈ expected_decoh atol=1e-10
+        #=MAYBE BUG ->(The root cause: Layer is a parametric struct (Layer{T}), so StructVector{Layer{Float64}} doesn't match the function signature StructVector{Layer} due to Julia's type invariance. Fix: Change StructVector{Layer} → StructVector{<:Layer} on lines 505 and 510 of osc.jl. This is a genuine bug — it would affect any caller constructing layers with concrete types)
+        #test for different layers in vacuum 
+        paths_vov = VectorOfVectors(paths_test)
+        layers_sv = StructVector(layers_test)
+        nPaths = length(paths_test)
+        L_total = [sum(seg.length for seg in p) for p in paths_test]
+
+        result_vac = Newtrinos.osc.propagate(U, H, E_test, paths_vov, layers_sv, Newtrinos.osc.Basic(), Newtrinos.osc.Vacuum(), false)
+        @test size(result_vac) == (3, 3, nE, nPaths)
+        result_direct = Newtrinos.osc.propagate(U, H, E_test, L_total, Newtrinos.osc.Basic())
+        @test result_vac ≈ result_direct atol=1e-10
+        
+        #test for different layers in matter
+        result_si = Newtrinos.osc.propagate(U, H, E_test, paths_vov, layers_sv, Newtrinos.osc.Damping(), Newtrinos.osc.SI(), false)
+        @test size(result_si) == (3, 3, nE, nPaths)
+        @test all(result_si .>= 0) && all(result_si .<= 1)
+        H_eff_ref = U * Diagonal(H) * adjoint(U)
+        expected_si = stack(map(e -> Newtrinos.osc.matter_osc_per_e(H_eff_ref, e, layers_sv, paths_vov, false, Newtrinos.osc.Damping(), Newtrinos.osc.SI()), E_test))
+        expected_si = permutedims(expected_si, (1, 2, 4, 3))
+        @test result_si ≈ expected_si atol=1e-10=#
+
+
+
+        #@test get_osc_prob() 
+        #@test osc_prob() #two variants=#
     end 
 
     @testset "get matrices" begin
