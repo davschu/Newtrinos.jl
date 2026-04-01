@@ -351,6 +351,7 @@ using StaticArrays
             P
         end, E_test, L_test'))
         @test result_decoh ≈ expected_decoh atol=1e-10
+
         #=MAYBE BUG ->(The root cause: Layer is a parametric struct (Layer{T}), so StructVector{Layer{Float64}} doesn't match the function signature StructVector{Layer} due to Julia's type invariance. Fix: Change StructVector{Layer} → StructVector{<:Layer} on lines 505 and 510 of osc.jl. This is a genuine bug — it would affect any caller constructing layers with concrete types)
         #test for different layers in vacuum 
         paths_vov = VectorOfVectors(paths_test)
@@ -371,12 +372,203 @@ using StaticArrays
         expected_si = stack(map(e -> Newtrinos.osc.matter_osc_per_e(H_eff_ref, e, layers_sv, paths_vov, false, Newtrinos.osc.Damping(), Newtrinos.osc.SI()), E_test))
         expected_si = permutedims(expected_si, (1, 2, 4, 3))
         @test result_si ≈ expected_si atol=1e-10=#
-
-
-
-        #@test get_osc_prob() 
-        #@test osc_prob() #two variants=#
+    
     end 
+
+    @testset "get_osc_prob" begin
+        F = Newtrinos.osc.F_units
+
+        # test Zero Baseline -> Identity 
+        @testset "zero baseline identity" begin
+            cfg = Newtrinos.osc.OscillationConfig()
+            osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+            params = Newtrinos.osc.get_params(cfg)
+
+            E = [1.0, 5.0, 10.0]
+            L = [0.0]
+            result = osc_prob(E, L, params)
+
+            for i_e in 1:length(E)
+                @test result[i_e, 1, :, :] ≈ I(3) atol=1e-12
+            end
+        end
+
+        # test Zero Mixing -> Identity 
+        @testset "zero mixing identity" begin
+            cfg = Newtrinos.osc.OscillationConfig()
+            osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+            params_zero = (θ₁₂=0.0, θ₁₃=0.0, θ₂₃=0.0, δCP=0.0, Δm²₂₁=7.53e-5, Δm²₃₁=2.5e-3)
+
+            E = [1.0, 5.0]
+            L = [100.0, 500.0, 1000.0]
+            result = osc_prob(E, L, params_zero)
+
+            for i_e in 1:length(E), i_l in 1:length(L)
+                @test result[i_e, i_l, :, :] ≈ I(3) atol=1e-12
+            end
+        end
+
+        # test Two-Flavour limit -> standard 2-flavour formula
+        @testset "two-flavour limit" begin
+            cfg = Newtrinos.osc.OscillationConfig()
+            osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+
+            θ12 = 0.6
+            Δm²₂₁ = 7.53e-5
+            params_2f = (θ₁₂=θ12, θ₁₃=0.0, θ₂₃=0.0, δCP=0.0, Δm²₂₁=Δm²₂₁, Δm²₃₁=2.5e-3)
+
+            E = [0.5, 1.0, 3.0]
+            L = [100.0, 500.0, 1500.0]
+            result = osc_prob(E, L, params_2f)
+
+            for (ie, e) in enumerate(E), (il, l) in enumerate(L)
+                Δ21 = F * Δm²₂₁ * l / (2 * e)
+                P_12_expected = sin(2 * θ12)^2 * sin(Δ21)^2
+                # with θ₁₃=θ₂₃=0, flavour 3 decouples completely
+                @test result[ie, il, 1, 2] ≈ P_12_expected atol=1e-10
+                @test result[ie, il, 2, 1] ≈ P_12_expected atol=1e-10
+                @test result[ie, il, 1, 3] ≈ 0.0 atol=1e-12
+                @test result[ie, il, 3, 1] ≈ 0.0 atol=1e-12
+                @test result[ie, il, 3, 2] ≈ 0.0 atol=1e-12
+                @test result[ie, il, 2, 3] ≈ 0.0 atol=1e-12
+            end
+        end
+
+        # test Unitarity 
+        @testset "unitarity" begin
+            cfg = Newtrinos.osc.OscillationConfig()
+            osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+            params = Newtrinos.osc.get_params(cfg)
+
+            E = [0.5, 1.0, 3.0, 10.0]
+            L = [50.0, 295.0, 810.0, 1300.0]
+            result = osc_prob(E, L, params)
+
+            for i_e in 1:length(E), i_l in 1:length(L)
+                P = result[i_e, i_l, :, :]
+                for α in 1:3
+                    @test sum(P[α, :]) ≈ 1.0 atol=1e-10
+                end
+                @test all(P .>= -1e-15)
+            end
+        end
+
+        # test against Independent PMNS Calculation 
+        @testset "independent calculation" begin
+            cfg = Newtrinos.osc.OscillationConfig()
+            osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+
+            params = (θ₁₂=0.5843, θ₁₃=0.1496, θ₂₃=0.8587, δCP=3.59, Δm²₂₁=7.42e-5, Δm²₃₁=2.514e-3)
+            E = [0.4, 1.0, 2.5, 8.0]
+            L = [180.0, 295.0, 810.0]
+
+            result = osc_prob(E, L, params)
+
+            # Build PMNS from scratch (independent of get_PMNS)
+            s12, c12 = sin(params.θ₁₂), cos(params.θ₁₂)
+            s13, c13 = sin(params.θ₁₃), cos(params.θ₁₃)
+            s23, c23 = sin(params.θ₂₃), cos(params.θ₂₃)
+            δ = cis(params.δCP)
+            δc = conj(δ)
+
+            U_manual = [
+                c12*c13                       s12*c13                       s13*δc
+                -s12*c23 - c12*s23*s13*δ      c12*c23 - s12*s23*s13*δ      s23*c13
+                s12*s23 - c12*c23*s13*δ       -c12*s23 - s12*c23*s13*δ     c23*c13
+            ]
+
+            h_raw = [0.0, params.Δm²₂₁, params.Δm²₃₁]
+            h = h_raw .- minimum(h_raw)
+
+            expected = zeros(length(E), length(L), 3, 3)
+            for (ie, e) in enumerate(E), (il, l) in enumerate(L)
+                phases = -F * 1im * (l / e) .* h
+                A = U_manual * Diagonal(exp.(phases)) * U_manual'
+                expected[ie, il, :, :] = abs2.(A)
+            end
+
+            @test result ≈ expected atol=1e-10
+        end
+
+        # test for Anti-Neutrino and CP Violation 
+        @testset "anti-neutrino and CP" begin
+            cfg = Newtrinos.osc.OscillationConfig()
+            osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+
+            params_cp = (θ₁₂=0.5843, θ₁₃=0.1496, θ₂₃=0.8587, δCP=π/2, Δm²₂₁=7.42e-5, Δm²₃₁=2.514e-3)
+            params_nocp = (θ₁₂=0.5843, θ₁₃=0.1496, θ₂₃=0.8587, δCP=0.0, Δm²₂₁=7.42e-5, Δm²₃₁=2.514e-3)
+
+            E = [0.6, 2.5]
+            L = [295.0, 810.0]
+
+            result_nu = osc_prob(E, L, params_cp; anti=false)
+            result_anti = osc_prob(E, L, params_cp; anti=true)
+            result_nu_nocp = osc_prob(E, L, params_nocp; anti=false)
+            result_anti_nocp = osc_prob(E, L, params_nocp; anti=true)
+
+            # δCP=0: neutrino == anti-neutrino
+            @test result_nu_nocp ≈ result_anti_nocp atol=1e-10
+
+            # δCP≠0: disappearance still same (CPT)
+            for ie in 1:length(E), il in 1:length(L), α in 1:3
+                @test result_nu[ie, il, α, α] ≈ result_anti[ie, il, α, α] atol=1e-10
+            end
+
+            # Verify anti-neutrino against independent calc with conj(U)
+            s12, c12 = sin(params_cp.θ₁₂), cos(params_cp.θ₁₂)
+            s13, c13 = sin(params_cp.θ₁₃), cos(params_cp.θ₁₃)
+            s23, c23 = sin(params_cp.θ₂₃), cos(params_cp.θ₂₃)
+            δ = cis(params_cp.δCP)
+            δc = conj(δ)
+
+            U_nu = [
+                c12*c13                       s12*c13                       s13*δc
+                -s12*c23 - c12*s23*s13*δ      c12*c23 - s12*s23*s13*δ      s23*c13
+                s12*s23 - c12*c23*s13*δ       -c12*s23 - s12*c23*s13*δ     c23*c13
+            ]
+            U_anti = conj.(U_nu)
+
+            h = [0.0, params_cp.Δm²₂₁, params_cp.Δm²₃₁]
+            h = h .- minimum(h)
+
+            expected_anti = zeros(length(E), length(L), 3, 3)
+            for (ie, e) in enumerate(E), (il, l) in enumerate(L)
+                phases = -F * 1im * (l / e) .* h
+                A = U_anti * Diagonal(exp.(phases)) * U_anti'
+                expected_anti[ie, il, :, :] = abs2.(A)
+            end
+
+            @test result_anti ≈ expected_anti atol=1e-10
+        end
+
+        # test for Different Propagation Models
+        @testset "propagation models" begin
+            params = Newtrinos.osc.get_params(Newtrinos.osc.ThreeFlavour())
+            E = [1.0, 5.0]
+            L = [295.0, 810.0]
+
+            for prop in [Newtrinos.osc.Basic(), Newtrinos.osc.Damping(), Newtrinos.osc.Decoherent()]
+                cfg = Newtrinos.osc.OscillationConfig(propagation=prop)
+                osc_prob = Newtrinos.osc.get_osc_prob(cfg)
+                result = osc_prob(E, L, params)
+
+                @test size(result) == (2, 2, 3, 3)
+                @test all(result .>= -1e-15)
+                @test all(result .<= 1.0 + 1e-15)
+                for ie in 1:2, il in 1:2, α in 1:3
+                    @test sum(result[ie, il, α, :]) ≈ 1.0 atol=1e-6
+                end
+            end
+
+            # Damping should differ from Basic
+            r_basic = Newtrinos.osc.get_osc_prob(Newtrinos.osc.OscillationConfig(propagation=Newtrinos.osc.Basic()))(E, L, params)
+            r_damp = Newtrinos.osc.get_osc_prob(Newtrinos.osc.OscillationConfig(propagation=Newtrinos.osc.Damping()))(E, L, params)
+            @test !(r_basic ≈ r_damp)
+        end
+        
+    end
+
+
 
     @testset "get matrices" begin
         #test get_matrices for different model configurations
