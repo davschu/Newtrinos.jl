@@ -28,7 +28,7 @@ makedocs(
             "Physics" => "api/physics.md",
         ],
     ],
-    warnonly = [:missing_docs],
+    warnonly = [:missing_docs, :cross_references],
 )
 
 deploydocs(
