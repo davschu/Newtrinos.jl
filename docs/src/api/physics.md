@@ -4,7 +4,9 @@
 
 The oscillation module is accessed via `Newtrinos.osc`. Key types include `OscillationConfig`, flavour models (`ThreeFlavour`, `Sterile`, `ADD`), interaction models (`Vacuum`, `SI`, `NSI`), and propagation models (`Basic`, `Decoherent`, `Damping`).
 
-Docstrings will be rendered here as they are added to the source code.
+'''@autodocs
+Modules = [Newtrinos.osc]
+'''
 
 ## Eigendecomposition
 
