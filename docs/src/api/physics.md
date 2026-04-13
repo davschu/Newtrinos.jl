@@ -13,6 +13,23 @@ Newtrinos.osc.Osc
 Newtrinos.osc.configure
 ```
 
+### Data Types
+
+```@docs
+Newtrinos.osc.ftype
+Newtrinos.osc.Layer
+Newtrinos.osc.Path
+```
+
+### Core Functions
+
+```@docs
+Newtrinos.osc.get_osc_prob
+Newtrinos.osc.get_matrices
+Newtrinos.osc.get_PMNS
+Newtrinos.osc.get_abs_masses
+```
+
 ### Flavour Models
 
 ```@docs
@@ -21,6 +38,13 @@ Newtrinos.osc.ThreeFlavour
 Newtrinos.osc.ThreeFlavourXYCP
 Newtrinos.osc.Sterile
 Newtrinos.osc.ADD
+```
+
+### Parameters and Priors
+
+```@docs
+Newtrinos.osc.get_params
+Newtrinos.osc.get_priors
 ```
 
 ### Interaction Models
@@ -58,30 +82,6 @@ Newtrinos.osc.decompose
 Newtrinos.BargerEigen
 ```
 
-### Data Types
-
-```@docs
-Newtrinos.osc.ftype
-Newtrinos.osc.Layer
-Newtrinos.osc.Path
-```
-
-### Core Functions
-
-```@docs
-Newtrinos.osc.get_osc_prob
-Newtrinos.osc.get_matrices
-Newtrinos.osc.get_PMNS
-Newtrinos.osc.get_abs_masses
-```
-
-### Parameters and Priors
-
-```@docs
-Newtrinos.osc.get_params
-Newtrinos.osc.get_priors
-```
-
 ### Internal Functions
 
 These functions are not part of the public API but are documented for developers working
@@ -94,6 +94,29 @@ Newtrinos.osc.osc_reduce
 Newtrinos.osc.matter_osc_per_e
 Newtrinos.osc.select
 Newtrinos.osc.propagate
+```
+
+## Earth Layers
+
+The Earth density module is accessed via `Newtrinos.earth_layers`. Use
+[`Newtrinos.earth_layers.configure`](@ref) to create an [`Newtrinos.earth_layers.EarthLayers`](@ref)
+physics module providing layer structures and path computations for matter-effect oscillations.
+
+### Density Models
+
+```@docs
+Newtrinos.earth_layers.DensityModel
+Newtrinos.earth_layers.PREM
+Newtrinos.earth_layers.EarthLayers
+```
+
+### Configuration and Functions
+
+```@docs
+Newtrinos.earth_layers.configure
+Newtrinos.earth_layers.get_compute_layers
+Newtrinos.earth_layers.compute_paths
+Newtrinos.earth_layers.ray_circle_path_length
 ```
 
 ## Atmospheric Flux
