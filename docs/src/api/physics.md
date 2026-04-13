@@ -102,7 +102,26 @@ The atmospheric flux module is accessed via `Newtrinos.atm_flux`.
 
 ## Cross-Sections
 
-The cross-section module is accessed via `Newtrinos.xsec`.
+The cross-section module is accessed via `Newtrinos.xsec`. Use [`Newtrinos.xsec.configure`](@ref)
+to create a [`Newtrinos.xsec.Xsec`](@ref) physics module.
+
+### Models
+
+```@docs
+Newtrinos.xsec.XsecModel
+Newtrinos.xsec.SimpleScaling
+Newtrinos.xsec.Differential_H2O
+Newtrinos.xsec.Xsec
+```
+
+### Configuration and Functions
+
+```@docs
+Newtrinos.xsec.configure
+Newtrinos.xsec.get_params
+Newtrinos.xsec.get_priors
+Newtrinos.xsec.get_scale
+```
 
 ## Utility Functions
 
