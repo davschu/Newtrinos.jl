@@ -121,7 +121,39 @@ Newtrinos.earth_layers.ray_circle_path_length
 
 ## Atmospheric Flux
 
-The atmospheric flux module is accessed via `Newtrinos.atm_flux`.
+The atmospheric flux module is accessed via `Newtrinos.atm_flux`. Use
+[`Newtrinos.atm_flux.configure`](@ref) to create an [`Newtrinos.atm_flux.AtmFlux`](@ref)
+physics module providing nominal HKKM fluxes and Barr systematic modifications.
+
+### Flux Models
+
+```@docs
+Newtrinos.atm_flux.NominalFluxModel
+Newtrinos.atm_flux.HKKM
+Newtrinos.atm_flux.FluxSystematicsModel
+Newtrinos.atm_flux.Barr
+Newtrinos.atm_flux.AtmFluxConfig
+Newtrinos.atm_flux.AtmFlux
+```
+
+### Configuration and Functions
+
+```@docs
+Newtrinos.atm_flux.configure
+Newtrinos.atm_flux.get_params
+Newtrinos.atm_flux.get_priors
+Newtrinos.atm_flux.get_nominal_flux
+Newtrinos.atm_flux.get_sys_flux
+```
+
+### Internal Functions
+
+```@docs
+Newtrinos.atm_flux.get_hkkm_flux
+Newtrinos.atm_flux.scale_flux
+Newtrinos.atm_flux.uphorizontal
+Newtrinos.atm_flux.updown
+```
 
 ## Cross-Sections
 
