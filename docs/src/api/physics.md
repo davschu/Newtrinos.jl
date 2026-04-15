@@ -155,6 +155,31 @@ Newtrinos.atm_flux.uphorizontal
 Newtrinos.atm_flux.updown
 ```
 
+## SNS Flux
+
+The Spallation Neutron Source flux module is accessed via `Newtrinos.sns_flux`. Use
+[`Newtrinos.sns_flux.configure`](@ref) to create an [`Newtrinos.sns_flux.SNSFlux`](@ref)
+physics module for COHERENT-style experiments.
+
+### Configuration
+
+```@docs
+Newtrinos.sns_flux.SNSFlux
+Newtrinos.sns_flux.configure
+Newtrinos.sns_flux.get_params
+Newtrinos.sns_flux.get_priors
+```
+
+### Internal Functions
+
+```@docs
+Newtrinos.sns_flux.get_assets
+Newtrinos.sns_flux.get_flux
+Newtrinos.sns_flux.flux_nu_mu
+Newtrinos.sns_flux.flux_nu_e
+Newtrinos.sns_flux.flux_nu_mu_bar
+```
+
 ## Cross-Sections
 
 The cross-section module is accessed via `Newtrinos.xsec`. Use [`Newtrinos.xsec.configure`](@ref)
