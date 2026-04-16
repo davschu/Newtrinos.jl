@@ -1,9 +1,6 @@
 using Distributions
 using DataStructures
-<<<<<<< HEAD
-=======
 #using OrderedCollections
->>>>>>> testing
 using Newtrinos
 using Test
 
@@ -71,11 +68,7 @@ using Test
         datadir = joinpath(dirname(pathof(Newtrinos)), "physics")
         flux = Newtrinos.atm_flux.get_hkkm_flux(joinpath(datadir, "spl-nu-20-01-000.d"))
 
-<<<<<<< HEAD
-        @test flux isa AbstractDict
-=======
         #@test flux isa OrderedDict 
->>>>>>> testing
         @test length(flux) == 4
         @test collect(keys(flux)) == [:numu, :numubar, :nue, :nuebar]
 
