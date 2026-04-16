@@ -1,3 +1,7 @@
+using Distributions
+using Test
+using Newtrinos
+
 @testset "Cross Sections" begin
 
     @testset "SimpleScaling scale function" begin
@@ -24,7 +28,7 @@
                             ("Differential_H2O", Newtrinos.xsec.Differential_H2O())]
             xs = Newtrinos.xsec.configure(cfg)
             for key in keys(xs.params)
-                @test insupport(xs.priors[key], xs.params[key])
+                @test Distributions.insupport(xs.priors[key], xs.params[key])
             end
         end
     end
