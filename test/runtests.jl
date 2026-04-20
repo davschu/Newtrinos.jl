@@ -12,4 +12,5 @@ using Test
     include("osc_unit_tests.jl")
     include("test_snsflux.jl")
     include("test_atmflux.jl")
+    include("test_cevns_xsec.jl")
 end
