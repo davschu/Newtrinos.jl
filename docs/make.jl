@@ -36,6 +36,6 @@ makedocs(
 
 deploydocs(
     repo = "github.com/$(gh_repo).git",
-    devbranch = "documentation",
+    devbranch = "main",
     #push_preview = true,
 )
