@@ -82,6 +82,20 @@ Newtrinos.osc.decompose
 Newtrinos.BargerEigen
 ```
 
+### Analytic Eigendecomposition
+
+Closed-form 3×3 Hermitian eigendecomposition underlying [`Newtrinos.BargerEigen`](@ref).
+These functions are defined in `src/physics/eigen_hermitian_3x3.jl` and live in the
+top-level `Newtrinos` namespace.
+
+```@docs
+Newtrinos.fast_eigen
+Newtrinos._fast_eigen_efzero
+Newtrinos._fast_eigen_edzero
+Newtrinos._fast_eigen_dfzero
+Newtrinos._sorted_eigen
+```
+
 ### Internal Functions
 
 These functions are not part of the public API but are documented for developers working
@@ -178,6 +192,31 @@ Newtrinos.sns_flux.get_flux
 Newtrinos.sns_flux.flux_nu_mu
 Newtrinos.sns_flux.flux_nu_e
 Newtrinos.sns_flux.flux_nu_mu_bar
+```
+
+## CEvNS Cross-Section
+
+The CEvNS cross-section module is accessed via `Newtrinos.cevns_xsec`. Use
+[`Newtrinos.cevns_xsec.configure`](@ref) to create a
+[`Newtrinos.cevns_xsec.CevnsXsec`](@ref) physics module for COHERENT-style experiments.
+
+### Configuration
+
+```@docs
+Newtrinos.cevns_xsec.CevnsXsec
+Newtrinos.cevns_xsec.configure
+Newtrinos.cevns_xsec.build_params_and_priors
+```
+
+### Internal Functions
+
+```@docs
+Newtrinos.cevns_xsec.get_assets
+Newtrinos.cevns_xsec.ffsq
+Newtrinos.cevns_xsec.ds
+Newtrinos.cevns_xsec.get_diff_xsec
+Newtrinos.cevns_xsec.get_diff_xsec_lar
+Newtrinos.cevns_xsec.get_diff_xsec_csi
 ```
 
 ## Cross-Sections
