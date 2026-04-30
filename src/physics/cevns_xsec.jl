@@ -111,8 +111,8 @@ Per-isotope nuclear radius parameters `Rn_*` are appended automatically using th
 # Returns
 A 2-tuple `(params::NamedTuple, priors::NamedTuple)`.
 """
-# Dynamic parameter/prior builder for isotope-specific Rn keys, using isotope list
 function build_params_and_priors(isotopes)
+    # Dynamic parameter/prior builder for isotope-specific Rn keys, using isotope list
     param_dict = Dict(
         :cevns_xsec_a => 0.0,
         :cevns_xsec_b => 0.0,
@@ -193,8 +193,8 @@ and ``s = 0.9\\,\\text{fm}`` is the nuclear skin thickness.
 # Returns
 The dimensionless form factor squared ``F^2(q^2)``.
 """
-# Helm-like nuclear form factor squared, generic in type
 function ffsq(er, mn, rn)
+    # Helm-like nuclear form factor squared, generic in type
     r0 = rn / 197.326963
     arg = 2 * mn * er
     q = sqrt(max(arg, zero(arg)))                 # typed zero
@@ -233,8 +233,8 @@ the expression reduces to the standard CEvNS formula of Freedman (1974).
 # Returns
 Matrix of shape `(n_er, n_enu)` with units [MeV⁻¹].
 """
-# Vectorized differential cross section dσ/dEr (n_er × n_enu), AD-safe
 function ds(er, enu, params, nupar, Rn_key)
+    # Vectorized differential cross section dσ/dEr (n_er × n_enu), AD-safe
     mN = nupar[1]
     Z  = nupar[2]
     N  = nupar[3]
