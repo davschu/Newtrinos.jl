@@ -197,7 +197,14 @@ struct Vacuum <: InteractionModel end
 Non-Standard Interactions in matter. Extends the matter Hamiltonian beyond the Standard
 Model Wolfenstein potential.
 """
-struct NSI <: InteractionModel end
+@kwdef struct NSI <: InteractionModel 
+    ε_ee::Float64 = 0.0
+    ε_μμ::Float64 = 0.0
+    ε_ττ::Float64 = 0.0
+    ε_eμ::ComplexF64 = 0.0
+    ε_eτ::ComplexF64 = 0.0
+    ε_μτ::ComplexF64 = 0.0
+end
 
 """
     SI <: InteractionModel
@@ -493,8 +500,8 @@ its own set of parameters (mixing angles, mass splittings, and any BSM quantitie
 # Returns
 A `NamedTuple` of `Symbol => Float64` (or `Vector` for shell parameters) with the nominal
 parameter values.
-"""
-get_params(cfg::OscillationConfig) = get_params(cfg.flavour)
+""" 
+get_params(cfg::OscillationConfig) = merge(get_params(cfg.flavour), get_params(cfg.interaction))
 
 """
     get_priors(cfg::OscillationConfig) -> NamedTuple
@@ -511,7 +518,9 @@ Delegates to the flavour-model-specific method. Priors are `Distributions.jl` ob
 # Returns
 A `NamedTuple` of `Symbol => Distribution` mapping each parameter to its prior.
 """
-get_priors(cfg::OscillationConfig) = get_priors(cfg.flavour)
+get_priors(cfg::OscillationConfig) = merge(get_priors(cfg.flavour), get_priors(cfg.interaction))
+
+#FLAVOUR MODELS:
 
 function get_params(cfg::ThreeFlavour)
     params = OrderedDict()
@@ -679,6 +688,40 @@ function get_priors(cfg::Darkdim_cas)
     NamedTuple(priors)
 end
 
+#INTERACTION MODELS:
+
+get_params(::Union{Vacuum, SI}) = (;)
+get_priors(::Union{Vacuum, SI}) = (;)
+
+function get_params(cfg::NSI)
+    params = OrderedDict()
+    params[:ε_ee] = ftype(0.0)
+    params[:ε_μμ] = ftype(0.0)
+    params[:ε_ττ] = ftype(0.0)
+    params[:ε_eμ_re] = ftype(0.0)
+    params[:ε_eμ_im] = ftype(0.0)
+    params[:ε_eτ_re] = ftype(0.0)
+    params[:ε_eτ_im] = ftype(0.0)
+    params[:ε_μτ_re] = ftype(0.0)
+    params[:ε_μτ_im] = ftype(0.0)
+    NamedTuple(params)
+end 
+
+function get_priors(cfg::NSI)
+    priors = OrderedDict()
+    priors[:ε_ee] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_μμ] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_ττ] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eμ_re] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eμ_im] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eτ_re] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eτ_im] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_μτ_re] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_μτ_im] = Uniform(-ftype(1), ftype(1))
+    NamedTuple(priors)
+end
+
+
 """
     get_PMNS(params) -> SMatrix{3,3}
 
@@ -844,7 +887,64 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     H = Hermitian(H_eff + H_mat)
     tmp = decompose(H, eigen_method)
     tmp.vectors, tmp.values
-end   
+end 
+
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9 
+    H_NSI = a * [
+        interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
+        conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
+        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
+    ]
+
+    if anti
+        H[1,1] -= A * layer.p_density * 2 * e * 1e9 
+        for i in 1:3
+            H[i,i] += A * layer.n_density * e * 1e9 
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i] 
+            end
+        end
+
+    else
+        H[1,1] += A * layer.p_density * 2 * e * 1e9
+        for i in 1:3
+            H[i,i] -= A * layer.n_density * e * 1e9
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+    H_NSI = a * @SMatrix [
+        interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
+        conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
+        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
+    ]
+    
+    ve = A * e * 1e9
+    if anti
+        d1 = ve * (-2 * layer.p_density + layer.n_density)
+        dn = ve * layer.n_density
+        H_NSI = -1 * conj(H_NSI)
+    else
+        d1 = ve * (2 * layer.p_density - layer.n_density)
+        dn = ve * (-layer.n_density)
+    end
+    z=zero(d1)
+    H_mat = @SMatrix [d1 z z; z dn z; z z dn]
+    H = Hermitian(H_eff + H_mat + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
 
 """
     osc_reduce(matter_matrices, path, e, propagation) -> Matrix
@@ -1119,6 +1219,24 @@ function _add_rest_and_permute(p_raw, rest)
     result
 end
 
+
+#Helper functions for enabling scans over interaction parameters (needed for NSI)
+#call make_interaction within before calculating p_raw in osc_prob
+make_interaction(::Vacuum, _) = Vacuum() 
+make_interaction(::SI, _) = SI()
+make_interaction(::NSI, params) = NSI(
+    ε_ee = params.ε_ee,
+    ε_μμ = params.ε_μμ,
+    ε_ττ = params.ε_ττ,
+    ε_eμ = ComplexF64(params.ε_eμ_re, params.ε_eμ_im),
+    ε_eτ = ComplexF64(params.ε_eτ_re, params.ε_eτ_im),
+    ε_μτ = ComplexF64(params.ε_μτ_re, params.ε_μτ_im)
+)
+
+
+
+
+
 """
     get_osc_prob(cfg::OscillationConfig) -> Function
 
@@ -1173,8 +1291,9 @@ function get_osc_prob(cfg::OscillationConfig)
 
         U, h, rest = select(Uc, h, cfg.states)
 
+        interaction = make_interaction(cfg.interaction, params)
         # propagate returns (n_flav, n_flav, n_E, n_cz)
-        p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti, cfg.eigen_method)
+        p_raw = propagate(U, h, E, paths, layers, cfg.propagation, interaction, anti, cfg.eigen_method)
 
         # fuse rest addition + permutedims into (n_E, n_cz, n_flav, n_flav)
         return _add_rest_and_permute(p_raw, rest)
