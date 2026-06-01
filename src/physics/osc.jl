@@ -961,7 +961,120 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     tmp.vectors, tmp.values
 end 
 
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::Union{NSI, NSI_Standard, NSI_GMP}, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9   
+    
+    H_NSI = a * [
+            interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
+            conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
+            conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
+        ]
+
+    if anti
+        H[1,1] -= A * layer.p_density * 2 * e * 1e9 
+        for i in 1:3
+            H[i,i] += A * layer.n_density * e * 1e9 
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i] 
+            end
+        end
+
+    else
+        H[1,1] += A * layer.p_density * 2 * e * 1e9
+        for i in 1:3
+            H[i,i] -= A * layer.n_density * e * 1e9
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_Standard, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9 
+
+    H_NSI = a * [
+        1.0 + interaction.Δ_eμ        interaction.ε_eμ        interaction.ε_eτ;
+        conj(interaction.ε_eμ)  0.0                       interaction.ε_μτ;
+        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.Δ_τμ   
+    ]
+    
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate()
+        for i in 1:3
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i]  # index flip for conjugate
+            end
+        end
+    else 
+        for i in 1:3
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_GMP, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9 
+
+    R12 = [ cos(interaction.ϕ_12)   sin(interaction.ϕ_12)   0.0;
+            -sin(interaction.ϕ_12)  cos(interaction.ϕ_12)   0.0;
+            0.0                     0.0                     1.0]
+
+    R13 = [ cos(interaction.ϕ_13)   0.0     sin(interaction.ϕ_13);
+            0.0                     1.0     0.0;
+            -sin(interaction.ϕ_13)  0.0     cos(interaction.ϕ_13)]
+
+    R23 = [ 1.0     0.0                                                 0.0;
+            0.0     cos(interaction.ϕ_23)                               sin(interaction.ϕ_23) * cis(-interaction.δ_NS);
+            0.0     -sin(interaction.ϕ_23) * cis(interaction.δ_NS)      cos(interaction.ϕ_23)]
+
+    Q = [ cis(interaction.α_1)   0.0                     0.0;
+          0.0                     cis(interaction.α_2)   0.0;
+          0.0                     0.0                     cis(-(interaction.α_1 + interaction.α_2))]
+
+    D = a * [interaction.ε_1    0.0                 0.0;
+              0.0               interaction.ε_2     0.0;
+              0.0               0.0                 0.0]
+
+    U = R12 * R13 * R23
+    H_NSI = Q * U * D * U' * Q'
+
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate()
+        for i in 1:3
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i]  # index flip for conjugate 
+            end
+        end
+    else 
+        for i in 1:3
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+#=function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::Union{NSI, NSI_Standard, NSI_GMP}, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     a= A * layer.p_density * 2 * e * 1e9 
 
@@ -1011,9 +1124,74 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     H = Hermitian(H)
     tmp=decompose(H, eigen_method)
     tmp.vectors, tmp.values
+end=#
+
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+     
+    H_NSI = a * @SMatrix [
+        interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
+        conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
+        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
+    ]
+        
+    ve = A * e * 1e9
+    if anti
+        d1 = ve * (-2 * layer.p_density + layer.n_density)
+        dn = ve * layer.n_density
+        H_NSI = -1 * conj(H_NSI)
+    else
+        d1 = ve * (2 * layer.p_density - layer.n_density)
+        dn = ve * (-layer.n_density)
+    end
+    z=zero(d1)
+    H_mat = @SMatrix [d1 z z; z dn z; z z dn]
+    H = Hermitian(H_eff + H_mat + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::Union{NSI, NSI_Standard, NSI_GMP}, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_Standard, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+    
+    H_NSI = a * @SMatrix[
+        1.0 + interaction.Δ_eμ  interaction.ε_eμ        interaction.ε_eτ;
+        conj(interaction.ε_eμ)  0.0                     interaction.ε_μτ;
+        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.Δ_τμ   
+    ]
+    
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate() 
+        H_NSI = -1 * conj(H_NSI)
+    end
+    H = Hermitian(H_eff + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_GMP, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+    
+    R12 = SMatrix{3,3}(cos(interaction.ϕ_12), -sin(interaction.ϕ_12), 0.0, sin(interaction.ϕ_12), cos(interaction.ϕ_12), 0.0, 0.0, 0.0, 1.0)
+    R13 = SMatrix{3,3}(cos(interaction.ϕ_13), 0.0, -sin(interaction.ϕ_13), 0.0, 1.0, 0.0, sin(interaction.ϕ_13), 0.0, cos(interaction.ϕ_13))
+    R23 = SMatrix{3,3}(1.0, 0.0, 0.0, 0.0, cos(interaction.ϕ_23), -sin(interaction.ϕ_23) * cis(-interaction.δ_NS), 0.0, sin(interaction.ϕ_23) * cis(interaction.δ_NS), cos(interaction.ϕ_23))
+    U = R12 * R13 * R23
+    Q = SMatrix{3,3}(cis(interaction.α_1), 0.0, 0.0, 0.0, cis(interaction.α_2), 0.0, 0.0, 0.0, cis(-(interaction.α_1 + interaction.α_2)))
+    D = a * SMatrix{3,3}(interaction.ε_1, 0.0, 0.0, 0.0, interaction.ε_2, 0.0, 0.0, 0.0, 0.0)
+    H_NSI = Q * U * D * U' * Q'
+
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate()
+        H_NSI = -1 * conj(H_NSI)
+    end
+    H = Hermitian(H_eff + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+#=function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::Union{NSI, NSI_Standard, NSI_GMP}, eigen_method::EigenMethod=DefaultEigen())
     a = A * layer.p_density * 2 * e * 1e9
     
     if interaction isa NSI  
@@ -1054,7 +1232,7 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     H = Hermitian(H_eff + H_mat + H_NSI)
     tmp = decompose(H, eigen_method)
     tmp.vectors, tmp.values
-end
+end=#
 
 """
     osc_reduce(matter_matrices, path, e, propagation) -> Matrix
