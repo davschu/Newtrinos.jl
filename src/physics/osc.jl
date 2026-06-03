@@ -197,35 +197,13 @@ struct Vacuum <: InteractionModel end
 Non-Standard Interactions in matter. Extends the matter Hamiltonian beyond the Standard
 Model Wolfenstein potential.
 """
-@kwdef struct NSI <: InteractionModel 
-    ε_ee::Float64 = 0.0
-    ε_μμ::Float64 = 0.0
-    ε_ττ::Float64 = 0.0
-    ε_eμ::ComplexF64 = 0.0
-    ε_eτ::ComplexF64 = 0.0
-    ε_μτ::ComplexF64 = 0.0
-end
+struct NSI <: InteractionModel end
 
 #for "standard parametrization": substracted ε_μμ from diagonal
-@kwdef struct NSI_Standard <: InteractionModel
-    Δ_eμ::Float64 = 0.0 # = ε_ee - ε_μμ
-    Δ_τμ::Float64 = 0.0 # = ε_ττ - ε_μμ
-    ε_eμ::ComplexF64 = 0.0
-    ε_eτ::ComplexF64 = 0.0
-    ε_μτ::ComplexF64 = 0.0
-end
+struct NSI_Standard <: InteractionModel end
 
 #for generalized matter potential parametrization:
-@kwdef struct NSI_GMP <: InteractionModel
-    α_1::Float64 = 0.0
-    α_2::Float64 = 0.0
-    ϕ_12::Float64 = 0.0
-    ϕ_13::Float64 = 0.0
-    ϕ_23::Float64 = 0.0
-    δ_NS::Float64 = 0.0
-    ε_1::Float64 = 0.0
-    ε_2::Float64 = 0.0 
-end
+struct NSI_GMP <: InteractionModel end
 
 """
     SI <: InteractionModel
@@ -927,7 +905,7 @@ optimized one for `SMatrix{3,3}`.
 # Returns
 A tuple `(U_m, h_m)` of matter-modified eigenvectors and eigenvalues.
 """
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     if anti
         H[1,1] -= A * layer.p_density * 2 * e * 1e9
@@ -945,7 +923,7 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::SI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     ve = A * e * 1e9
     if anti
         d1 = ve * (-2 * layer.p_density + layer.n_density)
@@ -961,14 +939,17 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     tmp.vectors, tmp.values
 end 
 
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     a= A * layer.p_density * 2 * e * 1e9   
-    
+    ε_eμ = complex(params.ε_eμ_re, params.ε_eμ_im)
+    ε_eτ = complex(params.ε_eτ_re, params.ε_eτ_im)
+    ε_μτ = complex(params.ε_μτ_re, params.ε_μτ_im)
+
     H_NSI = a * [
-            interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
-            conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
-            conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
+            params.ε_ee     ε_eμ            ε_eτ;
+            conj(ε_eμ)      params.ε_μμ     ε_μτ;
+            conj(ε_eτ)      conj(ε_μτ)      params.ε_ττ    
         ]
 
     if anti
@@ -995,14 +976,17 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_Standard, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_Standard, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     a= A * layer.p_density * 2 * e * 1e9 
+    ε_eμ = params.ε_eμ_abs * cis(params.δ_eμ)
+    ε_eτ = params.ε_eτ_abs * cis(params.δ_eτ)
+    ε_μτ = params.ε_μτ_abs * cis(params.δ_μτ)
 
     H_NSI = a * [
-        1.0 + interaction.Δ_eμ        interaction.ε_eμ        interaction.ε_eτ;
-        conj(interaction.ε_eμ)  0.0                       interaction.ε_μτ;
-        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.Δ_τμ   
+        1.0 + params.Δ_eμ     ε_eμ            ε_eτ;
+        conj(ε_eμ)            0.0             ε_μτ;
+        conj(ε_eτ)            conj(ε_μτ)      params.Δ_τμ   
     ]
     
     #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
@@ -1026,28 +1010,28 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_GMP, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_GMP, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     a= A * layer.p_density * 2 * e * 1e9 
 
-    R12 = [ cos(interaction.ϕ_12)   sin(interaction.ϕ_12)   0.0;
-            -sin(interaction.ϕ_12)  cos(interaction.ϕ_12)   0.0;
+    R12 = [ cos(params.ϕ_12)   sin(params.ϕ_12)   0.0;
+            -sin(params.ϕ_12)  cos(params.ϕ_12)   0.0;
             0.0                     0.0                     1.0]
 
-    R13 = [ cos(interaction.ϕ_13)   0.0     sin(interaction.ϕ_13);
+    R13 = [ cos(params.ϕ_13)   0.0     sin(params.ϕ_13);
             0.0                     1.0     0.0;
-            -sin(interaction.ϕ_13)  0.0     cos(interaction.ϕ_13)]
+            -sin(params.ϕ_13)  0.0     cos(params.ϕ_13)]
 
     R23 = [ 1.0     0.0                                                 0.0;
-            0.0     cos(interaction.ϕ_23)                               sin(interaction.ϕ_23) * cis(-interaction.δ_NS);
-            0.0     -sin(interaction.ϕ_23) * cis(interaction.δ_NS)      cos(interaction.ϕ_23)]
+            0.0     cos(params.ϕ_23)                               sin(params.ϕ_23) * cis(-params.δ_NS);
+            0.0     -sin(params.ϕ_23) * cis(params.δ_NS)      cos(params.ϕ_23)]
 
-    Q = [ cis(interaction.α_1)   0.0                     0.0;
-          0.0                     cis(interaction.α_2)   0.0;
-          0.0                     0.0                     cis(-(interaction.α_1 + interaction.α_2))]
+    Q = [ cis(params.α_1)   0.0                     0.0;
+          0.0                     cis(params.α_2)   0.0;
+          0.0                     0.0                     cis(-(params.α_1 + params.α_2))]
 
-    D = a * [interaction.ε_1    0.0                 0.0;
-              0.0               interaction.ε_2     0.0;
+    D = a * [params.ε_1    0.0                 0.0;
+              0.0               params.ε_2     0.0;
               0.0               0.0                 0.0]
 
     U = R12 * R13 * R23
@@ -1074,65 +1058,16 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end
 
-#=function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::Union{NSI, NSI_Standard, NSI_GMP}, eigen_method::EigenMethod=DefaultEigen())
-    H = copy(H_eff)
-    a= A * layer.p_density * 2 * e * 1e9 
-
-    if interaction isa NSI  
-        H_NSI = a * @SMatrix [
-            interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
-            conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
-            conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
-        ]
-
-    elseif interaction isa NSI_Standard
-        H_NSI = a * @SMatrix[
-            interaction.Δ_eμ        interaction.ε_eμ        interaction.ε_eτ;
-            conj(interaction.ε_eμ)  0                       interaction.ε_μτ;
-            conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.Δ_τμ   
-        ]
-
-    elseif interaction isa NSI_GMP
-        R12 = SMatrix{3,3}(cos(interaction.ϕ_12), -sin(interaction.ϕ_12), 0.0, sin(interaction.ϕ_12), cos(interaction.ϕ_12), 0.0, 0.0, 0.0, 1.0)
-        R13 = SMatrix{3,3}(cos(interaction.ϕ_13), 0.0, -sin(interaction.ϕ_13), 0.0, 1.0, 0.0, sin(interaction.ϕ_13), 0.0, cos(interaction.ϕ_13))
-        R23 = SMatrix{3,3}(1.0, 0.0, 0.0, 0.0, cos(interaction.ϕ_23), -sin(interaction.ϕ_23) * cis(-interaction.δ_NS), 0.0, sin(interaction.ϕ_23) * cis(interaction.δ_NS), cos(interaction.ϕ_23))
-        U = R12 * R13 * R23
-        Q = SMatrix{3,3}(cis(interaction.α_1), 0.0, 0.0, 0.0, cis(interaction.α_2), 0.0, 0.0, 0.0, cis(-(interaction.α_1 + interaction.α_2)))
-        D = a * SMatrix{3,3}(interaction.ε_1, 0.0, 0.0, 0.0, interaction.ε_2, 0.0, 0.0, 0.0, 0.0)
-        H_NSI = Q * U * D * U' * Q'
-    end     
-
-    if anti
-        H[1,1] -= A * layer.p_density * 2 * e * 1e9 
-        for i in 1:3
-            H[i,i] += A * layer.n_density * e * 1e9 
-            for j in 1:3
-                H[i,j] -= H_NSI[j,i] 
-            end
-        end
-
-    else
-        H[1,1] += A * layer.p_density * 2 * e * 1e9
-        for i in 1:3
-            H[i,i] -= A * layer.n_density * e * 1e9
-            for j in 1:3
-                H[i,j] += H_NSI[i,j]
-            end
-        end
-    end
-    
-    H = Hermitian(H)
-    tmp=decompose(H, eigen_method)
-    tmp.vectors, tmp.values
-end=#
-
-function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     a = A * layer.p_density * 2 * e * 1e9
-     
+    ε_eμ = complex(params.ε_eμ_re, params.ε_eμ_im)
+    ε_eτ = complex(params.ε_eτ_re, params.ε_eτ_im)
+    ε_μτ = complex(params.ε_μτ_re, params.ε_μτ_im)
+
     H_NSI = a * @SMatrix [
-        interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
-        conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
-        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
+        params.ε_ee     ε_eμ          ε_eτ;
+        conj(ε_eμ)      params.ε_μμ   ε_μτ;
+        conj(ε_eτ)      conj(ε_μτ)    params.ε_ττ
     ]
         
     ve = A * e * 1e9
@@ -1151,15 +1086,17 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_Standard, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_Standard, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     a = A * layer.p_density * 2 * e * 1e9
-    
-    H_NSI = a * @SMatrix[
-        1.0 + interaction.Δ_eμ  interaction.ε_eμ        interaction.ε_eτ;
-        conj(interaction.ε_eμ)  0.0                     interaction.ε_μτ;
-        conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.Δ_τμ   
+    ε_eμ = params.ε_eμ_abs * cis(params.δ_eμ)
+    ε_eτ = params.ε_eτ_abs * cis(params.δ_eτ)
+    ε_μτ = params.ε_μτ_abs * cis(params.δ_μτ)
+
+    H_NSI = a * @SMatrix [
+        1 + params.Δ_eμ   ε_eμ          ε_eτ;
+        conj(ε_eμ)        0.0           ε_μτ;
+        conj(ε_eτ)        conj(ε_μτ)    params.Δ_τμ
     ]
-    
     #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
     if anti 
         #H_vac is already conjugated in propagate() 
@@ -1170,15 +1107,15 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_GMP, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_GMP, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     a = A * layer.p_density * 2 * e * 1e9
     
-    R12 = SMatrix{3,3}(cos(interaction.ϕ_12), -sin(interaction.ϕ_12), 0.0, sin(interaction.ϕ_12), cos(interaction.ϕ_12), 0.0, 0.0, 0.0, 1.0)
-    R13 = SMatrix{3,3}(cos(interaction.ϕ_13), 0.0, -sin(interaction.ϕ_13), 0.0, 1.0, 0.0, sin(interaction.ϕ_13), 0.0, cos(interaction.ϕ_13))
-    R23 = SMatrix{3,3}(1.0, 0.0, 0.0, 0.0, cos(interaction.ϕ_23), -sin(interaction.ϕ_23) * cis(-interaction.δ_NS), 0.0, sin(interaction.ϕ_23) * cis(interaction.δ_NS), cos(interaction.ϕ_23))
+    R12 = SMatrix{3,3}(cos(params.ϕ_12), -sin(params.ϕ_12), 0.0, sin(params.ϕ_12), cos(params.ϕ_12), 0.0, 0.0, 0.0, 1.0)
+    R13 = SMatrix{3,3}(cos(params.ϕ_13), 0.0, -sin(params.ϕ_13), 0.0, 1.0, 0.0, sin(params.ϕ_13), 0.0, cos(params.ϕ_13))
+    R23 = SMatrix{3,3}(1.0, 0.0, 0.0, 0.0, cos(params.ϕ_23), -sin(params.ϕ_23) * cis(-params.δ_NS), 0.0, sin(params.ϕ_23) * cis(params.δ_NS), cos(params.ϕ_23))
     U = R12 * R13 * R23
-    Q = SMatrix{3,3}(cis(interaction.α_1), 0.0, 0.0, 0.0, cis(interaction.α_2), 0.0, 0.0, 0.0, cis(-(interaction.α_1 + interaction.α_2)))
-    D = a * SMatrix{3,3}(interaction.ε_1, 0.0, 0.0, 0.0, interaction.ε_2, 0.0, 0.0, 0.0, 0.0)
+    Q = SMatrix{3,3}(cis(params.α_1), 0.0, 0.0, 0.0, cis(params.α_2), 0.0, 0.0, 0.0, cis(-(params.α_1 + params.α_2)))
+    D = a * SMatrix{3,3}(params.ε_1, 0.0, 0.0, 0.0, params.ε_2, 0.0, 0.0, 0.0, 0.0)
     H_NSI = Q * U * D * U' * Q'
 
     #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
@@ -1190,49 +1127,6 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     tmp = decompose(H, eigen_method)
     tmp.vectors, tmp.values
 end
-
-#=function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::Union{NSI, NSI_Standard, NSI_GMP}, eigen_method::EigenMethod=DefaultEigen())
-    a = A * layer.p_density * 2 * e * 1e9
-    
-    if interaction isa NSI  
-        H_NSI = a * @SMatrix [
-            interaction.ε_ee        interaction.ε_eμ        interaction.ε_eτ;
-            conj(interaction.ε_eμ)  interaction.ε_μμ        interaction.ε_μτ;
-            conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.ε_ττ    
-        ]
-
-    elseif interaction isa NSI_Standard
-        H_NSI = a * @SMatrix[
-            interaction.Δ_eμ        interaction.ε_eμ        interaction.ε_eτ;
-            conj(interaction.ε_eμ)  0                       interaction.ε_μτ;
-            conj(interaction.ε_eτ)  conj(interaction.ε_μτ)  interaction.Δ_τμ   
-        ]
-
-    elseif interaction isa NSI_GMP
-        R12 = SMatrix{3,3}(cos(interaction.ϕ_12), -sin(interaction.ϕ_12), 0.0, sin(interaction.ϕ_12), cos(interaction.ϕ_12), 0.0, 0.0, 0.0, 1.0)
-        R13 = SMatrix{3,3}(cos(interaction.ϕ_13), 0.0, -sin(interaction.ϕ_13), 0.0, 1.0, 0.0, sin(interaction.ϕ_13), 0.0, cos(interaction.ϕ_13))
-        R23 = SMatrix{3,3}(1.0, 0.0, 0.0, 0.0, cos(interaction.ϕ_23), -sin(interaction.ϕ_23) * cis(-interaction.δ_NS), 0.0, sin(interaction.ϕ_23) * cis(interaction.δ_NS), cos(interaction.ϕ_23))
-        Q = R12 * R13 * R23
-        U = SMatrix{3,3}(cis(interaction.α_1), 0.0, 0.0, 0.0, cis(interaction.α_2), 0.0, 0.0, 0.0, cis(-(interaction.α_1 + interaction.α_2)))
-        D = a * SMatrix{3,3}(interaction.ε_1, 0.0, 0.0, 0.0, interaction.ε_2, 0.0, 0.0, 0.0, 0.0)
-        H_NSI = Q * U * D * U' * Q'
-    end
-        
-    ve = A * e * 1e9
-    if anti
-        d1 = ve * (-2 * layer.p_density + layer.n_density)
-        dn = ve * layer.n_density
-        H_NSI = -1 * conj(H_NSI)
-    else
-        d1 = ve * (2 * layer.p_density - layer.n_density)
-        dn = ve * (-layer.n_density)
-    end
-    z=zero(d1)
-    H_mat = @SMatrix [d1 z z; z dn z; z z dn]
-    H = Hermitian(H_eff + H_mat + H_NSI)
-    tmp = decompose(H, eigen_method)
-    tmp.vectors, tmp.values
-end=#
 
 """
     osc_reduce(matter_matrices, path, e, propagation) -> Matrix
@@ -1287,19 +1181,20 @@ density-matrix evolution (for [`Decoherent`](@ref)).
 - `anti::Bool`: `true` for antineutrinos.
 - `propagation::PropagationModel`: propagation model.
 - `interaction::InteractionModel`: matter interaction model.
+- `params::NamedTuple`: model parameters (contains parameters for the interaction model).
 - `eigen_method::EigenMethod`: eigendecomposition algorithm.
 
 # Returns
 An `Array` of shape `(n_flav, n_flav, n_paths)` with ``P_{\\beta\\alpha}`` for each path.
 """
-function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping}, interaction, eigen_method::EigenMethod=DefaultEigen())
-    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction), Ref(eigen_method))
+function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping}, interaction, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction), Ref(params), Ref(eigen_method))
     p = stack(map(path -> osc_reduce(matter_matrices, path, e, propagation), paths))
 end
 
 
-function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction, eigen_method::EigenMethod=DefaultEigen())
-    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction), Ref(eigen_method))
+function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    matter_matrices = compute_matter_matrices.(Ref(H_eff), e, layers, anti, Ref(interaction), Ref(params), Ref(eigen_method))
     n = size(H_eff, 1)
     RT = real(eltype(H_eff))
     CT = eltype(H_eff)
@@ -1487,13 +1382,13 @@ function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{L
     propagate(U, h, E, L, propagation)
 end
 
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI, NSI_Standard, NSI_GMP}, anti::Bool, eigen_method::EigenMethod=DefaultEigen())
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI, NSI_Standard, NSI_GMP}, anti::Bool, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     if anti
         H_eff = conj.(U) * Diagonal(h) * transpose(U)
     else
         H_eff = U * Diagonal(h) * adjoint(U)
     end
-    p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, eigen_method), E))
+    p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, params, eigen_method), E))
     permutedims(p, (1, 2, 4, 3))
 end
 
@@ -1506,41 +1401,6 @@ function _add_rest_and_permute(p_raw, rest)
     end
     result
 end
-
-
-#Helper functions for enabling scans over interaction parameters (needed for NSI)
-#call make_interaction within before calculating p_raw in osc_prob
-make_interaction(::Vacuum, _) = Vacuum() 
-make_interaction(::SI, _) = SI()
-
-make_interaction(::NSI, params) = NSI(
-    ε_ee = params.ε_ee,
-    ε_μμ = params.ε_μμ,
-    ε_ττ = params.ε_ττ,
-    ε_eμ = ComplexF64(params.ε_eμ_re, params.ε_eμ_im),
-    ε_eτ = ComplexF64(params.ε_eτ_re, params.ε_eτ_im),
-    ε_μτ = ComplexF64(params.ε_μτ_re, params.ε_μτ_im)
-)
-
-make_interaction(::NSI_Standard, params) = NSI_Standard(
-    Δ_eμ = params.Δ_eμ, 
-    Δ_τμ = params.Δ_τμ,
-    ε_eμ = params.ε_eμ_abs * cis(params.δ_eμ),
-    ε_eτ = params.ε_eτ_abs * cis(params.δ_eτ),
-    ε_μτ = params.ε_μτ_abs * cis(params.δ_μτ)
-)
-
-make_interaction(::NSI_GMP, params) = NSI_GMP(
-    α_1 = params.α_1,
-    α_2 = params.α_2,
-    ϕ_12 = params.ϕ_12,
-    ϕ_13 = params.ϕ_13,
-    ϕ_23 = params.ϕ_23,
-    δ_NS = params.δ_NS,
-    ε_1 = params.ε_1,
-    ε_2 = params.ε_2
-)
-
 
 """
     get_osc_prob(cfg::OscillationConfig) -> Function
@@ -1596,9 +1456,8 @@ function get_osc_prob(cfg::OscillationConfig)
 
         U, h, rest = select(Uc, h, cfg.states)
 
-        interaction = make_interaction(cfg.interaction, params)
         # propagate returns (n_flav, n_flav, n_E, n_cz)
-        p_raw = propagate(U, h, E, paths, layers, cfg.propagation, interaction, anti, cfg.eigen_method)
+        p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti, params, cfg.eigen_method)
 
         # fuse rest addition + permutedims into (n_E, n_cz, n_flav, n_flav)
         return _add_rest_and_permute(p_raw, rest)
