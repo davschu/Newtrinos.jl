@@ -126,7 +126,7 @@ scatter!(ax, bf.θ₂₃, bf.Δm²₃₁, marker=:star5, color=:red)
 fig
 ```
 
-![png](./README_files/README_quick_example.png) 
+![png](./README_files/README_quick_example_plot.png) 
 
 ## Further Reading / Examples
 

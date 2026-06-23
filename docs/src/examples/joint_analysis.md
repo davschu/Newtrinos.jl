@@ -85,4 +85,4 @@ scatter!(ax2, bf_profile.θ₂₃, bf_profile.Δm²₃₁, marker=:star5, color=
 fig
 ```
 
-![png](./joint_analysis_plot.png)
+![png](./joint_analysis_plot_profile_scan.png)
