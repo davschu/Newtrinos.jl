@@ -1,8 +1,7 @@
 [![CI](https://github.com/davschu/Newtrinos.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/davschu/Newtrinos.jl/actions/workflows/CI.yml)
 [![codecov](https://codecov.io/github/davschu/Newtrinos.jl/graph/badge.svg?token=OTXXQIR8GW)](https://codecov.io/github/davschu/Newtrinos.jl)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://davschu.github.io/Newtrinos.jl/stable/)
-[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://davschu.github.io/Newtrinos.jl/dev/)
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://pilippeller.github.io/Newtrinos.jl/dev/)
 
 # Newtrinos.jl
 
@@ -115,16 +114,18 @@ We can also run a likelihood analysis to construct confidence contours in the (�
 
 ```julia
 result = Newtrinos.scan(likelihood, priors, (θ₂₃=31, Δm²₃₁=31), mle_result)
+bf=Newtrinos.bestfit(result) # extract best fit result
 ```
 ```julia
 using CairoMakie
 fig = Figure()
 ax = Axis(fig[1, 1], xlabel="θ₂₃", ylabel="Δm²₃₁")
-plot!(ax, result, levels=[0, 0.68, 0.9, 0.99]) # 68%, 90%, and 99% CL 
+plot!(ax, result, levels=[0, 0.68, 0.9, 0.99], filled=true, color=:black, cmap=Reverse(:Blues)) # 68%, 90%, and 99% CL
+scatter!(ax, bf.θ₂₃, bf.Δm²₃₁, marker=:star5, color=:red) 
 fig
 ```
 
-![png](./README_files/README_quick_example.png)
+![png](./README_files/README_quick_example.png) 
 
 ## Further Reading / Examples
 
