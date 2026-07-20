@@ -1155,11 +1155,24 @@ function osc_reduce(matter_matrices, path, e, propagation::Damping)
     # taking an average mixing matrix along the path to compute the decoherent sum, which is a bold approximation
     w = weights([section.length for section in path])
     P_ave  = mean([abs2.(matter_matrices[section.layer_idx][1]) for section in path], w)
-    p = abs2.(reduce(*, first.(res))) .+ P_ave * Diagonal(1 .- decay) * P_ave'
+    # Physical order: S_total = S_N · ... · S_1 (later layers multiply from the left)
+    S_matrices = first.(res)
+    S_total = S_matrices[1]
+    for i in 2:length(S_matrices)
+        S_total = S_matrices[i] * S_total
+    end
+    p = abs2.(S_total) .+ P_ave * Diagonal(1 .- decay) * P_ave'
 end
 
 function osc_reduce(matter_matrices, path, e, propagation::Basic)
-    p = abs2.(mapreduce(section -> osc_kernel(matter_matrices[section.layer_idx]..., e, section.length), *, path))
+    # Physical order: S_total = S_N · ... · S_1 (later layers multiply from the left)
+    # Path is entry→exit, so each new section's S multiplies from the left
+    sec = first(path)
+    S = osc_kernel(matter_matrices[sec.layer_idx]..., e, sec.length)
+    for sec in Iterators.drop(path, 1)
+        S = osc_kernel(matter_matrices[sec.layer_idx]..., e, sec.length) * S
+    end
+    abs2.(S)
 end
     
 
@@ -1383,21 +1396,22 @@ function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{L
 end
 
 function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI, NSI_Standard, NSI_GMP}, anti::Bool, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
-    if anti
-        H_eff = conj.(U) * Diagonal(h) * transpose(U)
-    else
-        H_eff = U * Diagonal(h) * adjoint(U)
-    end
+    # U is already conj(U_PMNS) for antineutrinos (done by the caller in get_osc_prob), so this gives:
+    #   neutrino:     U_PMNS  × diag(h) × U_PMNS†
+    #   antineutrino: U_PMNS* × diag(h) × U_PMNS^T
+    H_eff = U * Diagonal(h) * adjoint(U)
     p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, params, eigen_method), E))
     permutedims(p, (1, 2, 4, 3))
 end
 
-# Fuse rest addition + permutedims(p, (3,4,1,2)) into one pass
+# Fuse rest addition + permutedims + flavour transpose into one pass.
+# p_raw layout: [out, in, n_E, n_L] (from propagate, where out=detected, in=source)
+# result layout: [n_E, n_L, in, out] so that P[i, j, α, β] = P(να → νβ)
 function _add_rest_and_permute(p_raw, rest)
     n1, n2, n3, n4 = size(p_raw)
     result = similar(p_raw, n3, n4, n1, n2)
     @inbounds for b in 1:n2, a in 1:n1, j in 1:n4, i in 1:n3
-        result[i, j, a, b] = p_raw[a, b, i, j] + (rest isa AbstractArray ? rest[a, b] : rest)
+        result[i, j, b, a] = p_raw[a, b, i, j] + (rest isa AbstractArray ? rest[a, b] : rest)
     end
     result
 end
@@ -1430,10 +1444,16 @@ osc_prob(E::AbstractVector, paths::VectorOfVectors{Path}, layers::StructVector{L
 
 # Returns
 `Array{T,4}` of shape `(n_E, n_L, n_flav, n_flav)` where entry
-`result[i, j, β, α]` gives the transition probability
-``P(\\nu_\\alpha \\to \\nu_\\beta)`` at energy `E[i]` and baseline/path index `j`.
+`result[i, j, α, β]` gives the transition probability
+``P(\\nu_\\alpha \\to \\nu_\\beta)`` at energy `E[i]` and baseline/path index `j`
+(3rd index = input/source flavour, 4th index = output/detected flavour).
 """
 function get_osc_prob(cfg::OscillationConfig)
+
+    # Returns P[i, j, α, β] = P(να → νβ), i.e.:
+    #   3rd index = input (source) flavour
+    #   4th index = output (detected) flavour
+    # Probability conservation: sum(P[i, j, α, :]) ≈ 1 for any input flavour α.
 
     function osc_prob(E::AbstractVector{<:Real}, L::AbstractVector{<:Real}, params::NamedTuple; anti=false)
         U, h_raw = get_matrices(cfg.flavour, cfg.eigen_method)(params)
@@ -1442,10 +1462,10 @@ function get_osc_prob(cfg::OscillationConfig)
 
         U, h, rest = select(Uc, h, cfg.states)
 
-        # propagate returns (n_flav, n_flav, n_E, n_L)
+        # propagate returns p_raw[out, in, n_E, n_L]
         p_raw = propagate(U, h, E, L, cfg.propagation)
 
-        # fuse rest addition + permutedims into (n_E, n_L, n_flav, n_flav)
+        # fuse rest addition + permutedims into P[n_E, n_L, in, out]
         return _add_rest_and_permute(p_raw, rest)
     end
 
@@ -1456,10 +1476,10 @@ function get_osc_prob(cfg::OscillationConfig)
 
         U, h, rest = select(Uc, h, cfg.states)
 
-        # propagate returns (n_flav, n_flav, n_E, n_cz)
+        # propagate returns p_raw[out, in, n_E, n_cz]
         p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti, params, cfg.eigen_method)
 
-        # fuse rest addition + permutedims into (n_E, n_cz, n_flav, n_flav)
+        # fuse rest addition + permutedims into P[n_E, n_cz, in, out]
         return _add_rest_and_permute(p_raw, rest)
     end
 
