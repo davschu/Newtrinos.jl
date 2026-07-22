@@ -805,6 +805,41 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, ma
 end
 
 """
+    multistart_profile(likelihood, priors, vars_to_scan, starts; cache_dir=nothing, map_func=nothing)
+        -> NewtrinosResult
+
+Run [`profile`](@ref) once per starting point in `starts` over the same grid, then combine
+grid-point-by-grid-point, keeping whichever start achieved the higher `log_posterior` at each
+point. Guards against the local optimizer used by `find_mle`/`find_mle_cached` (gradient-based,
+single fixed starting point) getting stuck in the wrong basin — e.g. the θ₂₃ octant degeneracy
+in atmospheric oscillation fits — for part of the grid.
+
+# Arguments
+- `likelihood`, `priors`, `vars_to_scan`: same as [`profile`](@ref).
+- `starts::AbstractVector{<:NamedTuple}`: candidate starting parameter sets to try at every grid
+  point (e.g. one per θ₂₃ octant).
+- `cache_dir`, `map_func`: passed through to each underlying `profile` call. Safe to share one
+  `cache_dir` across all starts — `find_mle_cached`'s cache key hashes `(prior, params)`, and
+  `params` differs per start, so entries never collide.
+
+# Returns
+A [`NewtrinosResult`](@ref) with the same `axes` as a single `profile` call, and `values` taken
+pointwise from whichever start had the higher `log_posterior` at each grid point.
+"""
+function multistart_profile(likelihood, priors, vars_to_scan, starts; cache_dir=nothing, map_func=nothing)
+    results = [profile(likelihood, priors, vars_to_scan, s; cache_dir=cache_dir, map_func=map_func) for s in starts]
+
+    idx = CartesianIndices(results[1].values.log_posterior)
+    best_start = map(i -> argmax([r.values.log_posterior[i] for r in results]), idx)
+
+    combined = NamedTuple(
+        key => map(i -> results[best_start[i]].values[key][i], idx)
+        for key in keys(results[1].values)
+    )
+    NewtrinosResult(axes=results[1].axes, values=combined, meta=Dict("task"=>"multistart_profile", "n_starts"=>length(starts)))
+end
+
+"""
     scan(likelihood, priors, vars_to_scan, params;
          gradient_map=false) -> NewtrinosResult
 
