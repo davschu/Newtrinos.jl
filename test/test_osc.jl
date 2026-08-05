@@ -92,17 +92,13 @@ using StaticArrays
         L = [1000.0, 5000.0]    # km
 
         P = osc.osc_prob(E, L, osc.params)
-        # Shape: (n_L, n_E, n_flav_out, n_flav_in) but returned as permuted
-        # Actually returned as (n_flav_out, n_flav_in, n_E, n_L)
-        # Wait, let me check: permutedims(p, (3, 4, 1, 2)) in the code
-        # p has shape (n_flav, n_flav, n_E, n_L) before permutation
-        # after permutedims(p, (3, 4, 1, 2)) → (n_E, n_L, n_flav_out, n_flav_in)
+        # P[n_E, n_L, in, out]: P[i,j,α,β] = P(να → νβ)
 
         @test size(P) == (length(E), length(L), 3, 3)
 
         # Probability conservation: sum over output flavours = 1
         for i in 1:length(E), j in 1:length(L), k in 1:3
-            @test sum(P[i, j, :, k]) ≈ 1.0 atol=1e-10
+            @test sum(P[i, j, k, :]) ≈ 1.0 atol=1e-10
         end
 
         # All probabilities should be between 0 and 1
@@ -125,7 +121,74 @@ using StaticArrays
         # Anti-neutrino probabilities should also conserve probability
         P_anti = osc.osc_prob(E, L, osc.params; anti=true)
         for i in 1:length(E), j in 1:length(L), k in 1:3
-            @test sum(P_anti[i, j, :, k]) ≈ 1.0 atol=1e-10
+            @test sum(P_anti[i, j, k, :]) ≈ 1.0 atol=1e-10
+        end
+    end
+
+    @testset "Antineutrino Matter Oscillations" begin
+        # Test with SI interaction and non-zero δCP to catch double-conjugation bugs
+        cfg = Newtrinos.osc.OscillationConfig(interaction=Newtrinos.osc.SI())
+        osc = Newtrinos.osc.configure(cfg)
+        earth = Newtrinos.earth_layers.configure()
+        layers = earth.compute_layers()
+        coszen = [-1.0, -0.5, -0.2]
+        paths = earth.compute_paths(coszen, layers)
+
+        E = [1.0, 5.0, 10.0]
+        params = osc.params
+
+        # Antineutrino probability conservation with matter effects
+        P_anti = osc.osc_prob(E, paths, layers, params; anti=true)
+        @test size(P_anti) == (length(E), length(coszen), 3, 3)
+        for i in 1:length(E), j in 1:length(coszen), k in 1:3
+            @test sum(P_anti[i, j, k, :]) ≈ 1.0 atol=1e-10
+        end
+        @test all(P_anti .>= -1e-10)
+        @test all(P_anti .<= 1.0 + 1e-10)
+
+        # Neutrino probability conservation with matter effects
+        P_nu = osc.osc_prob(E, paths, layers, params; anti=false)
+        for i in 1:length(E), j in 1:length(coszen), k in 1:3
+            @test sum(P_nu[i, j, k, :]) ≈ 1.0 atol=1e-10
+        end
+
+        # With non-zero δCP, neutrino and antineutrino should differ (CP violation)
+        @test !isapprox(P_nu, P_anti, atol=1e-6)
+    end
+
+    @testset "NSI Matter Oscillations" begin
+        # Exercise the double-conjugation and layer-ordering fix for each NSI
+        # interaction model, with complex (non-zero-phase) couplings switched on.
+        earth = Newtrinos.earth_layers.configure()
+        layers = earth.compute_layers()
+        coszen = [-1.0, -0.7, -0.3]
+        paths = earth.compute_paths(coszen, layers)
+        E = [2.0, 8.0, 20.0]
+
+        nsi_configs = (
+            NSI = (cfg=Newtrinos.osc.NSI(), tweak=p -> merge(p, (ε_eμ_re=0.03, ε_eμ_im=0.02, ε_μτ_re=-0.02, ε_μτ_im=0.015))),
+            NSI_Standard = (cfg=Newtrinos.osc.NSI_Standard(), tweak=p -> merge(p, (ε_eμ_abs=0.03, δ_eμ=0.7, ε_μτ_abs=0.02, δ_μτ=1.1))),
+            NSI_GMP = (cfg=Newtrinos.osc.NSI_GMP(), tweak=p -> merge(p, (ε_1=1.0, ϕ_12=0.1, ϕ_13=0.05, α_1=0.4))),
+        )
+
+        for (name, spec) in pairs(nsi_configs)
+            cfg = Newtrinos.osc.OscillationConfig(interaction=spec.cfg)
+            osc = Newtrinos.osc.configure(cfg)
+            params = spec.tweak(osc.params)
+
+            P_nu = osc.osc_prob(E, paths, layers, params; anti=false)
+            P_anti = osc.osc_prob(E, paths, layers, params; anti=true)
+
+            @testset "$name" begin
+                for i in 1:length(E), j in 1:length(coszen), k in 1:3
+                    @test sum(P_nu[i, j, k, :]) ≈ 1.0 atol=1e-8
+                    @test sum(P_anti[i, j, k, :]) ≈ 1.0 atol=1e-8
+                end
+                @test all(P_nu .>= -1e-8) && all(P_nu .<= 1.0 + 1e-8)
+                @test all(P_anti .>= -1e-8) && all(P_anti .<= 1.0 + 1e-8)
+                # Complex NSI phases should break ν/ν̄ degeneracy
+                @test !isapprox(P_nu, P_anti, atol=1e-6)
+            end
         end
     end
 
@@ -167,7 +230,7 @@ using StaticArrays
 
         # Probability conservation still holds
         for i in 1:length(E), j in 1:length(L), k in 1:3
-            @test sum(P[i, j, :, k]) ≈ 1.0 atol=1e-6
+            @test sum(P[i, j, k, :]) ≈ 1.0 atol=1e-6
         end
 
         # All probabilities in valid range
@@ -184,7 +247,7 @@ using StaticArrays
 
         # Probability conservation
         for i in 1:length(E), j in 1:length(L), k in 1:3
-            @test sum(P[i, j, :, k]) ≈ 1.0 atol=1e-6
+            @test sum(P[i, j, k, :]) ≈ 1.0 atol=1e-6
         end
 
         @test all(P .>= -1e-6)

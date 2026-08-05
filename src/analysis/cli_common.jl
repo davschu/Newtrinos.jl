@@ -1,100 +1,12 @@
 using Newtrinos
 using FileIO
 
-"""
-    configure_experiments(experiment_list) -> NamedTuple
-
-Configure a list of experiments using each experiment's built-in defaults.
-
-Looks up each experiment by name in the `Newtrinos` module (case-insensitive),
-calls its `configure()` method with no arguments, and collects the results into
-a NamedTuple keyed by the lower-cased experiment name.
-
-# Arguments
-- `experiment_list`: iterable of experiment name strings (e.g. `["deepcore",
-  "dayabay"]`).
-
-# Returns
-A `NamedTuple` mapping the experiment name to the configured
-[`Newtrinos.Experiment`](@ref) object.
-
-# Examples
-```julia
-experiments = configure_experiments(["deepcore", "dayabay"])
-# (deepcore = ..., dayabay = ...)
-```
-"""
-function configure_experiments(experiment_list)
-    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)() for exp in experiment_list)
-    return (; pairs...)
-end
-
-"""
-    configure_experiments(experiment_list, physics) -> NamedTuple
-
-Configure a list of experiments with a shared physics module override.
-
-Like the single-argument form but passes `physics` to each experiment's
-`configure(physics)` method, allowing a custom oscillation or cross-section
-configuration to be shared across all experiments.
-
-# Arguments
-- `experiment_list`: iterable of experiment name strings.
-- `physics`: a physics object (or NamedTuple of physics objects) to pass to
-  each experiment's `configure` method.
-
-# Returns
-A `NamedTuple` mapping the experiment name to the configured
-[`Newtrinos.Experiment`](@ref) object with specified physics module.
-"""
-function configure_experiments(experiment_list, physics)
-    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)(physics) for exp in experiment_list)
-    return (; pairs...)
-end
-
-"""
-    save_result(result, name)
-
-Save a [`NewtrinosResult`](@ref) to a JLD2 file.
-
-Writes `result` under the key `"result"` to `"\$(name).jld2"` in the
-current directory.
-
-# Arguments
-- `result::NewtrinosResult`: the scan or profile result to persist.
-- `name::String`: base filename (without extension).
-
-# Returns
-`nothing`.
-"""
+"""Save result to JLD2."""
 function save_result(result, name)
     FileIO.save(name * ".jld2", Dict("result" => result))
 end
 
-"""
-    plot_result(result, name, vars_to_scan; title=nothing)
-
-Plot a scan or profile result and save it as a PNG file.
-
-Renders the result using `plot!` (dispatched on [`NewtrinosResult`](@ref)),
-labels the axes from `vars_to_scan`, and saves the figure to `"\$(name).png"`.
-For a 1-D scan the y-axis is labelled `"-2ΔLLH"`; for a 2-D scan it shows
-the name of the second scanned parameter.
-
-!!! note
-    `CairoMakie` (or another Makie backend) must be loaded in the caller's
-    scope before calling this function.
-
-# Arguments
-- `result::NewtrinosResult`: output of [`scan`](@ref) or [`profile`](@ref).
-- `name::String`: base filename for the output PNG (without extension).
-- `vars_to_scan`: ordered collection whose keys are the scanned parameter names.
-- `title::Union{String,Nothing}`: optional axis title. Defaults to `nothing`
-  (no title).
-
-# Returns
-`nothing`.
-"""
+"""Plot result and save to PNG. Caller must have `using CairoMakie` in scope."""
 function plot_result(result, name, vars_to_scan; title=nothing)
     fig = Figure()
     ax = Axis(fig[1,1])
@@ -109,4 +21,65 @@ function plot_result(result, name, vars_to_scan; title=nothing)
         ax.title = title
     end
     save(name * ".png", fig)
+end
+
+
+"""
+    extract_ci(result::Newtrinos.NewtrinosResult, cl::Float64;
+               one_sided::Bool = false) -> (lower, upper)
+
+Extract confidence interval boundaries from a 1-D profile likelihood result.
+
+Computes neg2Δllh = -2 * (log_posterior - maximum(log_posterior)) and finds
+the x-values at which it crosses `threshold = quantile(Chisq(1), cl)` using
+linear interpolation between adjacent grid points.
+
+Returns (lower, upper). For one_sided parameters (abs values bounded at 0),
+the best-fit sits at the boundary so only an upper limit is physically
+meaningful: returns (0.0, upper).
+"""
+function extract_ci(result, cl; one_sided=false)
+    # Step 1: compute profile statistic
+    lp      = result.values.log_posterior         # raw 1-D array
+    max_lp  = maximum(lp)
+    neg2dlp = -2.0 .* (lp .- max_lp)             # 0 at best-fit, positive everywhere else
+
+    grid    = result.axes[1]                       # 1-D axis vector
+    thresh  = quantile(Chisq(1), cl)              # ~1.0 for 68.3%, ~2.706 for 90%
+
+    # Step 2: collect all crossing x-values via linear interpolation
+    crossings = Float64[]
+    for i in 1:(length(grid) - 1)
+        y0, y1 = neg2dlp[i], neg2dlp[i+1]
+        x0, x1 = grid[i], grid[i+1]
+        # crossing exists when the threshold is bracketed
+        if (y0 - thresh) * (y1 - thresh) <= 0
+            # linear interpolation: solve y0 + t*(y1-y0) = thresh for t in [0,1]
+            t = (thresh - y0) / (y1 - y0)
+            push!(crossings, x0 + t * (x1 - x0))
+        end
+    end
+
+    # Step 3: interpret crossings
+    if isempty(crossings)
+        # Profile never crosses threshold — sensitivity extends outside the grid
+        @warn "No CI crossing found for cl=$cl; grid may be too narrow."
+        if one_sided
+            return (0.0, grid[end])   # conservative: take grid edge as upper limit
+        else
+            return (grid[1], grid[end])
+        end
+    end
+
+    if one_sided
+        # For abs parameters: best-fit is at boundary=0, so there is no lower crossing.
+        # The interval is [0, first_crossing_above_0].
+        upper = minimum(crossings)   # take the first crossing as the upper limit
+        return (0.0, upper)
+    else
+        # Two-sided: take the outermost crossings as lower and upper
+        lower = minimum(crossings)
+        upper = maximum(crossings)
+        return (lower, upper)
+    end
 end

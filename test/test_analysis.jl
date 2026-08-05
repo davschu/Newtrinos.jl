@@ -7,6 +7,7 @@ using LinearAlgebra
 using DensityInterface
 using MeasureBase
 using ValueShapes
+using ADTypes
 
 struct MockPhysics <: Newtrinos.Physics
     params::NamedTuple
@@ -25,6 +26,14 @@ end
 struct ArgumentErrorDensity end
 DensityInterface.DensityKind(::ArgumentErrorDensity) = IsDensity()
 DensityInterface.logdensityof(::ArgumentErrorDensity, x) = throw(ArgumentError("forced"))
+
+# Bimodal in nuisance parameter :b — a global mode near b=2 (weight 0.6) and a
+# worse local mode near b=-2 (weight 0.4), used to test multistart_profile's
+# ability to recover the better mode when a single start gets stuck at the worse one.
+struct BimodalNuisanceDensity end
+DensityInterface.DensityKind(::BimodalNuisanceDensity) = IsDensity()
+DensityInterface.logdensityof(::BimodalNuisanceDensity, p) =
+    -0.5*(p.a - 1.0)^2 + log(0.6*exp(-0.5*(p.b-2.0)^2) + 0.4*exp(-0.5*(p.b+2.0)^2))
 
 @testset "Analysis Tools" begin
 
@@ -584,6 +593,28 @@ DensityInterface.logdensityof(::ArgumentErrorDensity, x) = throw(ArgumentError("
             end 
         end
 
+        @testset "multistart_profile" begin
+            # single-start local optimizer seeded near the bad mode gets stuck there;
+            # multistart_profile should recover the better mode by trying both.
+            likelihood = BimodalNuisanceDensity()
+            priors = (a=Uniform(-3.0, 3.0), b=Uniform(-4.0, 4.0))
+            start_hi = (a=0.0, b=2.0)   # seeded near the true (better) mode
+            start_lo = (a=0.0, b=-2.0)  # seeded near the worse mode
+
+            result_hi = Newtrinos.profile(likelihood, priors, OrderedDict(:a => 3), start_hi)
+            result_lo = Newtrinos.profile(likelihood, priors, OrderedDict(:a => 3), start_lo)
+
+            # confirm the scenario actually exercises two different local optima
+            @test all(result_lo.values.llh .< result_hi.values.llh .- 0.1)
+
+            result_multi = Newtrinos.multistart_profile(likelihood, priors, OrderedDict(:a => 3), [start_hi, start_lo])
+            @test result_multi isa Newtrinos.NewtrinosResult
+            @test result_multi.meta["n_starts"] == 2
+            @test result_multi.values.llh ≈ max.(result_hi.values.llh, result_lo.values.llh) atol=1e-6
+            @test result_multi.values.llh ≈ result_hi.values.llh atol=1e-6  # hi-start wins at every grid point here
+            @test result_multi.values.b ≈ result_hi.values.b atol=1e-6      # combined params come from the winning start
+        end
+
         @testset "profile fallback to scan" begin
             #fallback if all non-scanned priors are numbers, here: prior(a) = 0.0
             fwd(a, b) = MvNormal([a, b], I(2))
@@ -687,6 +718,51 @@ DensityInterface.logdensityof(::ArgumentErrorDensity, x) = throw(ArgumentError("
             @test result.axes.a[2] == bf.a
             @test result.axes.b[4] == bf.b
         end
+    end
+
+    @testset "set_ad_backend and select_ad" begin
+        Newtrinos.set_ad_backend(:forwarddiff)
+        @test Newtrinos.select_ad(3) isa ADTypes.AutoForwardDiff
+        @test Newtrinos.select_ad(30) isa ADTypes.AutoForwardDiff
+
+        Newtrinos.set_ad_backend(:polyester)
+        @test Newtrinos.select_ad(3) isa ADTypes.AutoPolyesterForwardDiff
+
+        Newtrinos.set_ad_backend(:auto)
+        @test Newtrinos.select_ad(3; threshold=12) isa ADTypes.AutoForwardDiff
+        @test Newtrinos.select_ad(30; threshold=12) isa ADTypes.AutoPolyesterForwardDiff
+
+        @test_throws ErrorException Newtrinos.set_ad_backend(:bogus)
+    end
+
+    @testset "find_mle_ext" begin
+        fwd(a, b) = MvNormal([a, b], I(2))
+        likelihood = likelihoodof(splat(fwd), [0.0, 0.0])
+        prior = distprod(a=Uniform(-3.0, 3.0), b=Uniform(-3.0, 3.0))
+        params = (a=0.5, b=-0.5)
+
+        llh, log_posterior, result, converged = Newtrinos.find_mle_ext(likelihood, prior, params)
+
+        @test converged
+        @test isfinite(llh)
+        @test isfinite(log_posterior)
+        @test abs(result.a) < 0.1
+        @test abs(result.b) < 0.1
+    end
+
+    @testset "configure_experiments" begin
+        experiments = Newtrinos.configure_experiments(["deepcore"])
+        @test haskey(experiments, :deepcore)
+        @test experiments.deepcore isa Newtrinos.Experiment
+
+        physics = (
+            osc          = Newtrinos.osc.configure(),
+            atm_flux     = Newtrinos.atm_flux.configure(),
+            earth_layers = Newtrinos.earth_layers.configure(),
+            xsec         = Newtrinos.xsec.configure(),
+        )
+        experiments2 = Newtrinos.configure_experiments(["deepcore"], physics)
+        @test haskey(experiments2, :deepcore)
     end
 
 end
