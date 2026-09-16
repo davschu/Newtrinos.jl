@@ -23,12 +23,14 @@ abstract type Experiment end
 
 export Physics, Experiment
 export NewtrinosResult, plot
+export smooth_result, make_seed_interpolants, make_merged_seed_interpolants
 export bin, rebin
 export make_init_samples, make_prior_samples, whack_a_moles, whack_many_moles
 
 include("physics/osc.jl")
 using .osc
 include("physics/barger_eigen.jl")
+include("physics/mooncake_eigen_rule.jl")
 include("physics/earth_layers.jl")
 include("physics/atm_flux.jl")
 include("physics/xsec.jl")
@@ -43,8 +45,8 @@ include("utils/helpers.jl")
 
 include("experiments/daya_bay/daya_bay_3158days/dayabay.jl")
 include("experiments/minos/minos_sterile_16e20_POT/minos.jl")
-#include("experiments/icecube/deepcore_3y_highstats_sample_b/deepcore.jl")
-include("experiments/icecube/deepcore_9y_verification_sample/deepcore.jl")
+include("experiments/icecube/deepcore_3y_highstats_sample_b/deepcore.jl")
+#include("experiments/icecube/deepcore_9y_verification_sample/deepcore.jl")
 include("experiments/super_k/sk_atm_2023/super_k.jl")
 include("experiments/icecube/upgrade_sim_2020/ic_upgrade.jl")
 include("experiments/kamland/kamland_7years/kamland.jl")
