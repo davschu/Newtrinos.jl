@@ -310,12 +310,22 @@ just draws a fresh random start from the priors via `randomize_free_params`.
 `n_particles` sets `Optim.ParticleSwarm`'s swarm size (`strategy == "pso"` only —
 `SimulatedAnnealing` is a single-trajectory method with no equivalent knob).
 
+`objective` (matches `local_find_mle`'s convention) selects what this *global* search
+stage targets: `"posterior"` (default, unchanged behavior -- `-(llh + log_prior)` over
+`prior`'s real, possibly non-flat, distributions) or `"likelihood"` (`-llh` alone, no
+prior term -- consistent with how `local_find_mle` switches to `flat_prior(prior)` under
+`objective="likelihood"`, see its docstring). Pass the same `objective` to both this
+function and the subsequent `local_find_mle` call so the seed-search and polish stages
+target the same thing; otherwise a posterior-biased seed (pulled toward high-prior-density
+regions by e.g. `Truncated(Normal)` nuisance priors or bounded NSI params) gets handed to
+a purely-likelihood-targeting local polish.
+
 `return_trace=true` additionally returns the best-objective-value-so-far at each
 generation (`Optim.f_trace(result)`), for diagnosing how many generations the global
 search actually needs before plateauing; default `false` keeps the normal single-value
 return for all existing callers.
 """
-function global_seed_search(likelihood, prior, params, strategy, global_iters, rng; n_particles=10, return_trace=false)
+function global_seed_search(likelihood, prior, params, strategy, global_iters, rng; n_particles=10, return_trace=false, objective="posterior")
     if strategy == "random"
         seeded = randomize_free_params(rng, params, prior)
         return return_trace ? (seeded, Float64[]) : seeded
@@ -326,9 +336,13 @@ function global_seed_search(likelihood, prior, params, strategy, global_iters, r
     function obj(x::AbstractVector)
         all_x = [b.is_free_mask[i] ? x[b.free_x_index[i]] : b.fixed_float[i] for i in 1:length(b.all_keys)]
         full_params = NamedTuple{b.all_keys}(Tuple(all_x))
-        llh_val   = logdensityof(likelihood, full_params)
-        prior_val = sum(logpdf(b.free_dists[j], x[j]) for j in 1:length(b.free_dists))
-        isfinite(llh_val) && isfinite(prior_val) ? -(llh_val + prior_val) : Inf
+        llh_val = logdensityof(likelihood, full_params)
+        if objective == "likelihood"
+            isfinite(llh_val) ? -llh_val : Inf
+        else
+            prior_val = sum(logpdf(b.free_dists[j], x[j]) for j in 1:length(b.free_dists))
+            isfinite(llh_val) && isfinite(prior_val) ? -(llh_val + prior_val) : Inf
+        end
     end
 
     galg = strategy == "pso" ? Optim.ParticleSwarm(lower=b.lo_vec, upper=b.hi_vec, n_particles=n_particles) :
