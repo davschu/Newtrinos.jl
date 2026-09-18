@@ -20,6 +20,19 @@
 #   --pso-particles 10 20 --global-iterations 10 20
 # gives 4 combos: (10,10), (10,20), (20,10), (20,20) -- not just the 2 "matching" pairs.
 #
+# --pso-subruns (default 1, NOT crossed factorially with the above -- a single scalar
+# multiplier applied uniformly to every combo) runs that many independent PSO sub-runs
+# per (combo, truth) task, each with its own RNG draw so they explore the parameter space
+# differently. All sub-runs for one truth point are plotted in the SAME color as a group
+# (thinner/lighter lines when pso_subruns>1), so their collective behavior is visible --
+# this is the tool for checking whether running several small/cheap PSO searches and
+# taking the best is competitive with one larger PSO search at comparable total cost
+# (e.g. compare `--pso-particles 20 --pso-subruns 5` against `--pso-particles 100`).
+# Every sub-run is saved (see "subruns" in the .jld2, keyed by truth point); the
+# best-of-pso_subruns sub-run (by log_post) also populates every flat top-level field
+# (fit_param/llh/log_post/pso_trace/etc.) exactly as the single-PSO-per-task case did,
+# so diagnostics 2-5 below are unaffected in shape, just now "best-of-N" when N>1.
+#
 # Diagnostics computed per (combo, truth) task:
 #   1. Reference-relative convergence trace: Δχ²_vs_reference(gen) = 2*(pso_trace[gen] -
 #      ref_neglogpost), compared against the truth-seeded LBFGS REFERENCE optimum
@@ -38,9 +51,9 @@
 # Diagnostics 2-5 are only saved to the .jld2 (not plotted) -- inspect them there directly.
 #
 # Usage: julia --threads=8 test_pso.jl --hypothesis ττ_μμ --n-points 10 \
-#            --pso-particles 20 40 60 --global-iterations 20 50 100
+#            --pso-particles 20 40 60 --global-iterations 20 50 100 [--pso-subruns 5]
 #
-# Output: nsi/pso_test_results/pso_test_<hypothesis>_<fluctuated|nominal>_<n>points[_<suffix>].{jld2,pdf}
+# Output: nsi/pso_test_results/pso_test_<hypothesis>_<fluctuated|nominal>_<n>points[_subruns<N>][_<suffix>].{jld2,pdf}
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
@@ -101,6 +114,11 @@ function parse_command_line()
         nargs = '+'
         default = [10, 20]
 
+        "--pso-subruns"
+        help = "Number of independent PSO sub-runs per (combo, truth) task, each with its own RNG draw (explores the parameter space differently). All sub-runs for one truth point are plotted in the same color as a group. Included in output filenames. Default 1 reproduces the single-PSO-per-task behavior exactly."
+        arg_type = Int
+        default = 1
+
         "--fluctuate-nuisances"
         help = "Additionally draw every nuisance parameter from its own prior per truth point (the \"(fluctuated) asimov\" mode) -- NSI truth is unaffected"
         action = :store_true
@@ -132,6 +150,7 @@ hypothesis_name          = args["hypothesis"]
 n_points                 = args["n-points"]
 pso_particles_list       = args["pso-particles"]
 global_iterations_list   = args["global-iterations"]
+pso_subruns              = args["pso-subruns"]
 fluctuate_nuisances_flag = args["fluctuate-nuisances"]
 vary_physics_truth_flag  = args["vary-physics-truth"]
 plateau_frac_thresh      = args["plateau-frac-thresh"]
@@ -140,6 +159,7 @@ suffix                   = args["suffix"]
 truth_mode_tag = fluctuate_nuisances_flag ? "fluctuated" : "nominal"
 output_tag = isempty(suffix) ? "$(hypothesis_name)_$(truth_mode_tag)_$(n_points)points" :
                                 "$(hypothesis_name)_$(truth_mode_tag)_$(n_points)points_$(suffix)"
+output_tag = pso_subruns == 1 ? output_tag : output_tag * "_subruns$(pso_subruns)"
 
 ### LOCAL HELPERS ###
 
@@ -288,36 +308,57 @@ Threads.@threads for k in 1:n_tasks
     combo_idx, truth_idx = phase2_tasks[k].combo_idx, phase2_tasks[k].truth_idx
     combo = combos[combo_idx]
     tp = phase1[truth_idx]
-    task_rng = Random.Xoshiro(args["seed"] + 1_000_000 + k)
 
-    t0 = time()
-    # Seeded BLIND at nominal params `p`, NOT at tp.truth_param -- global_seed_search uses
-    # its `params` argument as the free-dims x0 anchor for the PSO search (extract_bounds),
-    # so passing the truth here would warm-start (part of) the swarm exactly at the answer,
-    # trivially "recovering" it regardless of PSO settings and making this diagnostic
-    # measure almost nothing (see file header).
-    fit_param, pso_trace = global_seed_search(tp.truth_likelihood, cp_hyp, p, "pso",
-                                               combo.global_iterations, task_rng;
-                                               n_particles=combo.n_particles, return_trace=true, objective="posterior")
-    seed_elapsed = time() - t0
+    # Run `pso_subruns` independent PSO sub-runs for this (combo, truth) task, each with
+    # its own RNG stream (derived deterministically from k and the sub-run index m, so
+    # results stay reproducible regardless of thread scheduling) -- with pso_subruns==1
+    # this is exactly the previous single-PSO-per-task behavior (identical RNG draw).
+    # Every sub-run is kept (not just the best) so their COMBINED behavior as a group can
+    # be inspected (plotted all in one color per truth point -- see PLOT section below)
+    # and saved (`subruns` field below), not just the winner.
+    subruns = Vector{NamedTuple}(undef, pso_subruns)
+    for m in 1:pso_subruns
+        subrun_rng = Random.Xoshiro(args["seed"] + 1_000_000 + k * 1000 + m)
 
-    llh      = logdensityof(tp.truth_likelihood, fit_param)
-    log_post = logdensityof(PosteriorMeasure(tp.truth_likelihood, prior_dist), fit_param)
+        t0 = time()
+        # Seeded BLIND at nominal params `p`, NOT at tp.truth_param -- global_seed_search
+        # uses its `params` argument as the free-dims x0 anchor for the PSO search
+        # (extract_bounds), so passing the truth here would warm-start (part of) the
+        # swarm exactly at the answer, trivially "recovering" it regardless of PSO
+        # settings and making this diagnostic measure almost nothing (see file header).
+        fit_param, pso_trace = global_seed_search(tp.truth_likelihood, cp_hyp, p, "pso",
+                                                   combo.global_iterations, subrun_rng;
+                                                   n_particles=combo.n_particles, return_trace=true, objective="posterior")
+        seed_elapsed = time() - t0
 
-    Δχ²_optimizer_residual = 2 * (log_post - tp.ref_log_post)
-    Δχ²_recovery            = 2 * (log_post - tp.truth_log_post)
-    nsi_param_diff = Dict{Symbol,Float64}(sk => Float64(fit_param[sk]) - Float64(tp.truth_param[sk]) for sk in scan_keys)
-    plateau_gen = plateau_generation(pso_trace; frac_thresh=plateau_frac_thresh)
+        llh      = logdensityof(tp.truth_likelihood, fit_param)
+        log_post = logdensityof(PosteriorMeasure(tp.truth_likelihood, prior_dist), fit_param)
+
+        Δχ²_optimizer_residual = 2 * (log_post - tp.ref_log_post)
+        Δχ²_recovery            = 2 * (log_post - tp.truth_log_post)
+        nsi_param_diff = Dict{Symbol,Float64}(sk => Float64(fit_param[sk]) - Float64(tp.truth_param[sk]) for sk in scan_keys)
+        plateau_gen = plateau_generation(pso_trace; frac_thresh=plateau_frac_thresh)
+
+        subruns[m] = (fit_param=fit_param, llh=llh, log_post=log_post,
+                      Δχ²_optimizer_residual=Δχ²_optimizer_residual, Δχ²_recovery=Δχ²_recovery,
+                      nsi_param_diff=nsi_param_diff, plateau_gen=plateau_gen,
+                      pso_trace=pso_trace, seed_elapsed=seed_elapsed)
+    end
+
+    # Best-of-`pso_subruns` sub-run (highest log_post, NaN treated as -Inf) populates
+    # phase2[k]'s top-level fields, so every existing single-PSO-per-task consumer below
+    # (save block, plot block, summary printout) keeps working unchanged when
+    # pso_subruns==1 (where `subruns` has exactly one, trivially "best", entry).
+    best_m = argmax([isnan(r.log_post) ? -Inf : r.log_post for r in subruns])
+    best = subruns[best_m]
 
     phase2[k] = (combo_idx=combo_idx, truth_idx=truth_idx,
                  combo_label=combo_label(combo.n_particles, combo.global_iterations),
-                 fit_param=fit_param, llh=llh, log_post=log_post,
-                 Δχ²_optimizer_residual=Δχ²_optimizer_residual, Δχ²_recovery=Δχ²_recovery,
-                 nsi_param_diff=nsi_param_diff, plateau_gen=plateau_gen,
-                 pso_trace=pso_trace, seed_elapsed=seed_elapsed)
+                 best..., best_subrun_idx=best_m, subruns=subruns)
     println("  [task $k/$n_tasks] combo=$(phase2[k].combo_label) truth=$truth_idx " *
-            "log_post=$(round(log_post,digits=4)) Δχ²_optimizer_residual=$(round(Δχ²_optimizer_residual,digits=4)) " *
-            "plateau_gen=$plateau_gen elapsed=$(round(seed_elapsed,digits=1))s")
+            "best_of=$pso_subruns log_post=$(round(best.log_post,digits=4)) " *
+            "Δχ²_optimizer_residual=$(round(best.Δχ²_optimizer_residual,digits=4)) " *
+            "plateau_gen=$(best.plateau_gen) elapsed=$(round(sum(r.seed_elapsed for r in subruns),digits=1))s")
 end
 
 println("="^80)
@@ -379,12 +420,22 @@ for (c, combo) in enumerate(combos)
         "pso_trace"        => [r.pso_trace for r in rows],
         "seed_elapsed"     => [r.seed_elapsed for r in rows],
 
+        # Full per-point sub-run pool (length pso_subruns per point, best-of-them already
+        # folded into the flat fields above) -- for the "combined performance of several
+        # small PSO runs" diagnostic (see PLOT section): each point's subruns share one
+        # color in the trace plot below, so their collective spread/behavior is visible
+        # as a group instead of only the single winning trace.
+        "subruns"          => [r.subruns for r in rows],
+        "best_subrun_idx"  => [r.best_subrun_idx for r in rows],
+        "pso_subruns"      => pso_subruns,
+
         "settings" => Dict(
             "hypothesis"          => hypothesis_name,
             "n_points"             => n_points,
             "combo_label"          => combo_tag,
             "combo_n_particles"    => combo.n_particles,
             "combo_global_iterations" => combo.global_iterations,
+            "pso_subruns"          => pso_subruns,
             "fluctuate_nuisances"  => fluctuate_nuisances_flag,
             "vary_physics_truth"   => vary_physics_truth_flag,
             "plateau_frac_thresh"  => plateau_frac_thresh,
@@ -398,6 +449,7 @@ for (c, combo) in enumerate(combos)
         "settings_combo_label"         => combo_tag,
         "settings_combo_n_particles"   => combo.n_particles,
         "settings_combo_global_iterations" => combo.global_iterations,
+        "settings_pso_subruns"         => pso_subruns,
         "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
         "settings_vary_physics_truth"  => vary_physics_truth_flag,
         "settings_plateau_frac_thresh" => plateau_frac_thresh,
@@ -435,9 +487,18 @@ for (c, combo) in enumerate(combos)
         # Phase 1), NOT tp.truth_log_post (the injected truth's own posterior value) --
         # the reference is the better estimate of the actual optimum PSO is searching for.
         ref_neglogpost = -tp.ref_log_post
-        Δχ²_vs_reference = 2 .* (r.pso_trace .- ref_neglogpost)
         color = Makie.wong_colors()[mod1(r.truth_idx, 7)]
-        lines!(ax, 0:length(Δχ²_vs_reference)-1, Δχ²_vs_reference; color=(color, 0.8), linewidth=2)
+        # All pso_subruns sub-runs for this truth point share the SAME color -- with
+        # pso_subruns==1 this is exactly the previous single-line-per-truth-point plot;
+        # with pso_subruns>1, each sub-run is drawn thinner/lighter so the group reads as
+        # one color-coded cluster showing how the several independent PSO runs behave
+        # together, rather than pso_subruns opaque overlapping lines.
+        lw    = pso_subruns == 1 ? 2 : 1
+        alpha = pso_subruns == 1 ? 0.8 : 0.5
+        for sub in r.subruns
+            Δχ²_vs_reference = 2 .* (sub.pso_trace .- ref_neglogpost)
+            lines!(ax, 0:length(Δχ²_vs_reference)-1, Δχ²_vs_reference; color=(color, alpha), linewidth=lw)
+        end
     end
     hlines!(ax, [0.0]; color=:black, linestyle=:dash, linewidth=2)
 end

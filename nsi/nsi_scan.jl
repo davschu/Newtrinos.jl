@@ -217,10 +217,16 @@ if seed_strategy == "random" # Plain random draw from the (conditioned) prior --
     for s in 1:nseeds
         seed_params[s] = rand(rng, prior_dist)
     end
-elseif seed_strategy == "pso" # Short bounded PSO global search per seed (global_seed_search, from optimizer_tests_common.jl)
-    for s in 1:nseeds
-        seed_params[s] = global_seed_search(likelihood, cp_hyp, p, "pso", 30, rng; n_particles=50, objective=objective)
-    end
+elseif seed_strategy == "pso"
+    # Short bounded PSO global search per seed (global_seed_search, from
+    # optimizer_tests_common.jl) -- unlike "random"/"mle" above, PSO seeds are NOT built
+    # here: a seed built now, anchored at the nominal params `p`, would search for a good
+    # point completely independent of which grid point it's later used for (the scanned
+    # key is only overwritten AFTER the PSO search already ran, via `merge(seed_params[s],
+    # fixed_here)` in the profile task below), so the PSO search itself never actually
+    # explores near its target grid point. Instead, the profile task below runs a fresh
+    # PSO search per grid point, anchored at that point's own fixed scan-key value(s) --
+    # see its loop body for details.
 elseif seed_strategy == "mle" # Random start + a full local MLE fit per seed -- the "seed" is the fit result itself.
     # Uses local_find_mle (not Newtrinos.find_mle, which is always MAP/posterior and has no
     # objective knob) so this respects --objective the same way the "pso" branch already
@@ -279,23 +285,45 @@ println("Grid built for hypothesis '$hypothesis_name': $n_grid points, scanning 
 
 if lowercase(args["task"]) == "profile"
     # Run the local optimizer at every grid point, trying each of the `nseeds` candidate
-    # seed_params (built above in ##### seed strategy #####) and keeping whichever converges
-    # to the highest log_posterior. Uses local_find_mle (optimizer_tests_common.jl,
-    # fit_method="optim") directly instead of Newtrinos.profile/multistart_profile: their own
-    # nseeds mechanism ignores --seed-strategy, and they're built on find_mle_ext, which never
-    # reports an iteration count. Same per-point body inlined in both branches below (no
-    # helper function) -- bat_findmode's ExplicitInit strictly validates the init point
-    # against the prior's constants, so the seed's scanned key(s) must be overwritten to
-    # match this grid point's fixed value first, or it throws ArgumentError.
+    # seeds and keeping whichever converges to the highest log_posterior. Uses
+    # local_find_mle (optimizer_tests_common.jl, fit_method="optim") directly instead of
+    # Newtrinos.profile/multistart_profile: their own nseeds mechanism ignores
+    # --seed-strategy, and they're built on find_mle_ext, which never reports an
+    # iteration count. Same per-point body inlined in both branches below (no helper
+    # function) -- bat_findmode's ExplicitInit strictly validates the init point against
+    # the prior's constants, so the seed's scanned key(s) must be overwritten to match
+    # this grid point's fixed value first, or it throws ArgumentError.
     # `algorithm` is already built above in ##### seed strategy #####.
+    #
+    # Under seed_strategy=="pso", each of the `nseeds` seeds is a FRESH PSO search
+    # anchored at THIS grid point's own fixed scan-key value(s) (merge(p, fixed_here)),
+    # run right here rather than read from the pre-built `seed_params` (see the ##### seed
+    # strategy ##### block above) -- this is what makes each PSO search actually explore
+    # near its target grid point instead of the unconditioned nominal point. Each grid
+    # point gets its own RNG stream (seed_rng, seeded from args["seed"] + this point's
+    # linear index) rather than reusing the single top-level `rng`: under
+    # Threads.@threads, mutating one shared RNG object from multiple threads concurrently
+    # is unsafe, and per-point streams also keep results reproducible independent of
+    # pmap/thread scheduling order. global_seed_search consumes seed_rng progressively
+    # across the `for s in 1:nseeds` loop, so within one grid point each of the `nseeds`
+    # PSO sub-runs still draws a different random start, matching the "several
+    # independent PSO runs, keep the best" pattern used elsewhere (e.g. roundtrips.jl).
+    # Under seed_strategy=="random"/"mle", seeds are unaffected and come from the
+    # pre-built seed_params exactly as before.
 
     if use_distributed
         opt_results = @showprogress pmap(eachindex(scanpoints)) do i
             fixed_here = NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i])))
+            seed_rng = Random.Xoshiro(args["seed"] + i)
             best, best_log_post = nothing, -Inf
             t0 = time()
             for s in 1:nseeds
-                res = local_find_mle(likelihood, scanpoints[i], merge(seed_params[s], fixed_here);
+                start_param = if seed_strategy == "pso"
+                    global_seed_search(likelihood, scanpoints[i], merge(p, fixed_here), "pso", 30, seed_rng; n_particles=50, objective=objective)
+                else
+                    merge(seed_params[s], fixed_here)
+                end
+                res = local_find_mle(likelihood, scanpoints[i], start_param;
                                       fit_method="optim", algorithm=algorithm, iterations=2000,
                                       g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
                 log_post = isnan(res[2]) ? -Inf : res[2]
@@ -309,10 +337,16 @@ if lowercase(args["task"]) == "profile"
         opt_results = Vector{Any}(undef, length(scanpoints))
         @showprogress Threads.@threads for i in eachindex(scanpoints)
             fixed_here = NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i])))
+            seed_rng = Random.Xoshiro(args["seed"] + i)
             best, best_log_post = nothing, -Inf
             t0 = time()
             for s in 1:nseeds
-                res = local_find_mle(likelihood, scanpoints[i], merge(seed_params[s], fixed_here);
+                start_param = if seed_strategy == "pso"
+                    global_seed_search(likelihood, scanpoints[i], merge(p, fixed_here), "pso", 30, seed_rng; n_particles=50, objective=objective)
+                else
+                    merge(seed_params[s], fixed_here)
+                end
+                res = local_find_mle(likelihood, scanpoints[i], start_param;
                                       fit_method="optim", algorithm=algorithm, iterations=2000,
                                       g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
                 log_post = isnan(res[2]) ? -Inf : res[2]
