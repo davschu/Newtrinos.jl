@@ -89,7 +89,7 @@
 # Results (.jld2) are saved BEFORE plotting, so they survive even if plotting fails.
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, "..", "..", "Newtrinos.jl"))
+Pkg.activate(joinpath(@__DIR__, ".."))
 
 using Distributions
 using DensityInterface
@@ -109,7 +109,7 @@ using CairoMakie
 using Sobol
 using Statistics
 
-include(joinpath(@__DIR__, "optimizer_tests_common.jl"))
+include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
 
 const RESULTS_DIR = joinpath(@__DIR__, "roundtrip_results")
 
@@ -193,6 +193,11 @@ function parse_command_line()
         arg_type = Float64
         default = 0.0
 
+        "--nseeds"
+        help = "Number of independent PSO-seed + LBFGS-polish attempts per grid point (each PSO search uses a fresh RNG draw so sub-runs explore differently); keeps the attempt with the highest log_post. Default 1 reproduces the single-attempt behavior exactly."
+        arg_type = Int
+        default = 1
+
     end
     return parse_args(s)
 end
@@ -211,6 +216,7 @@ f_tol = args["f-tol"]
 x_tol = args["x-tol"]
 prior_effect_flag = args["prior-effect"]
 toydata_flag = args["toydata"]
+nseeds = args["nseeds"]
 
 args["chi2-recovery"] && args["chi2-mis-modeling"] &&
     error("--chi2-recovery and --chi2-mis-modeling are mutually exclusive -- pick one.")
@@ -221,6 +227,7 @@ data_mode_tag = toydata_flag ? "toydata" : "asimov"
 truth_mode_tag = fluctuate_nuisances_flag ? "fluctuated" : "nominal"
 objective_tag = objective == "likelihood" ? "likelihoodfit" : "posteriorfit"
 output_tag = isempty(args["suffix"]) ? "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)" : "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)_$(args["suffix"])"
+output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
 
 Δχ²_label = chi2_mode == "mis-modeling" ? "Δχ² (mis-mod)" : "Δχ² (recovery)"
 
@@ -308,6 +315,7 @@ is_2d = length(scan_keys) == 2 && !is_all
 
 println("Truth grid built for hypothesis '$hypothesis_name': $(n_grid) points, scanning $(scan_keys)")
 
+prior_dist = distprod(;cp_hyp...)
 algorithm = make_algorithm("lbfgs", step_size)
 
 ### ROUNDTRIP SCAN (PSO seed + LBFGS polish at every grid point, parallel) ###
@@ -341,14 +349,34 @@ Threads.@threads for k in 1:n_grid
     truth_posterior = PosteriorMeasure(truth_likelihood, prior_dist)
     truth_log_post = logdensityof(truth_posterior, truth_param)
 
-    start_param = global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
-    seed_elapsed = time() - t0
+    # Run `nseeds` independent PSO-seed + LBFGS-polish attempts, keeping whichever
+    # converges to the highest log_post (NaN treated as -Inf, matching do_roundtrip's own
+    # nseeds convention in optimizer_tests_common.jl). Each attempt's PSO search draws
+    # fresh from the same per-point seed_rng stream (consumed progressively across
+    # attempts), so with nseeds==1 this reproduces the previous single-attempt behavior
+    # exactly (identical RNG draw sequence).
+    best_result = nothing
+    best_log_post = -Inf
+    seed_elapsed = 0.0
+    lbfgs_elapsed = 0.0
+    for s in 1:nseeds
+        ts0 = time()
+        start_param = global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
+        this_seed_elapsed = time() - ts0
 
-    t1 = time()
-    llh, log_post, fit_param, converged, n_iters = local_find_mle(truth_likelihood, prior_dist, start_param;
-        fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
-        ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
-    lbfgs_elapsed = time() - t1
+        ts1 = time()
+        res = local_find_mle(truth_likelihood, prior_dist, start_param;
+            fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+            ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
+        this_lbfgs_elapsed = time() - ts1
+
+        log_post_s = isnan(res[2]) ? -Inf : res[2]
+        if log_post_s > best_log_post
+            best_result, best_log_post = res, log_post_s
+            seed_elapsed, lbfgs_elapsed = this_seed_elapsed, this_lbfgs_elapsed
+        end
+    end
+    llh, log_post, fit_param, converged, n_iters = best_result
 
     # χ²_recovery: pipeline-recovery diagnostic (see header comment). Always computed
     # (cheap, already have both values / one extra logdensityof call). Branches on
@@ -500,6 +528,7 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
         "chi2_mode"         => chi2_mode,
         "prior_effect"      => prior_effect_flag,
         "toydata"           => toydata_flag,
+        "nseeds"            => nseeds,
     ),
     # Same settings again, flattened to top-level scalar entries -- a nested Dict (like
     # "settings" above) shows as an opaque reference table in generic JLD2/HDF5 viewers
@@ -516,6 +545,7 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "settings_prior_effect"        => prior_effect_flag,
     "settings_toydata"             => toydata_flag,
     "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
+    "settings_nseeds"              => nseeds,
 ))
 println("Saved results to $(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"))")
 
