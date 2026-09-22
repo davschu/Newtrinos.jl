@@ -227,6 +227,17 @@ elseif seed_strategy == "pso"
     # explores near its target grid point. Instead, the profile task below runs a fresh
     # PSO search per grid point, anchored at that point's own fixed scan-key value(s) --
     # see its loop body for details.
+    #
+    # seed_params itself is never read for "pso" (see above), but it's still referenced --
+    # in a dead branch -- inside the profile task's `pmap(...) do i ... end` closure (the
+    # `else` arm of `start_param = if seed_strategy == "pso" ... else
+    # merge(seed_params[s], fixed_here) end`). Julia captures closures based on what the
+    # code mentions, not what actually runs, so under --workers>1
+    # Distributed.ClusterSerializer still has to serialize/hash `seed_params` as part of
+    # shipping that closure to workers -- and hashing a Vector{Any} with undefined
+    # (never-assigned) slots throws UndefRefError. Filling every slot with a throwaway
+    # value (never read) avoids that without changing "pso"'s actual behavior.
+    fill!(seed_params, NamedTuple())
 elseif seed_strategy == "mle" # Random start + a full local MLE fit per seed -- the "seed" is the fit result itself.
     # Uses local_find_mle (not Newtrinos.find_mle, which is always MAP/posterior and has no
     # objective knob) so this respects --objective the same way the "pso" branch already
