@@ -56,7 +56,7 @@ function parse_command_line()
         default = 25
 
         "--seed-strategy"
-        help = "seed for the optimizer - available: random, mle, pso"
+        help = "seed for the optimizer - available: random, mle, pso, smseed"
         arg_type = String
         default = "random"
 
@@ -194,6 +194,7 @@ cp_μτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_
 cp_ee_μμ = Newtrinos.condition(priors, Dict(:Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
 cp_ττ_μμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
 cp_all = deepcopy(priors)
+cp_sm = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
 
 all_cps = Dict("eμ" => cp_eμ, "eτ" => cp_eτ, "μτ" => cp_μτ, "ee_μμ" => cp_ee_μμ, "ττ_μμ" => cp_ττ_μμ, "all" => cp_all)
 hypothesis_name in keys(all_cps) || error("--hypothesis must be one of $(join(sort(collect(keys(all_cps))), ", ")), got '$hypothesis_name'")
@@ -250,8 +251,38 @@ elseif seed_strategy == "mle" # Random start + a full local MLE fit per seed -- 
                               g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
         seed_params[s] = res[3]
     end
+elseif seed_strategy == "smseed"
+    # SM-first seeding: fit the nuisance/physics parameters with every free NSI parameter
+    # of this hypothesis pinned to 0 (the SM point), then hand that fit's result -- nuisances
+    # tuned, NSI params still sitting at 0 -- on as the seed. The idea is that the systematics
+    # land at a reasonable point from the SM fit alone, so the subsequent NSI fit mostly has
+    # to tune the NSI parameters themselves rather than re-discovering good nuisance values
+    # from scratch. The SM fit doesn't depend on `s`, so it only needs to run once; it's
+    # reused for every one of the `nseeds` seeds (matching "mle"/"random"'s per-seed slot
+    # convention, just with identical contents across seeds here).
+    # `ExplicitInit` strictly validates the init point against every constant entry of
+    # `cp_sm`'s prior (its conditioned oscillation params + all 8 NSI params pinned to 0)
+    # -- `p` itself (Newtrinos.get_params's raw nominal values) doesn't necessarily agree
+    # with those constants, so every key `cp_sm` holds fixed must be forced to its exact
+    # conditioned value first, or `bat_findmode` throws `ArgumentError("Cannot set
+    # constant value to a different value")` (same issue `_fix_conditioned` solves in
+    # optimizer_tests_common.jl).
+    sm_overrides = Dict{Symbol, Float64}()
+    for k in keys(cp_sm)
+        d = cp_sm[k]
+        if d isa ValueShapes.ConstValueDist
+            sm_overrides[k] = Float64(d.value)
+        elseif d isa Number
+            sm_overrides[k] = Float64(d)
+        end
+    end
+    sm_init = merge(p, NamedTuple(sm_overrides))
+    sm_res = local_find_mle(likelihood, distprod(;cp_sm...), sm_init;
+                          fit_method="optim", algorithm=algorithm, iterations=2000,
+                          g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
+    fill!(seed_params, sm_res[3])
 else
-    error("Unknown --seed-strategy '$seed_strategy'. Available options: random, mle, pso")
+    error("Unknown --seed-strategy '$seed_strategy'. Available options: random, mle, pso, smseed")
 end
 
 
