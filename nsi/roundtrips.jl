@@ -194,9 +194,14 @@ function parse_command_line()
         default = 0.0
 
         "--nseeds"
-        help = "Number of independent PSO-seed + LBFGS-polish attempts per grid point (each PSO search uses a fresh RNG draw so sub-runs explore differently); keeps the attempt with the highest log_post. Default 1 reproduces the single-attempt behavior exactly."
+        help = "Number of independent PSO-seed + LBFGS-polish attempts per grid point (each PSO search uses a fresh RNG draw so sub-runs explore differently); keeps the attempt with the highest log_post. Default 1 reproduces the single-attempt behavior exactly. Ignored (treated as 1) under --seed-strategy smseed, which has no per-attempt randomness to exploit."
         arg_type = Int
         default = 1
+
+        "--seed-strategy"
+        help = "How to build each grid point's starting point before the LBFGS polish: pso (default -- fresh bounded PSO search per point/attempt, anchored at the truth), random (plain random draw from the hypothesis's prior per attempt), mle (random draw + a full local MLE fit per attempt -- the fit result itself is the seed), or smseed (fit the nuisance/physics parameters once per grid point with every free NSI parameter of this hypothesis pinned to 0, then use that SM fit's result -- nuisances tuned, NSI params at 0 -- as the single seed)."
+        arg_type = String
+        default = "pso"
 
     end
     return parse_args(s)
@@ -217,17 +222,20 @@ x_tol = args["x-tol"]
 prior_effect_flag = args["prior-effect"]
 toydata_flag = args["toydata"]
 nseeds = args["nseeds"]
+seed_strategy = lowercase(args["seed-strategy"])
 
 args["chi2-recovery"] && args["chi2-mis-modeling"] &&
     error("--chi2-recovery and --chi2-mis-modeling are mutually exclusive -- pick one.")
 chi2_mode = args["chi2-mis-modeling"] ? "mis-modeling" : "recovery"  # recovery is default
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
+seed_strategy in ("pso", "random", "mle", "smseed") || error("--seed-strategy must be 'pso', 'random', 'mle', or 'smseed', got '$seed_strategy'")
 
 data_mode_tag = toydata_flag ? "toydata" : "asimov"
 truth_mode_tag = fluctuate_nuisances_flag ? "fluctuated" : "nominal"
 objective_tag = objective == "likelihood" ? "likelihoodfit" : "posteriorfit"
 output_tag = isempty(args["suffix"]) ? "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)" : "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)_$(args["suffix"])"
 output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
+output_tag = seed_strategy == "pso" ? output_tag : output_tag * "_$(seed_strategy)seed"
 
 Δχ²_label = chi2_mode == "mis-modeling" ? "Δχ² (mis-mod)" : "Δχ² (recovery)"
 
@@ -279,6 +287,7 @@ cp_μτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_
 cp_ee_μμ = Newtrinos.condition(priors, Dict(:Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
 cp_ττ_μμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
 cp_all = deepcopy(priors)
+cp_sm = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
 
 all_cps = Dict("eμ" => cp_eμ, "eτ" => cp_eτ, "μτ" => cp_μτ, "ee_μμ" => cp_ee_μμ, "ττ_μμ" => cp_ττ_μμ, "all" => cp_all)
 hypothesis_name in keys(all_cps) || error("--hypothesis must be one of $(join(sort(collect(keys(all_cps))), ", ")), got '$hypothesis_name'")
@@ -318,6 +327,24 @@ println("Truth grid built for hypothesis '$hypothesis_name': $(n_grid) points, s
 prior_dist = distprod(;cp_hyp...)
 algorithm = make_algorithm("lbfgs", step_size)
 
+# `ExplicitInit` strictly validates the init point against every constant entry of
+# `cp_sm`'s prior (its conditioned oscillation/flux params + all 8 NSI params pinned to
+# 0) -- `p`/`truth_param` don't necessarily agree with those constants, so every key
+# `cp_sm` holds fixed must be forced to its exact conditioned value first, or
+# `bat_findmode` throws `ArgumentError("Cannot set constant value to a different
+# value")` (same issue `_fix_conditioned` solves in optimizer_tests_common.jl). Built
+# once here since `cp_sm` doesn't depend on the grid point.
+cp_sm_overrides = Dict{Symbol, Float64}()
+for k in keys(cp_sm)
+    d = cp_sm[k]
+    if d isa ValueShapes.ConstValueDist
+        cp_sm_overrides[k] = Float64(d.value)
+    elseif d isa Number
+        cp_sm_overrides[k] = Float64(d)
+    end
+end
+cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
+
 ### ROUNDTRIP SCAN (PSO seed + LBFGS polish at every grid point, parallel) ###
 
 results = Vector{NamedTuple}(undef, n_grid)
@@ -349,19 +376,47 @@ Threads.@threads for k in 1:n_grid
     truth_posterior = PosteriorMeasure(truth_likelihood, prior_dist)
     truth_log_post = logdensityof(truth_posterior, truth_param)
 
-    # Run `nseeds` independent PSO-seed + LBFGS-polish attempts, keeping whichever
-    # converges to the highest log_post (NaN treated as -Inf, matching do_roundtrip's own
-    # nseeds convention in optimizer_tests_common.jl). Each attempt's PSO search draws
-    # fresh from the same per-point seed_rng stream (consumed progressively across
+    # Run `nseeds` independent seed + LBFGS-polish attempts, keeping whichever converges
+    # to the highest log_post (NaN treated as -Inf, matching do_roundtrip's own nseeds
+    # convention in optimizer_tests_common.jl). Under "pso"/"random"/"mle" each attempt
+    # draws fresh from the same per-point seed_rng stream (consumed progressively across
     # attempts), so with nseeds==1 this reproduces the previous single-attempt behavior
-    # exactly (identical RNG draw sequence).
+    # exactly (identical RNG draw sequence). Under seed_strategy=="smseed" there's no
+    # per-attempt randomness -- every attempt seeds identically, so nseeds>1 only repeats
+    # the same fit (n_attempts is forced to 1 there to avoid the wasted repeats).
     best_result = nothing
     best_log_post = -Inf
     seed_elapsed = 0.0
     lbfgs_elapsed = 0.0
-    for s in 1:nseeds
+    n_attempts = seed_strategy == "smseed" ? 1 : nseeds
+    for s in 1:n_attempts
         ts0 = time()
-        start_param = global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
+        start_param = if seed_strategy == "smseed"
+            # SM-first seeding: fit the nuisance/physics parameters with every free NSI
+            # parameter pinned to 0 (the SM point) against THIS grid point's own
+            # truth-injected likelihood, then hand that fit's result -- nuisances tuned,
+            # NSI params still at 0 -- on as the seed for the main (unconstrained) fit.
+            sm_init = merge(p, cp_sm_overrides_nt)
+            sm_res = local_find_mle(truth_likelihood, distprod(;cp_sm...), sm_init;
+                fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+                ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
+            sm_res[3]
+        elseif seed_strategy == "random"
+            # Plain random draw from the (conditioned) hypothesis prior -- fixed/conditioned
+            # entries just resample their own constant.
+            rand(seed_rng, prior_dist)
+        elseif seed_strategy == "mle"
+            # Random start + a full local MLE fit against THIS grid point's own
+            # truth-injected likelihood -- the "seed" is the fit result itself (same
+            # pattern as nsi_scan.jl's "mle" strategy).
+            mle_start = rand(seed_rng, prior_dist)
+            mle_res = local_find_mle(truth_likelihood, prior_dist, mle_start;
+                fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+                ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
+            mle_res[3]
+        else
+            global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
+        end
         this_seed_elapsed = time() - ts0
 
         ts1 = time()
@@ -529,6 +584,7 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
         "prior_effect"      => prior_effect_flag,
         "toydata"           => toydata_flag,
         "nseeds"            => nseeds,
+        "seed_strategy"     => seed_strategy,
     ),
     # Same settings again, flattened to top-level scalar entries -- a nested Dict (like
     # "settings" above) shows as an opaque reference table in generic JLD2/HDF5 viewers
@@ -546,6 +602,7 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "settings_toydata"             => toydata_flag,
     "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
     "settings_nseeds"              => nseeds,
+    "settings_seed_strategy"       => seed_strategy,
 ))
 println("Saved results to $(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"))")
 
