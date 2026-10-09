@@ -400,7 +400,26 @@ Threads.@threads for k in 1:n_grid
             sm_res = local_find_mle(truth_likelihood, distprod(;cp_sm...), sm_init;
                 fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
                 ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
-            sm_res[3]
+            # The SM fit pins every NSI param exactly at 0 -- for NSI params whose prior
+            # lower bound is also 0 (ε_eμ_abs/ε_eτ_abs/ε_μτ_abs), that leaves the main
+            # fit's init point sitting exactly on a Uniform boundary. bat_findmode's
+            # PriorToNormal reparametrization maps bounded priors to an unconstrained
+            # space (e.g. probit/logit-like), and a boundary point maps to a non-finite
+            # value there. The SAME failure mode also hits any OTHER free parameter whose
+            # own optimum under the SM fit happens to land on (or at) ITS bound -- e.g.
+            # deepcore_atm_muon_scale (Uniform(0,2)) or deepcore_opt_eff_headon
+            # (Uniform(-5,2)) -- not just the NSI params, since the SM fit optimizes every
+            # free nuisance/physics parameter too. Either way the main LBFGS fit's very
+            # first line-search step hits AssertionError: isfinite(phi_c) &&
+            # isfinite(dphi_c) inside LineSearches, and local_find_mle silently returns
+            # NaN for that attempt. Nudge EVERY free parameter of cp_hyp (not just the
+            # scanned NSI keys) away from its own bound by the same ε=1e-8 extract_bounds
+            # (optimizer_tests_common.jl) already uses for exactly this reason, before
+            # handing the seed on to the main fit -- reuse extract_bounds itself rather
+            # than reimplementing its bound-finding/clamping logic.
+            b_sm = extract_bounds(cp_hyp, sm_res[3])
+            nudged = Dict(k => b_sm.x0_vec[b_sm.free_x_index[i]] for (i, k) in enumerate(b_sm.all_keys) if b_sm.is_free_mask[i])
+            merge(sm_res[3], NamedTuple(nudged))
         elseif seed_strategy == "random"
             # Plain random draw from the (conditioned) hypothesis prior -- fixed/conditioned
             # entries just resample their own constant.
