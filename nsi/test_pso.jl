@@ -508,5 +508,6 @@ combos_str = join([combo_label(c.n_particles, c.global_iterations) for c in comb
 Label(fig[0, 1:n_cols], "PSO trace diagnostics -- hypothesis=$hypothesis_name, n_points=$n_points$title_suffix, combos=$combos_str",
       fontsize=16, font=:bold)
 
-save(joinpath(RESULTS_DIR, "pso_test_$(output_tag).pdf"), fig)
+resize_to_layout!(fig)
+save(joinpath(RESULTS_DIR, "pso_test_$(output_tag).pdf"), fig; pt_per_unit=1.0)
 println("Saved plot to $(joinpath(RESULTS_DIR, "pso_test_$(output_tag).pdf"))")
