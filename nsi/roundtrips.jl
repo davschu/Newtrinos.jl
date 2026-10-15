@@ -450,6 +450,16 @@ Threads.@threads for k in 1:n_grid
             seed_elapsed, lbfgs_elapsed = this_seed_elapsed, this_lbfgs_elapsed
         end
     end
+    # If every attempt failed (log_post_s stays -Inf, same as the initial best_log_post,
+    # so the strict `>` above never fires -- e.g. the lone smseed attempt hitting
+    # local_find_mle's caught AssertionError), best_result is still `nothing` here.
+    # Fall back to the same NaN-filled failure tuple local_find_mle itself returns on a
+    # caught exception, so this grid point is recorded as a non-convergent failure
+    # instead of crashing the whole threaded scan via iterate(::Nothing).
+    if best_result === nothing
+        nan_params = NamedTuple{keys(prior_dist)}(ntuple(_ -> NaN, length(keys(prior_dist))))
+        best_result = (NaN, NaN, nan_params, false, missing)
+    end
     llh, log_post, fit_param, converged, n_iters = best_result
 
     # χ²_recovery: pipeline-recovery diagnostic (see header comment). Always computed
