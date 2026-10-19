@@ -350,9 +350,9 @@ cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
 results = Vector{NamedTuple}(undef, n_grid)
 
 println("="^80)
-println("Running $(n_grid) grid-point roundtrips on $(Threads.nthreads()) threads (Δχ²_mod mode: $chi2_mode)...")
+println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy == "smseed" ? "1" : "$nseeds") seed-attempt(s) each) on $(Threads.nthreads()) threads (Δχ²_mod mode: $chi2_mode)...")
 
-Threads.@threads for k in 1:n_grid
+for k in 1:n_grid
     seed_rng = Random.Xoshiro(1000 + k)
     truth_param = fluctuate_nuisances_flag ?
         fluctuate_nuisances(seed_rng, truths[k], cp_hyp, fluctuated_names) : truths[k]
@@ -378,18 +378,27 @@ Threads.@threads for k in 1:n_grid
 
     # Run `nseeds` independent seed + LBFGS-polish attempts, keeping whichever converges
     # to the highest log_post (NaN treated as -Inf, matching do_roundtrip's own nseeds
-    # convention in optimizer_tests_common.jl). Under "pso"/"random"/"mle" each attempt
-    # draws fresh from the same per-point seed_rng stream (consumed progressively across
-    # attempts), so with nseeds==1 this reproduces the previous single-attempt behavior
-    # exactly (identical RNG draw sequence). Under seed_strategy=="smseed" there's no
+    # convention in optimizer_tests_common.jl). Attempts are independent of each other
+    # (each builds its own start_param and polishes it separately against the SAME
+    # read-only truth_likelihood/prior_dist for this grid point) so they run concurrently
+    # via Threads.@threads, one Julia thread per attempt -- this is the actual expensive
+    # work (PSO global search + LBFGS polish), unlike the outer loop over grid points k
+    # (now serial; see the per-k iteration this is nested in), so spending the thread pool
+    # here uses it where the cost actually is, including when n_grid is small.
+    #
+    # Each attempt s gets its own Random.Xoshiro(1000*k + s) RNG rather than sharing one
+    # seed_rng advanced sequentially across s (which would be inherently serial and would
+    # race under concurrent access) -- deterministic and reproducible per (k, s), though
+    # NOT bit-identical to the old sequential-draw scheme for nseeds>1 (each attempt no
+    # longer consumes from a shared stream). Under seed_strategy=="smseed" there's no
     # per-attempt randomness -- every attempt seeds identically, so nseeds>1 only repeats
     # the same fit (n_attempts is forced to 1 there to avoid the wasted repeats).
-    best_result = nothing
-    best_log_post = -Inf
-    seed_elapsed = 0.0
-    lbfgs_elapsed = 0.0
     n_attempts = seed_strategy == "smseed" ? 1 : nseeds
-    for s in 1:n_attempts
+    attempt_results = Vector{Any}(undef, n_attempts)
+    attempt_starts = Vector{Any}(undef, n_attempts)
+    attempt_elapsed = Vector{NTuple{2,Float64}}(undef, n_attempts)
+    Threads.@threads for s in 1:n_attempts
+        attempt_rng = Random.Xoshiro(1000 * k + s)
         ts0 = time()
         start_param = if seed_strategy == "smseed"
             # SM-first seeding: fit the nuisance/physics parameters with every free NSI
@@ -423,18 +432,18 @@ Threads.@threads for k in 1:n_grid
         elseif seed_strategy == "random"
             # Plain random draw from the (conditioned) hypothesis prior -- fixed/conditioned
             # entries just resample their own constant.
-            rand(seed_rng, prior_dist)
+            rand(attempt_rng, prior_dist)
         elseif seed_strategy == "mle"
             # Random start + a full local MLE fit against THIS grid point's own
             # truth-injected likelihood -- the "seed" is the fit result itself (same
             # pattern as nsi_scan.jl's "mle" strategy).
-            mle_start = rand(seed_rng, prior_dist)
+            mle_start = rand(attempt_rng, prior_dist)
             mle_res = local_find_mle(truth_likelihood, prior_dist, mle_start;
                 fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
                 ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
             mle_res[3]
         else
-            global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
+            global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, attempt_rng; n_particles=pso_particles, objective=objective)
         end
         this_seed_elapsed = time() - ts0
 
@@ -444,21 +453,40 @@ Threads.@threads for k in 1:n_grid
             ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
         this_lbfgs_elapsed = time() - ts1
 
+        attempt_results[s] = res
+        attempt_starts[s] = start_param
+        attempt_elapsed[s] = (this_seed_elapsed, this_lbfgs_elapsed)
+    end
+
+    # Reduce the n_attempts parallel results serially: keep whichever attempt converged to
+    # the highest log_post (NaN treated as -Inf, matching do_roundtrip's own nseeds
+    # convention in optimizer_tests_common.jl), along with THAT attempt's own start_param
+    # (needed below for --chi2-mis-modeling's profile_start -- previously this picked up
+    # whichever attempt happened to run last in the s-loop, not the one that actually won,
+    # a pre-existing mismatch whenever nseeds>1 that parallelizing the loop would otherwise
+    # turn from a silent bug into a nondeterministic one). If every attempt failed (log_post
+    # stays NaN for all of them, so this never updates past the initial -Inf), fall back to
+    # the same NaN-filled failure tuple local_find_mle itself returns on a caught exception,
+    # so this grid point is recorded as a non-convergent failure instead of crashing on a
+    # `nothing` destructure below.
+    best_result = nothing
+    best_start_param = nothing
+    best_log_post = -Inf
+    seed_elapsed = 0.0
+    lbfgs_elapsed = 0.0
+    for s in 1:n_attempts
+        res = attempt_results[s]
         log_post_s = isnan(res[2]) ? -Inf : res[2]
         if log_post_s > best_log_post
             best_result, best_log_post = res, log_post_s
-            seed_elapsed, lbfgs_elapsed = this_seed_elapsed, this_lbfgs_elapsed
+            best_start_param = attempt_starts[s]
+            seed_elapsed, lbfgs_elapsed = attempt_elapsed[s]
         end
     end
-    # If every attempt failed (log_post_s stays -Inf, same as the initial best_log_post,
-    # so the strict `>` above never fires -- e.g. the lone smseed attempt hitting
-    # local_find_mle's caught AssertionError), best_result is still `nothing` here.
-    # Fall back to the same NaN-filled failure tuple local_find_mle itself returns on a
-    # caught exception, so this grid point is recorded as a non-convergent failure
-    # instead of crashing the whole threaded scan via iterate(::Nothing).
     if best_result === nothing
         nan_params = NamedTuple{keys(prior_dist)}(ntuple(_ -> NaN, length(keys(prior_dist))))
         best_result = (NaN, NaN, nan_params, false, missing)
+        best_start_param = nan_params
     end
     llh, log_post, fit_param, converged, n_iters = best_result
 
@@ -504,14 +532,16 @@ Threads.@threads for k in 1:n_grid
         fixed_vals = Dict(k => Float64(truth_param[k]) for k in scan_keys)
         cp_fixed = Newtrinos.condition(cp_hyp, fixed_vals, truth_param)
         prior_fixed = distprod(;cp_fixed...)
-        # start_param's scan-key value(s) come from the free/unconstrained PSO seed search
-        # and generally do NOT equal truth_param's -- but prior_fixed now holds scan_keys
-        # constant at the truth value, and bat_findmode's ExplicitInit strictly validates
-        # the init point against the prior's constants (same failure mode documented on
-        # controlled_truth/_fix_conditioned in optimizer_tests_common.jl). Overwrite the
-        # scan key(s) in the seed to match before fitting, or this throws ArgumentError
-        # (silently caught by local_find_mle, returning NaN log_post).
-        profile_start = merge(start_param, NamedTuple{Tuple(scan_keys)}(Tuple(fixed_vals[k] for k in scan_keys)))
+        # best_start_param's scan-key value(s) come from the free/unconstrained PSO seed
+        # search and generally do NOT equal truth_param's -- but prior_fixed now holds
+        # scan_keys constant at the truth value, and bat_findmode's ExplicitInit strictly
+        # validates the init point against the prior's constants (same failure mode
+        # documented on controlled_truth/_fix_conditioned in optimizer_tests_common.jl).
+        # Overwrite the scan key(s) in the seed to match before fitting, or this throws
+        # ArgumentError (silently caught by local_find_mle, returning NaN log_post).
+        # Uses best_start_param (the WINNING attempt's seed, tracked above), not just
+        # whichever attempt happened to run/finish last.
+        profile_start = merge(best_start_param, NamedTuple{Tuple(scan_keys)}(Tuple(fixed_vals[k] for k in scan_keys)))
         _, log_post_fixed, _, converged_fixed, _ = local_find_mle(truth_likelihood, prior_fixed, profile_start;
             fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
             ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
@@ -658,12 +688,21 @@ conv_flags = [r.converged for r in results]
 # CairoMakie's colormap interpolation ("Can't interpolate in a range where cmin == cmax").
 # Widen a degenerate range by a small symmetric epsilon so the colorbar always has a valid
 # (nonzero) span; falls back to the same (-1.0, 1.0) default when there's nothing to plot.
+#
+# The degeneracy check itself must be done in Float32, not Float64: CairoMakie casts
+# colorrange (and the plotted colors) down to Float32 internally before rendering, so two
+# Float64 values that are merely CLOSE (not bit-equal) -- e.g. 0.0028239744427... vs.
+# 0.0028239744568..., differing only ~1e-11 apart -- can still round to the exact same
+# Float32 value and silently reproduce the degenerate-range crash even though the Float64
+# `lo == hi` check above passed as "not degenerate" (confirmed: this exact pair of
+# near-but-not-equal Float64 Δχ²_mod values from a real run crashed CairoMakie's PDF
+# renderer with "Can't interpolate in a range where cmin == cmax" despite lo != hi here).
 Δχ²_converged_finite = filter(isfinite, Δχ²_all[conv_flags])
 colorrange = if isempty(Δχ²_converged_finite)
     (-1.0, 1.0)
 else
     lo, hi = extrema(Δχ²_converged_finite)
-    lo == hi ? (lo - max(abs(lo), 1.0) * 1e-3 - 1e-6, hi + max(abs(hi), 1.0) * 1e-3 + 1e-6) : (lo, hi)
+    Float32(lo) == Float32(hi) ? (lo - max(abs(lo), 1.0) * 1e-3 - 1e-6, hi + max(abs(hi), 1.0) * 1e-3 + 1e-6) : (lo, hi)
 end
 
 # Build the ordered list of NSI panel specs first (hypothesis-dependent), then append
