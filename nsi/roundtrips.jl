@@ -352,7 +352,15 @@ results = Vector{NamedTuple}(undef, n_grid)
 println("="^80)
 println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy == "smseed" ? "1" : "$nseeds") seed-attempt(s) each) on $(Threads.nthreads()) threads (Δχ²_mod mode: $chi2_mode)...")
 
-for k in 1:n_grid
+# Two nested levels of Threads.@threads: grid points k run concurrently with each other,
+# AND each k's n_attempts seed-attempts (inner loop below) run concurrently with each
+# other. Julia's task-based @threads scheduler (confirmed on this Julia version) handles
+# nested @threads correctly -- it schedules dynamically via tasks rather than statically
+# pinning one OS thread per @threads level, so this doesn't oversubscribe or deadlock the
+# way naive nested parallel-for constructs can in some other languages/runtimes. Total
+# concurrent units in flight at once is bounded by n_grid * n_attempts, resource/thread
+# budget permitting -- size --cpus-per-task/--threads accordingly for real jobs.
+Threads.@threads for k in 1:n_grid
     seed_rng = Random.Xoshiro(1000 + k)
     truth_param = fluctuate_nuisances_flag ?
         fluctuate_nuisances(seed_rng, truths[k], cp_hyp, fluctuated_names) : truths[k]
