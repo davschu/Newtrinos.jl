@@ -91,25 +91,15 @@
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 
-using Distributions
-using DensityInterface
-using BAT
-using DataStructures
-using MeasureBase
-using ADTypes
-using Newtrinos
-using FileIO
-using Accessors
-using Random
+# Driver-only packages: CLI parsing happens before we know --workers/--threads (needed to
+# decide whether/how to addprocs), and saving/plotting only ever run on the driver after
+# the scan completes -- neither needs to be loaded on worker processes.
 using ArgParse
-import Optim
-import ForwardDiff
-using ValueShapes
+using FileIO
 using CairoMakie
 using Sobol
 using Statistics
-
-include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
+using Distributed
 
 const RESULTS_DIR = joinpath(@__DIR__, "roundtrip_results")
 
@@ -203,6 +193,16 @@ function parse_command_line()
         arg_type = String
         default = "pso"
 
+        "--workers"
+        help = "Number of distributed worker processes (default: 1, no distributed -- grid points run via Threads.@threads in a single process, same as before). When >1, grid points are dispatched across worker processes via pmap, each worker internally running --threads threads across its own grid point's seed-attempts. Confirmed locally that a MODERATE number of threads per worker (e.g. 4) spread across more workers beats both a single many-threaded process (severe contention -- Julia's per-process stop-the-world GC stalls every thread together under heavy concurrent allocation) and very few many-threaded workers (reintroduces the same per-worker GC contention at smaller scale)."
+        arg_type = Int
+        default = 1
+
+        "--threads"
+        help = "Threads per worker process (only used when --workers > 1; passed to addprocs' exeflags). Ignored (and irrelevant) when --workers is 1 -- that single-process fallback path's own concurrency is fixed by whatever --threads=N the whole `julia` invocation was started with."
+        arg_type = Int
+        default = 4
+
     end
     return parse_args(s)
 end
@@ -223,6 +223,9 @@ prior_effect_flag = args["prior-effect"]
 toydata_flag = args["toydata"]
 nseeds = args["nseeds"]
 seed_strategy = lowercase(args["seed-strategy"])
+n_workers = args["workers"]
+n_threads = args["threads"]
+use_distributed = n_workers > 1
 
 args["chi2-recovery"] && args["chi2-mis-modeling"] &&
     error("--chi2-recovery and --chi2-mis-modeling are mutually exclusive -- pick one.")
@@ -238,6 +241,48 @@ output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
 output_tag = seed_strategy == "pso" ? output_tag : output_tag * "_$(seed_strategy)seed"
 
 Δχ²_label = chi2_mode == "mis-modeling" ? "Δχ² (mis-mod)" : "Δχ² (recovery)"
+
+### DISTRIBUTED WORKERS (optional) ###
+# Spawn worker processes BEFORE loading any package they'll need, then load those
+# packages via @everywhere so both the driver and every worker have them. Each worker
+# gets its own --threads=n_threads (passed through addprocs' exeflags), so grid points
+# dispatched to it (via pmap below) can still run their own seed-attempts concurrently
+# via Threads.@threads internally -- this hybrid shape (a moderate number of separate
+# processes, each multi-threaded) was confirmed locally to avoid the severe contention
+# that a single process with MANY threads hits under heavy concurrent PSO/LBFGS
+# allocation (Julia's current GC is stop-the-world PER PROCESS -- every thread in that
+# process stalls together on every GC pause; splitting into a few processes confines
+# each pause to that process's own threads only).
+if use_distributed
+    addprocs(n_workers; exeflags="--threads=$n_threads")
+end
+
+@everywhere begin
+    using Distributions
+    using DensityInterface
+    using BAT
+    using DataStructures
+    using MeasureBase
+    using ADTypes
+    using Newtrinos
+    using Random
+    import Optim
+    import ForwardDiff
+    using ValueShapes
+end
+
+# `@reset` (Accessors' macro, used below for prior overrides) must be expanded in a
+# SEPARATE top-level @everywhere block from `using Accessors` -- Julia errors with
+# "UndefVarError: @reset not defined ... binding may be too new" if both are evaluated
+# together as one atomic block (world age hasn't advanced yet to see the macro). In
+# practice `@reset` itself is only ever called on the DRIVER (the priors/`cp_*`
+# construction below never runs on a worker), but `using Accessors` still needs to be
+# loaded everywhere `optimizer_tests_common.jl`'s own code might reference it internally,
+# so keep this split defensively rather than relying on that happening to be true today.
+@everywhere begin
+    using Accessors
+    include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
+end
 
 ### PHYSICS CONFIG (mirrors optimizer_tests.jl / test_global_seed.jl) ###
 
@@ -345,22 +390,47 @@ for k in keys(cp_sm)
 end
 cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
 
+# `run_grid_point` below needs every one of these on whichever process actually executes
+# it. A plain `@everywhere function run_grid_point(k) ... end` does NOT automatically see
+# driver-side free variables the way a pmap do-block closure would -- confirmed directly:
+# referencing an un-broadcast driver variable from inside an @everywhere function throws
+# UndefVarError on the worker. Bundling everything into one NamedTuple and broadcasting it
+# ONCE (rather than ~25 individual `@everywhere x = $x` statements, or re-serializing
+# large objects like `experiments` on every one of the n_grid calls) is the simplest fix;
+# `run_grid_point` below references the global `ctx` directly (resolved to each worker's
+# own already-broadcast copy -- confirmed this does NOT re-send ctx per call). When
+# `!use_distributed`, this is just a plain global in the single process, no different from
+# today's top-level variables.
+ctx = (; experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p, algorithm,
+       nseeds, seed_strategy, lbfgs_iterations, g_tol, f_tol, x_tol, objective,
+       global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
+       fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_all, is_2d,
+       fluctuate_nuisances_flag)
+use_distributed && @everywhere ctx = $ctx
+
 ### ROUNDTRIP SCAN (PSO seed + LBFGS polish at every grid point, parallel) ###
 
-results = Vector{NamedTuple}(undef, n_grid)
-
 println("="^80)
-println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy == "smseed" ? "1" : "$nseeds") seed-attempt(s) each) on $(Threads.nthreads()) threads (Δχ²_mod mode: $chi2_mode)...")
+println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy == "smseed" ? "1" : "$nseeds") seed-attempt(s) each) on " *
+        (use_distributed ? "$n_workers workers x $n_threads threads each" : "$(Threads.nthreads()) threads") *
+        " (Δχ²_mod mode: $chi2_mode)...")
 
-# Two nested levels of Threads.@threads: grid points k run concurrently with each other,
-# AND each k's n_attempts seed-attempts (inner loop below) run concurrently with each
-# other. Julia's task-based @threads scheduler (confirmed on this Julia version) handles
-# nested @threads correctly -- it schedules dynamically via tasks rather than statically
-# pinning one OS thread per @threads level, so this doesn't oversubscribe or deadlock the
-# way naive nested parallel-for constructs can in some other languages/runtimes. Total
-# concurrent units in flight at once is bounded by n_grid * n_attempts, resource/thread
-# budget permitting -- size --cpus-per-task/--threads accordingly for real jobs.
-Threads.@threads for k in 1:n_grid
+# One grid point's full roundtrip: build its truth-injected likelihood, run n_attempts
+# independent PSO-seed + LBFGS-polish attempts CONCURRENTLY via the inner Threads.@threads
+# (one Julia thread per attempt -- this is the actual expensive work), reduce to the best
+# attempt, then (optionally) the --prior-effect and --chi2-mis-modeling extra fits.
+# Called either from pmap (--workers > 1, dispatched across worker processes, each with
+# its own --threads threads so this inner Threads.@threads still has something to use) or
+# from a plain Threads.@threads loop over k (--workers 1, today's single-process
+# behavior) -- identical body either way; only who calls it differs below. Defined via
+# @everywhere unconditionally (harmless/equivalent to a plain `function` when there are no
+# extra worker processes) so it works identically in both modes without a branch here.
+@everywhere function run_grid_point(k)
+    experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p, algorithm,
+        nseeds, seed_strategy, lbfgs_iterations, g_tol, f_tol, x_tol, objective,
+        global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
+        fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_all, is_2d,
+        fluctuate_nuisances_flag = ctx
     seed_rng = Random.Xoshiro(1000 + k)
     truth_param = fluctuate_nuisances_flag ?
         fluctuate_nuisances(seed_rng, truths[k], cp_hyp, fluctuated_names) : truths[k]
@@ -565,7 +635,7 @@ Threads.@threads for k in 1:n_grid
     # matching what the truth-vs-fit diagonal panels already plot.
     nsi_param_diff = Dict{Symbol,Float64}(k => Float64(fit_param[k]) - Float64(truth_param[k]) for k in scan_keys)
 
-    results[k] = (
+    result = (
         truth_param=truth_param, fit_param=fit_param, converged=converged,
         log_post=log_post, truth_log_post=truth_log_post,
         Δχ²_mod=Δχ²_mod, Δχ²_recovery=Δχ²_recovery, Δχ²_mis_modeling=Δχ²_mis_modeling,
@@ -584,6 +654,24 @@ Threads.@threads for k in 1:n_grid
     end
     println("  [$k/$n_grid] coord=$coord_str converged=$converged n_iters=$n_iters log_post=$(round(log_post,digits=4)) " *
             "Δχ²_mod=$(round(Δχ²_mod,digits=4)) elapsed=$(round(total_elapsed,digits=1))s")
+    return result
+end
+
+# --workers > 1: dispatch grid points across worker processes via pmap (dynamic
+# load-balancing -- handles the significant per-point cost variance seen throughout
+# testing better than Threads.@threads's static partition). Each worker still internally
+# parallelizes that point's own n_attempts seed-attempts via the inner Threads.@threads
+# inside run_grid_point, using the --threads threads it was spawned with.
+# --workers 1 (default): today's exact single-process behavior, Threads.@threads over k,
+# with results[k] assigned directly (no pmap/serialization involved).
+results = if use_distributed
+    pmap(run_grid_point, 1:n_grid)
+else
+    results_local = Vector{NamedTuple}(undef, n_grid)
+    Threads.@threads for k in 1:n_grid
+        results_local[k] = run_grid_point(k)
+    end
+    results_local
 end
 
 n_converged = count(r -> r.converged, results)
