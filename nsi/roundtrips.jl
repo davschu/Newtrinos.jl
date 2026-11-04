@@ -100,6 +100,7 @@ using CairoMakie
 using Sobol
 using Statistics
 using Distributed
+using SlurmClusterManager
 
 const RESULTS_DIR = joinpath(@__DIR__, "roundtrip_results")
 
@@ -203,6 +204,10 @@ function parse_command_line()
         arg_type = Int
         default = 4
 
+        "--multi-node"
+        help = "Spawn workers across multiple SLURM-allocated nodes (e.g. LRZ cm4_std) via SlurmClusterManager.jl instead of all on this single machine (plain addprocs(n_workers), the cm4_tiny-compatible default). Only valid when --workers > 1 AND running inside an active SLURM allocation (SLURM_JOB_ID/SLURM_JOBID and SLURM_NTASKS must be set -- this is NOT auto-detected; the flag must be passed explicitly, and the SBATCH script's own --ntasks must equal --workers exactly or this errors out before spawning anything, rather than silently using the wrong worker count. Worker count on multi-node is controlled by the SBATCH script's --ntasks, not by --workers directly -- --workers is only used here as a consistency check."
+        action = :store_true
+
     end
     return parse_args(s)
 end
@@ -225,7 +230,11 @@ nseeds = args["nseeds"]
 seed_strategy = lowercase(args["seed-strategy"])
 n_workers = args["workers"]
 n_threads = args["threads"]
+multi_node_flag = args["multi-node"]
 use_distributed = n_workers > 1
+
+multi_node_flag && !use_distributed &&
+    error("--multi-node requires --workers > 1 (got --workers $n_workers).")
 
 args["chi2-recovery"] && args["chi2-mis-modeling"] &&
     error("--chi2-recovery and --chi2-mis-modeling are mutually exclusive -- pick one.")
@@ -253,8 +262,32 @@ output_tag = seed_strategy == "pso" ? output_tag : output_tag * "_$(seed_strateg
 # allocation (Julia's current GC is stop-the-world PER PROCESS -- every thread in that
 # process stalls together on every GC pause; splitting into a few processes confines
 # each pause to that process's own threads only).
+#
+# --multi-node switches from plain addprocs(n_workers) (all workers on THIS single
+# machine -- correct for cm4_tiny) to SlurmClusterManager.jl's SlurmManager(), which
+# launches workers across every node SLURM actually allocated to this job (e.g.
+# cm4_std's multi-node jobs) via `srun ... --worker` internally. SlurmManager() takes
+# NO worker-count argument -- it reads ENV["SLURM_NTASKS"] itself (requires an active
+# SLURM allocation; SLURM_JOB_ID/SLURM_JOBID and SLURM_NTASKS must be set, or its own
+# constructor errors). Worker count is therefore fixed by the SBATCH script's own
+# --ntasks, NOT by --workers directly here -- --workers is only used as an explicit
+# consistency check below, so a mismatched SBATCH script (--ntasks != --workers) fails
+# loudly before spawning anything, rather than silently running with the wrong worker
+# count.
 if use_distributed
-    addprocs(n_workers; exeflags="--threads=$n_threads")
+    if multi_node_flag
+        slurm_ntasks_str = get(ENV, "SLURM_NTASKS", nothing)
+        slurm_ntasks_str === nothing &&
+            error("--multi-node requires an active SLURM allocation with SLURM_NTASKS set " *
+                  "(not found in ENV) -- SlurmManager() cannot be constructed outside sbatch/salloc.")
+        slurm_ntasks = parse(Int, slurm_ntasks_str)
+        slurm_ntasks == n_workers ||
+            error("--multi-node: --workers ($n_workers) must equal the SBATCH script's " *
+                  "--ntasks (SLURM_NTASKS=$slurm_ntasks) -- fix one or the other, don't let them drift.")
+        addprocs(SlurmManager(); exeflags="--threads=$n_threads")
+    else
+        addprocs(n_workers; exeflags="--threads=$n_threads")
+    end
 end
 
 @everywhere begin

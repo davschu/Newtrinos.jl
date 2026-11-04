@@ -3,6 +3,7 @@ Pkg.activate(joinpath(@__DIR__, ".."))
 
 using Distributions
 using Distributed
+using SlurmClusterManager
 using DensityInterface
 using BAT
 using DataStructures
@@ -70,6 +71,31 @@ function parse_command_line()
         arg_type = Int
         default = 1234
 
+        "--global-iterations"
+        help = "Iteration budget for the PSO global seed-search stage (only used with --seed-strategy pso)"
+        arg_type = Int
+        default = 30
+
+        "--pso-particles"
+        help = "Swarm size (n_particles) for Optim.ParticleSwarm during the global seed-search stage (only used with --seed-strategy pso)"
+        arg_type = Int
+        default = 50
+
+        "--iterations"
+        help = "Max iterations for the local LBFGS optimizer"
+        arg_type = Int
+        default = 2000
+
+        "--step-size"
+        help = "Initial step size (alphaguess) for LBFGS"
+        arg_type = Float64
+        default = 1.0
+
+        "--g-tol"
+        help = "Gradient-norm convergence tolerance"
+        arg_type = Float64
+        default = 1e-6
+
         "--workers"
         help = "Number of distributed workers (default: 1, no distributed)"
         arg_type = Int
@@ -79,6 +105,10 @@ function parse_command_line()
         help = "Number of threads per worker (only used when --workers > 1)"
         arg_type = Int
         default = 1
+
+        "--multi-node"
+        help = "Spawn workers across multiple SLURM-allocated nodes (e.g. LRZ cm4_std) via SlurmClusterManager.jl instead of all on this single machine (plain addprocs(n_workers), the cm4_tiny-compatible default). Only valid when --workers > 1 AND running inside an active SLURM allocation (SLURM_JOB_ID/SLURM_JOBID and SLURM_NTASKS must be set). Worker count on multi-node is controlled by the SBATCH script's --ntasks, not by --workers directly -- --workers is only used here as a consistency check (must equal SLURM_NTASKS exactly, or this errors out before spawning anything)."
+        action = :store_true
     end
 
     return parse_args(s)
@@ -89,18 +119,46 @@ args = parse_command_line()
 name = args["name"]
 n_workers = args["workers"]
 n_threads = args["threads"]
+multi_node_flag = args["multi-node"]
 hypothesis_name = args["hypothesis"]
 objective = args["objective"]
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
+global_iterations = args["global-iterations"]
+pso_particles = args["pso-particles"]
+lbfgs_iterations = args["iterations"]
+step_size = args["step-size"]
+g_tol = args["g-tol"]
 
 use_distributed = n_workers > 1
+multi_node_flag && !use_distributed &&
+    error("--multi-node requires --workers > 1 (got --workers $n_workers).")
 ftype = Float64
 mkpath("scan_results")
 
 map_func = nothing
 
 if use_distributed
-    addprocs(n_workers; exeflags="--threads=$n_threads")
+    # --multi-node switches from plain addprocs(n_workers) (all workers on THIS single
+    # machine -- correct for cm4_tiny) to SlurmClusterManager.jl's SlurmManager(), which
+    # launches workers across every node SLURM allocated to this job (e.g. cm4_std's
+    # multi-node jobs). SlurmManager() takes NO worker-count argument -- it reads
+    # ENV["SLURM_NTASKS"] itself (requires an active SLURM allocation). Worker count is
+    # therefore fixed by the SBATCH script's own --ntasks, NOT by --workers directly --
+    # --workers is only used as an explicit consistency check here, so a mismatched
+    # SBATCH script (--ntasks != --workers) fails loudly before spawning anything.
+    if multi_node_flag
+        slurm_ntasks_str = get(ENV, "SLURM_NTASKS", nothing)
+        slurm_ntasks_str === nothing &&
+            error("--multi-node requires an active SLURM allocation with SLURM_NTASKS set " *
+                  "(not found in ENV) -- SlurmManager() cannot be constructed outside sbatch/salloc.")
+        slurm_ntasks = parse(Int, slurm_ntasks_str)
+        slurm_ntasks == n_workers ||
+            error("--multi-node: --workers ($n_workers) must equal the SBATCH script's " *
+                  "--ntasks (SLURM_NTASKS=$slurm_ntasks) -- fix one or the other, don't let them drift.")
+        addprocs(SlurmManager(); exeflags="--threads=$n_threads")
+    else
+        addprocs(n_workers; exeflags="--threads=$n_threads")
+    end
 
     @everywhere args = $args
 
@@ -211,7 +269,7 @@ nseeds = args["nseeds"]
 seed_strategy = args["seed-strategy"]
 rng = Random.Xoshiro(args["seed"])
 prior_dist = distprod(;cp_hyp...)
-algorithm = make_algorithm("lbfgs", 1.0)
+algorithm = make_algorithm("lbfgs", step_size)
 
 seed_params = Vector{Any}(undef, nseeds)
 if seed_strategy == "random" # Plain random draw from the (conditioned) prior -- fixed/conditioned entries just resample their own constant
@@ -247,8 +305,8 @@ elseif seed_strategy == "mle" # Random start + a full local MLE fit per seed -- 
     for s in 1:nseeds
         start_param = rand(rng, prior_dist)
         res = local_find_mle(likelihood, prior_dist, start_param;
-                              fit_method="optim", algorithm=algorithm, iterations=2000,
-                              g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
+                              fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations,
+                              g_tol=g_tol, f_tol=0.0, x_tol=0.0, objective=objective)
         seed_params[s] = res[3]
     end
 elseif seed_strategy == "smseed"
@@ -278,8 +336,8 @@ elseif seed_strategy == "smseed"
     end
     sm_init = merge(p, NamedTuple(sm_overrides))
     sm_res = local_find_mle(likelihood, distprod(;cp_sm...), sm_init;
-                          fit_method="optim", algorithm=algorithm, iterations=2000,
-                          g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
+                          fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations,
+                          g_tol=g_tol, f_tol=0.0, x_tol=0.0, objective=objective)
     fill!(seed_params, sm_res[3])
 else
     error("Unknown --seed-strategy '$seed_strategy'. Available options: random, mle, pso, smseed")
@@ -361,13 +419,13 @@ if lowercase(args["task"]) == "profile"
             t0 = time()
             for s in 1:nseeds
                 start_param = if seed_strategy == "pso"
-                    global_seed_search(likelihood, scanpoints[i], merge(p, fixed_here), "pso", 30, seed_rng; n_particles=50, objective=objective)
+                    global_seed_search(likelihood, scanpoints[i], merge(p, fixed_here), "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
                 else
                     merge(seed_params[s], fixed_here)
                 end
                 res = local_find_mle(likelihood, scanpoints[i], start_param;
-                                      fit_method="optim", algorithm=algorithm, iterations=2000,
-                                      g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
+                                      fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations,
+                                      g_tol=g_tol, f_tol=0.0, x_tol=0.0, objective=objective)
                 log_post = isnan(res[2]) ? -Inf : res[2]
                 if best === nothing || log_post > best_log_post
                     best, best_log_post = res, log_post
@@ -384,13 +442,13 @@ if lowercase(args["task"]) == "profile"
             t0 = time()
             for s in 1:nseeds
                 start_param = if seed_strategy == "pso"
-                    global_seed_search(likelihood, scanpoints[i], merge(p, fixed_here), "pso", 30, seed_rng; n_particles=50, objective=objective)
+                    global_seed_search(likelihood, scanpoints[i], merge(p, fixed_here), "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
                 else
                     merge(seed_params[s], fixed_here)
                 end
                 res = local_find_mle(likelihood, scanpoints[i], start_param;
-                                      fit_method="optim", algorithm=algorithm, iterations=2000,
-                                      g_tol=1e-6, f_tol=0.0, x_tol=0.0, objective=objective)
+                                      fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations,
+                                      g_tol=g_tol, f_tol=0.0, x_tol=0.0, objective=objective)
                 log_post = isnan(res[2]) ? -Inf : res[2]
                 if best === nothing || log_post > best_log_post
                     best, best_log_post = res, log_post
