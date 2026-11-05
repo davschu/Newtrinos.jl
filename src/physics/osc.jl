@@ -14,7 +14,7 @@ export Layer
 export Path
 export Decoherent, Damping, Basic, Spray
 export All, Cut
-export Vacuum, SI, NSI
+export Vacuum, SI, NSI, NSI_Standard, NSI_GMP
 export ThreeFlavour, ThreeFlavourXYCP, Sterile, ADD
 export OscillationConfig
 export EigenMethod, DefaultEigen, decompose
@@ -222,6 +222,12 @@ Non-Standard Interactions in matter. Extends the matter Hamiltonian beyond the S
 Model Wolfenstein potential.
 """
 struct NSI <: InteractionModel end
+
+#for "standard parametrization": substracted ε_μμ from diagonal
+struct NSI_Standard <: InteractionModel end
+
+#for generalized matter potential parametrization:
+struct NSI_GMP <: InteractionModel end
 """
     SI <: InteractionModel
 
@@ -558,7 +564,7 @@ its own set of parameters (mixing angles, mass splittings, and any BSM quantitie
 A `NamedTuple` of `Symbol => Float64` (or `Vector` for shell parameters) with the nominal
 parameter values.
 """
-get_params(cfg::OscillationConfig) = get_params(cfg.flavour)
+get_params(cfg::OscillationConfig) = merge(get_params(cfg.flavour), get_params(cfg.interaction))
 """
     get_priors(cfg::OscillationConfig) -> NamedTuple
     get_priors(cfg::FlavourModel) -> NamedTuple
@@ -574,7 +580,7 @@ Delegates to the flavour-model-specific method. Priors are `Distributions.jl` ob
 # Returns
 A `NamedTuple` of `Symbol => Distribution` mapping each parameter to its prior.
 """
-get_priors(cfg::OscillationConfig) = get_priors(cfg.flavour)
+get_priors(cfg::OscillationConfig) = merge(get_priors(cfg.flavour), get_priors(cfg.interaction))
 
 function get_params(cfg::ThreeFlavour)
     params = OrderedDict()
@@ -790,6 +796,91 @@ function get_priors(cfg::NNM)    #N-Naturalness Majorana
     NamedTuple(priors)
 end
 
+#INTERACTION MODELS:
+
+get_params(::Union{Vacuum, SI}) = (;)
+get_priors(::Union{Vacuum, SI}) = (;)
+
+function get_params(cfg::NSI)
+    params = OrderedDict()
+    params[:ε_ee] = ftype(0.0)
+    params[:ε_μμ] = ftype(0.0)
+    params[:ε_ττ] = ftype(0.0)
+    params[:ε_eμ_re] = ftype(0.0)
+    params[:ε_eμ_im] = ftype(0.0)
+    params[:ε_eτ_re] = ftype(0.0)
+    params[:ε_eτ_im] = ftype(0.0)
+    params[:ε_μτ_re] = ftype(0.0)
+    params[:ε_μτ_im] = ftype(0.0)
+    NamedTuple(params)
+end 
+
+function get_priors(cfg::NSI)
+    priors = OrderedDict()
+    priors[:ε_ee] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_μμ] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_ττ] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eμ_re] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eμ_im] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eτ_re] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eτ_im] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_μτ_re] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_μτ_im] = Uniform(-ftype(1), ftype(1))
+    NamedTuple(priors)
+end
+
+function get_params(cfg::NSI_Standard)
+    params = OrderedDict()
+    params[:Δ_eμ] = ftype(0.0)
+    params[:Δ_τμ] = ftype(0.0)
+    params[:ε_eμ_abs] = ftype(0.0)
+    params[:δ_eμ] = ftype(0.0)
+    params[:ε_eτ_abs] = ftype(0.0)
+    params[:δ_eτ] = ftype(0.0)
+    params[:ε_μτ_abs] = ftype(0.0)
+    params[:δ_μτ] = ftype(0.0)
+    NamedTuple(params)
+end 
+
+function get_priors(cfg::NSI_Standard)
+    priors = OrderedDict()
+    priors[:Δ_eμ] = Uniform(-ftype(1), ftype(1))
+    priors[:Δ_τμ] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_eμ_abs] = Uniform(ftype(0), ftype(1))
+    priors[:δ_eμ] = Uniform(-ftype(π), ftype(π))
+    priors[:ε_eτ_abs] = Uniform(ftype(0), ftype(1))
+    priors[:δ_eτ] = Uniform(-ftype(π), ftype(π))
+    priors[:ε_μτ_abs] = Uniform(ftype(0), ftype(1))
+    priors[:δ_μτ] = Uniform(-ftype(π), ftype(π))
+    NamedTuple(priors)
+end
+
+function get_params(cfg::NSI_GMP)
+    params = OrderedDict()
+    params[:α_1] = ftype(0.0)
+    params[:α_2] = ftype(0.0)
+    params[:ϕ_12] = ftype(0.0)
+    params[:ϕ_13] = ftype(0.0)
+    params[:ϕ_23] = ftype(0.0)
+    params[:δ_NS] = ftype(0.0)
+    params[:ε_1] = ftype(0.0)
+    params[:ε_2] = ftype(0.0)
+    NamedTuple(params)
+end
+
+function get_priors(cfg::NSI_GMP)
+    priors = OrderedDict()
+    priors[:α_1] = Uniform(-ftype(π), ftype(π))
+    priors[:α_2] = Uniform(-ftype(π), ftype(π))
+    priors[:ϕ_12] = Uniform(-ftype(π), ftype(π))
+    priors[:ϕ_13] = Uniform(-ftype(π), ftype(π))
+    priors[:ϕ_23] = Uniform(-ftype(π), ftype(π))
+    priors[:δ_NS] = Uniform(-ftype(π), ftype(π))
+    priors[:ε_1] = Uniform(-ftype(1), ftype(1))
+    priors[:ε_2] = Uniform(-ftype(1), ftype(1))
+    NamedTuple(priors)
+end
+
 """
     get_PMNS(params) -> SMatrix{3,3}
 
@@ -925,7 +1016,7 @@ optimized one for `SMatrix{3,3}`.
 # Returns
 A tuple `(U_m, h_m)` of matter-modified eigenvectors and eigenvalues.
 """
-function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H = copy(H_eff)
     if anti
         H[1,1] -= A * layer.p_density * 2 * e * 1e9
@@ -943,7 +1034,7 @@ function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti
     tmp.vectors, tmp.values
 end
 
-function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen())
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::SI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     ve = A * e * 1e9
     if anti
         d1 = ve * (-2 * layer.p_density + layer.n_density)
@@ -958,6 +1049,199 @@ function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interactio
     tmp = decompose(H, eigen_method)
     tmp.vectors, tmp.values
 end
+
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9   
+    ε_eμ = complex(params.ε_eμ_re, params.ε_eμ_im)
+    ε_eτ = complex(params.ε_eτ_re, params.ε_eτ_im)
+    ε_μτ = complex(params.ε_μτ_re, params.ε_μτ_im)
+
+    H_NSI = a * [
+            params.ε_ee     ε_eμ            ε_eτ;
+            conj(ε_eμ)      params.ε_μμ     ε_μτ;
+            conj(ε_eτ)      conj(ε_μτ)      params.ε_ττ    
+        ]
+
+    if anti
+        H[1,1] -= A * layer.p_density * 2 * e * 1e9 
+        for i in 1:3
+            H[i,i] += A * layer.n_density * e * 1e9 
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i] 
+            end
+        end
+
+    else
+        H[1,1] += A * layer.p_density * 2 * e * 1e9
+        for i in 1:3
+            H[i,i] -= A * layer.n_density * e * 1e9
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_Standard, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9 
+    ε_eμ = params.ε_eμ_abs * cis(params.δ_eμ)
+    ε_eτ = params.ε_eτ_abs * cis(params.δ_eτ)
+    ε_μτ = params.ε_μτ_abs * cis(params.δ_μτ)
+
+    H_NSI = a * [
+        1.0 + params.Δ_eμ     ε_eμ            ε_eτ;
+        conj(ε_eμ)            0.0             ε_μτ;
+        conj(ε_eτ)            conj(ε_μτ)      params.Δ_τμ   
+    ]
+    
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate()
+        for i in 1:3
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i]  # index flip for conjugate
+            end
+        end
+    else 
+        for i in 1:3
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::NSI_GMP, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    H = copy(H_eff)
+    a= A * layer.p_density * 2 * e * 1e9 
+
+    R12 = [ cos(params.ϕ_12)   sin(params.ϕ_12)   0.0;
+            -sin(params.ϕ_12)  cos(params.ϕ_12)   0.0;
+            0.0                     0.0                     1.0]
+
+    R13 = [ cos(params.ϕ_13)   0.0     sin(params.ϕ_13);
+            0.0                     1.0     0.0;
+            -sin(params.ϕ_13)  0.0     cos(params.ϕ_13)]
+
+    R23 = [ 1.0     0.0                                                 0.0;
+            0.0     cos(params.ϕ_23)                               sin(params.ϕ_23) * cis(-params.δ_NS);
+            0.0     -sin(params.ϕ_23) * cis(params.δ_NS)      cos(params.ϕ_23)]
+
+    Q = [ cis(params.α_1)   0.0                     0.0;
+          0.0                     cis(params.α_2)   0.0;
+          0.0                     0.0                     cis(-(params.α_1 + params.α_2))]
+
+    D = a * [params.ε_1    0.0                 0.0;
+              0.0               params.ε_2     0.0;
+              0.0               0.0                 0.0]
+
+    U = R12 * R13 * R23
+    H_NSI = Q * U * D * U' * Q'
+
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate()
+        for i in 1:3
+            for j in 1:3
+                H[i,j] -= H_NSI[j,i]  # index flip for conjugate 
+            end
+        end
+    else 
+        for i in 1:3
+            for j in 1:3
+                H[i,j] += H_NSI[i,j]
+            end
+        end
+    end
+    
+    H = Hermitian(H)
+    tmp=decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+    ε_eμ = complex(params.ε_eμ_re, params.ε_eμ_im)
+    ε_eτ = complex(params.ε_eτ_re, params.ε_eτ_im)
+    ε_μτ = complex(params.ε_μτ_re, params.ε_μτ_im)
+
+    H_NSI = a * @SMatrix [
+        params.ε_ee     ε_eμ          ε_eτ;
+        conj(ε_eμ)      params.ε_μμ   ε_μτ;
+        conj(ε_eτ)      conj(ε_μτ)    params.ε_ττ
+    ]
+        
+    ve = A * e * 1e9
+    if anti
+        d1 = ve * (-2 * layer.p_density + layer.n_density)
+        dn = ve * layer.n_density
+        H_NSI = -1 * conj(H_NSI)
+    else
+        d1 = ve * (2 * layer.p_density - layer.n_density)
+        dn = ve * (-layer.n_density)
+    end
+    z=zero(d1)
+    H_mat = @SMatrix [d1 z z; z dn z; z z dn]
+    H = Hermitian(H_eff + H_mat + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_Standard, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+    ε_eμ = params.ε_eμ_abs * cis(params.δ_eμ)
+    ε_eτ = params.ε_eτ_abs * cis(params.δ_eτ)
+    ε_μτ = params.ε_μτ_abs * cis(params.δ_μτ)
+
+    H_NSI = a * @SMatrix [
+        1 + params.Δ_eμ   ε_eμ          ε_eτ;
+        conj(ε_eμ)        0.0           ε_μτ;
+        conj(ε_eτ)        conj(ε_μτ)    params.Δ_τμ
+    ]
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate() 
+        H_NSI = -1 * conj(H_NSI)
+    end
+    H = Hermitian(H_eff + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+function compute_matter_matrices(H_eff::SMatrix{3,3}, e, layer, anti, interaction::NSI_GMP, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    a = A * layer.p_density * 2 * e * 1e9
+    
+    R12 = SMatrix{3,3}(cos(params.ϕ_12), -sin(params.ϕ_12), 0.0, sin(params.ϕ_12), cos(params.ϕ_12), 0.0, 0.0, 0.0, 1.0)
+    R13 = SMatrix{3,3}(cos(params.ϕ_13), 0.0, -sin(params.ϕ_13), 0.0, 1.0, 0.0, sin(params.ϕ_13), 0.0, cos(params.ϕ_13))
+    R23 = SMatrix{3,3}(1.0, 0.0, 0.0, 0.0, cos(params.ϕ_23), -sin(params.ϕ_23) * cis(-params.δ_NS), 0.0, sin(params.ϕ_23) * cis(params.δ_NS), cos(params.ϕ_23))
+    U = R12 * R13 * R23
+    Q = SMatrix{3,3}(cis(params.α_1), 0.0, 0.0, 0.0, cis(params.α_2), 0.0, 0.0, 0.0, cis(-(params.α_1 + params.α_2)))
+    D = a * SMatrix{3,3}(params.ε_1, 0.0, 0.0, 0.0, params.ε_2, 0.0, 0.0, 0.0, 0.0)
+    H_NSI = Q * U * D * U' * Q'
+
+    #H(ν) = H_vac + H_NSI ; H(̄ν) = [H_vac - H_NSI]* 
+    if anti 
+        #H_vac is already conjugated in propagate()
+        H_NSI = -1 * conj(H_NSI)
+    end
+    H = Hermitian(H_eff + H_NSI)
+    tmp = decompose(H, eigen_method)
+    tmp.vectors, tmp.values
+end
+
+# SI has no parameters: allow calls without `params` (used by the solar code and others)
+compute_matter_matrices(H_eff::AbstractMatrix{<:Number}, e, layer, anti, interaction::SI, eigen_method::EigenMethod=DefaultEigen()) =
+    compute_matter_matrices(H_eff, e, layer, anti, interaction, (;), eigen_method)
 
 # --- Spray (ray-to-spray) averaging helpers ---
 
@@ -1230,19 +1514,25 @@ density-matrix evolution (for [`Decoherent`](@ref)).
 - `anti::Bool`: `true` for antineutrinos.
 - `propagation::PropagationModel`: propagation model.
 - `interaction::InteractionModel`: matter interaction model.
+- `params::NamedTuple`: model parameters (contains parameters for the interaction model).
 - `eigen_method::EigenMethod`: eigendecomposition algorithm.
 
 # Returns
 An `Array` of shape `(n_flav, n_flav, n_paths)` with ``P_{\\beta\\alpha}`` for each path.
 """
-function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping}, interaction, eigen_method::EigenMethod=DefaultEigen())
-    matter_matrices = [compute_matter_matrices(H_eff, e, layer, anti, interaction, eigen_method) for layer in layers]
+function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping}, interaction, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    matter_matrices = [compute_matter_matrices(H_eff, e, layer, anti, interaction, params, eigen_method) for layer in layers]
     p = stack(map(path -> osc_reduce(matter_matrices, path, e, propagation), paths))
 end
 
 
-function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction, eigen_method::EigenMethod=DefaultEigen())
-    matter_matrices = [compute_matter_matrices(H_eff, e, layer, anti, interaction, eigen_method) for layer in layers]
+# SI has no parameters: `params` can be omitted
+matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Union{Basic, Damping, Decoherent}, interaction::SI, eigen_method::EigenMethod=DefaultEigen()) =
+    matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, (;), eigen_method)
+
+
+function matter_osc_per_e(H_eff, e, layers, paths, anti, propagation::Decoherent, interaction, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
+    matter_matrices = [compute_matter_matrices(H_eff, e, layer, anti, interaction, params, eigen_method) for layer in layers]
     n = size(H_eff, 1)
     RT = real(eltype(H_eff))
     CT = eltype(H_eff)
@@ -1432,17 +1722,17 @@ end
 
 # Basic / Damping: write every (E, path) probability matrix straight into p_raw[out, in, E, path]
 # (one allocation), instead of stacking per energy, stacking over energies and permuting.
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Union{Basic, Damping}, interaction::Union{SI, NSI}, anti::Bool, eigen_method::EigenMethod=DefaultEigen())
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Union{Basic, Damping}, interaction::Union{SI, NSI, NSI_Standard, NSI_GMP}, anti::Bool, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H_eff = U * Diagonal(h) * adjoint(U)
-    mm1 = [compute_matter_matrices(H_eff, first(E), layer, anti, interaction, eigen_method) for layer in layers]
+    mm1 = [compute_matter_matrices(H_eff, first(E), layer, anti, interaction, params, eigen_method) for layer in layers]
     P1 = osc_reduce(mm1, first(paths), first(E), propagation)
     p = Array{eltype(P1)}(undef, size(P1)..., length(E), length(paths))
-    _fill_matter!(p, H_eff, E, layers, paths, anti, propagation, interaction, eigen_method)
+    _fill_matter!(p, H_eff, E, layers, paths, anti, propagation, interaction, params, eigen_method)
 end
 
-function _fill_matter!(p, H_eff, E, layers, paths, anti, propagation, interaction, eigen_method)
+function _fill_matter!(p, H_eff, E, layers, paths, anti, propagation, interaction, params, eigen_method)
     for (ie, e) in enumerate(E)
-        matter_matrices = [compute_matter_matrices(H_eff, e, layer, anti, interaction, eigen_method) for layer in layers]
+        matter_matrices = [compute_matter_matrices(H_eff, e, layer, anti, interaction, params, eigen_method) for layer in layers]
         for (ip, path) in enumerate(paths)
             @views p[:, :, ie, ip] .= osc_reduce(matter_matrices, path, e, propagation)
         end
@@ -1450,14 +1740,18 @@ function _fill_matter!(p, H_eff, E, layers, paths, anti, propagation, interactio
     p
 end
 
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI}, anti::Bool, eigen_method::EigenMethod=DefaultEigen())
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::Union{SI, NSI, NSI_Standard, NSI_GMP}, anti::Bool, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     # U is already conj(U_PMNS) for antineutrinos, so this gives:
     #   neutrino:     U_PMNS  × diag(h) × U_PMNS†
     #   antineutrino: U_PMNS* × diag(h) × U_PMNS^T
     H_eff = U * Diagonal(h) * adjoint(U)
-    p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, eigen_method), E))
+    p = stack(map(e -> matter_osc_per_e(H_eff, e, layers, paths, anti, propagation, interaction, params, eigen_method), E))
     permutedims(p, (1, 2, 4, 3))
 end
+
+# SI has no parameters: `params` can be omitted
+propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::PropagationModel, interaction::SI, anti::Bool, eigen_method::EigenMethod=DefaultEigen()) =
+    propagate(U, h, E, paths, layers, propagation, interaction, anti, (;), eigen_method)
 
 # Per-section dL/dh for Spray: only the first (atmosphere) section of each path depends on the
 # production height; see the comment in the Spray `propagate`.
@@ -1479,7 +1773,7 @@ function _spray_dldh(paths, layers)
     end
 end
 
-function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Spray, interaction::Union{SI, NSI}, anti::Bool, eigen_method::EigenMethod=DefaultEigen())
+function propagate(U, h, E, paths::VectorOfVectors{Path}, layers::StructVector{Layer}, propagation::Spray, interaction::Union{SI, NSI}, anti::Bool, params::NamedTuple, eigen_method::EigenMethod=DefaultEigen())
     H_eff = U * Diagonal(h) * adjoint(U)
     # Production height: only first (atmosphere) section varies.
     # dL/dh = 1/cos(α) where α is the angle between the path and the radial
@@ -1612,7 +1906,7 @@ function _osc_prob(cfg, E::AbstractVector{<:Real}, paths::VectorOfVectors{Path},
     U, h, rest = select(Uc, h, cfg.states)
 
     # propagate returns p_raw[out, in, n_E, n_cz]
-    p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti, cfg.eigen_method)
+    p_raw = propagate(U, h, E, paths, layers, cfg.propagation, cfg.interaction, anti, params, cfg.eigen_method)
 
     # fuse rest addition + permutedims into P[n_E, n_cz, in, out]
     return _add_rest_and_permute(p_raw, rest)
