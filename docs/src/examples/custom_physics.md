@@ -85,4 +85,4 @@ plot!(ax, result)
 fig 
 ```
 
-![png](custom_physics_example_likelihood_plot.png)
+![png](custom_physics_likelihood_plot.png)

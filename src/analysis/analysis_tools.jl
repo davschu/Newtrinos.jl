@@ -8,6 +8,7 @@ import PolyesterForwardDiff
 using BAT
 using Optimization
 using OptimizationLBFGSB
+import Optim
 using IterTools
 using DataStructures
 using ADTypes
@@ -24,7 +25,69 @@ using Logging
 using ProgressMeter
 using Dates
 using LibGit2
+import Mooncake
+import Random
+using Interpolations
+using Statistics
 using ..Newtrinos
+
+const AD_BACKEND = Ref{Symbol}(:auto)
+
+"""
+    set_ad_backend(backend::Symbol)
+
+Set the global AD backend. Valid values: `:auto`, `:forwarddiff`, `:polyester`, `:mooncake`.
+"""
+function set_ad_backend(backend::Symbol)
+    backend in (:auto, :forwarddiff, :polyester, :mooncake) || error("Unknown AD backend: $backend. Choose from: auto, forwarddiff, polyester, mooncake")
+    AD_BACKEND[] = backend
+end
+
+"""
+    select_ad(n_params; threshold=12)
+
+Choose AD backend for gradient-based optimization based on the global setting
+(see [`set_ad_backend`](@ref)).
+
+- `:auto` — ForwardDiff for ≤ threshold params, PolyesterForwardDiff otherwise
+- `:forwarddiff` — standard chunked ForwardDiff
+- `:polyester` — threaded chunked ForwardDiff (PolyesterForwardDiff)
+- `:mooncake` — reverse-mode AD via Mooncake (constant overhead, lower memory)
+"""
+function select_ad(n_params; threshold=12)
+    backend = AD_BACKEND[]
+    if backend == :auto
+        return n_params > threshold ? AutoPolyesterForwardDiff() : AutoForwardDiff()
+    elseif backend == :forwarddiff
+        return AutoForwardDiff()
+    elseif backend == :polyester
+        return AutoPolyesterForwardDiff()
+    elseif backend == :mooncake
+        return AutoMooncake(Mooncake.Config())
+    end
+end
+
+# AD backend is set via set_ad_backend() + set_batcontext(ad = select_ad(n))
+# Do NOT set a hardcoded default here — it overrides user selection
+
+# ── Experiment Configuration ───────────────────────────────────────
+
+"""
+    configure_experiments(experiment_list)
+    configure_experiments(experiment_list, physics)
+
+Construct a NamedTuple of configured experiments from a list of experiment name strings.
+Optionally pass a shared `physics` override.
+"""
+function configure_experiments(experiment_list)
+    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)() for exp in experiment_list)
+    return (; pairs...)
+end
+
+function configure_experiments(experiment_list, physics)
+    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)(physics) for exp in experiment_list)
+    return (; pairs...)
+end
 
 adsel = AutoForwardDiff()
 set_batcontext(ad = adsel)
@@ -614,6 +677,104 @@ function find_mle(likelihood, prior, params; adsel = AutoPolyesterForwardDiff())
     end
 end
 
+"""
+    find_mle_ext(likelihood, prior, params; g_tol=1e-6, maxiters=2000)
+
+Like [`find_mle`](@ref) but bypasses BAT entirely. Uses `Optim.Fminbox(LBFGS(m=20))`
+with bounds derived directly from the prior distributions and ForwardDiff gradients.
+More robust for combined fits where one experiment dominates the gradient.
+
+Parameters with `ConstValueDist` (or a raw number) in the prior are treated as fixed
+and excluded from the optimization. All other parameters are optimized with bounds
+`[minimum(d), maximum(d)]` from their prior distribution (Uniform/Truncated give finite
+bounds; Normal gives ±Inf, which Fminbox treats as unconstrained).
+"""
+function find_mle_ext(likelihood, prior, params; g_tol=1e-6, maxiters=2000)
+    all_keys = tuple(keys(prior)...)
+    n = length(all_keys)
+
+    # Separate fixed (ConstValueDist or raw Number) from free params
+    is_free_mask  = Vector{Bool}(undef, n)
+    fixed_float   = Vector{Float64}(undef, n)  # sentinel 0.0 for free slots
+    free_x_index  = Vector{Int}(undef, n)       # free_x_index[i] = position in x vector (0 if fixed)
+    free_dists    = Any[]
+    lo_vec        = Float64[]
+    hi_vec        = Float64[]
+    x0_vec        = Float64[]
+    n_free        = 0
+
+    for (i, k) in enumerate(all_keys)
+        d = prior[k]
+        if d isa ValueShapes.ConstValueDist
+            is_free_mask[i]  = false
+            fixed_float[i]   = Float64(d.value)
+            free_x_index[i]  = 0
+        elseif d isa Number
+            is_free_mask[i]  = false
+            fixed_float[i]   = Float64(d)
+            free_x_index[i]  = 0
+        else
+            n_free          += 1
+            is_free_mask[i]  = true
+            fixed_float[i]   = 0.0
+            free_x_index[i]  = n_free
+            push!(free_dists, d)
+            lo = Float64(minimum(d))
+            hi = Float64(maximum(d))
+            push!(lo_vec, lo)
+            push!(hi_vec, hi)
+            θ0   = Float64(params[k])
+            ε    = 1e-8
+            lo_s = isfinite(lo) ? lo + ε : θ0 - 1e10
+            hi_s = isfinite(hi) ? hi - ε : θ0 + 1e10
+            push!(x0_vec, clamp(θ0, lo_s, hi_s))
+        end
+    end
+
+    function obj(x::AbstractVector{T}) where T
+        all_x = [is_free_mask[i] ? x[free_x_index[i]] : T(fixed_float[i]) for i in 1:n]
+        full_params = NamedTuple{all_keys}(Tuple(all_x))
+        llh_val   = logdensityof(likelihood, full_params)
+        prior_val = sum(logpdf(free_dists[j], x[j]) for j in 1:n_free)
+        return -(llh_val + prior_val)
+    end
+
+    msg = "Running Optimization (ext) for point"
+    for (i, k) in enumerate(all_keys)
+        is_free_mask[i] || (msg *= " $(k): $(fixed_float[i])")
+    end
+    @info msg
+
+    try
+        result = Optim.optimize(
+            obj,
+            (G, x) -> ForwardDiff.gradient!(G, obj, x),
+            lo_vec, hi_vec, x0_vec,
+            Optim.Fminbox(Optim.LBFGS(m=20)),
+            Optim.Options(g_tol=g_tol, outer_iterations=maxiters)
+        )
+
+        x_opt      = Optim.minimizer(result)
+        opt_params = NamedTuple{all_keys}(Tuple(
+            is_free_mask[i] ? x_opt[free_x_index[i]] : fixed_float[i] for i in 1:n
+        ))
+
+        converged = Optim.converged(result)
+        converged || @warn "Optimizer (ext) did not converge (iters=$(Optim.iterations(result)), g_residual=$(Optim.g_residual(result)))"
+
+        llh      = logdensityof(likelihood, opt_params)
+        log_post = -(Optim.minimum(result))
+        return llh, log_post, opt_params, converged
+    catch e
+        if e isa ArgumentError
+            nan_params = NamedTuple{all_keys}(ntuple(_ -> NaN, n))
+            return NaN, NaN, nan_params, false
+        else
+            rethrow(e)
+        end
+    end
+end
+
 # Cache key of a fit. ContentHashes cannot serialise `Char`, which every `MvNormal` prior contains (the `uplo` field of its
 # Cholesky factor, e.g. in the correlated solar-flux prior `solar_norms`): such priors are hashed with their multivariate
 # normals replaced by mean and covariance. Priors without them keep their previous keys.
@@ -741,7 +902,7 @@ function generate_scanpoints(vars_to_scan, priors)
         scanpoints[i] = make_prior(mesh[i])
     end
 
-    values, scanpoints
+    values, scanpoints, vec(mesh)
 end
 
 """
@@ -786,6 +947,65 @@ function assemble_profile_results(opt_results, result_size)
     NamedTuple(s)
 end
 
+"""
+    randomize_params(rng, params, prior)
+
+Sample free parameters from their prior distributions to create randomized starting points.
+Parameters fixed via `ConstValueDist` are left unchanged.
+"""
+function randomize_params(rng, params, prior)
+    p = deepcopy(params)
+    for key in keys(p)
+        d = prior[key]
+        if !(d isa ValueShapes.ConstValueDist)
+            @reset p[key] = rand(rng, d)
+        end
+    end
+    return p
+end
+
+"""
+    _sequential_order(grid_shape, center_linear)
+
+Compute a BFS traversal order of grid points (as linear indices) starting from `center_linear`,
+walking to Manhattan-adjacent neighbours. Returns `(order, parent)`:
+- `order`: vector of linear indices in visit order
+- `parent`: for each linear index, the linear index of its BFS parent (-1 for the start)
+"""
+function _sequential_order(grid_shape, center_linear::Int)
+    li = LinearIndices(grid_shape)
+    ci = CartesianIndices(grid_shape)
+    n  = prod(grid_shape)
+    nd = length(grid_shape)
+
+    visited = falses(n)
+    order   = Int[]
+    sizehint!(order, n)
+    parent  = fill(-1, n)
+
+    visited[center_linear] = true
+    push!(order, center_linear)
+    queue = [center_linear]
+    head  = 1
+
+    while head <= length(queue)
+        curr    = queue[head]; head += 1
+        curr_ci = ci[curr]
+        for d in 1:nd, delta in (-1, 1)
+            coords = ntuple(i -> i == d ? curr_ci[i] + delta : curr_ci[i], nd)
+            all(1 .<= coords .<= grid_shape) || continue
+            nb = li[CartesianIndex(coords)]
+            visited[nb] && continue
+            visited[nb]  = true
+            parent[nb]   = curr
+            push!(order, nb)
+            push!(queue, nb)
+        end
+    end
+
+    order, parent
+end
+
 # AD backend for the per-point fits of a profile scan. With the default threaded loop the threads
 # are already busy with scan points, so a threaded AD backend (Polyester) inside each fit only adds
 # contention; use plain ForwardDiff there. Otherwise (one thread, or a custom map_func such as pmap
@@ -814,15 +1034,65 @@ to override the parallelism strategy.
 # Returns
 A NamedTuple of result arrays as produced by [`assemble_profile_results`](@ref).
 """
-function _profile(likelihood, scanpoints, params, cache_dir; map_func=nothing, adsel=_profile_adsel(map_func), starts=[(;)])
-    # one fit per start (start values override `params`), keep the one with the largest log posterior
-    function do_work(i)
+function _profile(likelihood, scanpoints, params, cache_dir; map_func=nothing, adsel=_profile_adsel(map_func), starts=[(;)],
+                  nseeds=1, seed_params=nothing, sequential=false, center_linear=1)
+    # base start values of grid point i: `params`, or the per-point seeds `seed_params` if given
+    get_p(i) = isnothing(seed_params) ? params : seed_params[i]
+
+    # one fit per start (start values override the base values `p0`), keep the one with the largest log posterior
+    function fit_point(i, p0)
         # start values of parameters that are fixed at this grid point (scanned) do not matter: drop them
         free(st) = NamedTuple(k => v for (k, v) in pairs(st) if !(scanpoints[i][k] isa ValueShapes.ConstValueDist))
         sts = unique(free.(starts))
-        fits = [find_mle_cached(likelihood, scanpoints[i], merge(deepcopy(params), s), cache_dir; adsel = adsel) for s in sts]
+        fits = [find_mle_cached(likelihood, scanpoints[i], merge(deepcopy(p0), s), cache_dir; adsel = adsel) for s in sts]
         lp = [isnan(f[2]) ? -Inf : f[2] for f in fits]
         fits[argmax(lp)]
+    end
+    do_work(i) = fit_point(i, get_p(i))
+
+    if sequential
+        # Sequential warm-starting: BFS order from center_linear, each point seeded by its parent's optimised result
+        grid_shape = size(scanpoints)
+        order, parent = _sequential_order(grid_shape, center_linear)
+        opt_results_flat = Vector{Any}(undef, prod(grid_shape))
+
+        @info "Sequential profile: $(prod(grid_shape)) scan points, BFS from linear index $center_linear"
+        p_idx = ProgressMeter.Progress(prod(grid_shape))
+        for i in order
+            seed = parent[i] < 0 ? get_p(i) : opt_results_flat[parent[i]][3]
+            opt_results_flat[i] = fit_point(i, seed)
+            ProgressMeter.next!(p_idx)
+        end
+        return assemble_profile_results(opt_results_flat, grid_shape)
+    end
+
+    if nseeds > 1
+        # Multi-seed: expand each scan point into nseeds independent jobs (random start values drawn from the
+        # priors), keep the best fit (highest log posterior) per scan point
+        n_points = length(scanpoints)
+        n_jobs = n_points * nseeds
+        job_point = [mod1(j, n_points) for j in 1:n_jobs]
+        rng = Random.Xoshiro(42)
+        job_params = [randomize_params(rng, get_p(job_point[j]), scanpoints[job_point[j]]) for j in 1:n_jobs]
+        run_job(j) = fit_point(job_point[j], job_params[j])
+
+        @info "Running $n_jobs jobs ($n_points scan points × $nseeds seeds)"
+        if isnothing(map_func)
+            job_results = Vector{Any}(undef, n_jobs)
+            @showprogress Threads.@threads for j in 1:n_jobs
+                job_results[j] = run_job(j)
+            end
+        else
+            job_results = collect(map_func(run_job, collect(1:n_jobs)))
+        end
+
+        best_results = Vector{Any}(undef, n_points)
+        for i in 1:n_points
+            seed_indices = [(s - 1) * n_points + i for s in 1:nseeds]
+            posteriors = [let p = job_results[j][2]; isnan(p) ? -Inf : p end for j in seed_indices]
+            best_results[i] = job_results[seed_indices[argmax(posteriors)]]
+        end
+        return assemble_profile_results(reshape(best_results, size(scanpoints)), size(scanpoints))
     end
 
     if isnothing(map_func)
@@ -867,19 +1137,27 @@ Also collects meta data of the profile process and attaches it the returned obje
   `[(δCP = π/4,), (δCP = 3π/4,), (δCP = 5π/4,), (δCP = 7π/4,)]`: each grid point is fitted from every
   start (merged into `params`) and the fit with the largest log posterior is kept. Needed when a
   profiled parameter has several local optima (δCP, the θ₂₃ octant). Default: one start, `params`.
+- `nseeds`: with `nseeds > 1` every grid point is fitted from `nseeds` start values drawn at random from the
+  priors (see [`randomize_params`](@ref)) and the best fit is kept. Default: 1.
+- `seed_result`, `seed_results`: a [`NewtrinosResult`](@ref) (or several) of an earlier profile whose
+  smoothed best-fit parameters (see [`make_seed_interpolants`](@ref)) seed each grid point.
+- `sequential`: if `true`, scan points are fitted in BFS order from `start_from` (a NamedTuple of axis
+  values, e.g. the best fit of a previous run; default: the central grid point), each point seeded by its
+  parent's optimised result. Runs locally (`map_func` is ignored).
 
 # Returns
 A [`NewtrinosResult`](@ref) NewtrinosResult(axes, values, meta) 
 with the scan grid axes, per-point profiling results, and meta data.
 """
-function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, map_func=nothing, adsel=_profile_adsel(map_func), starts=[(;)])
+function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, map_func=nothing, adsel=_profile_adsel(map_func), starts=[(;)],
+                 nseeds=1, seed_result=nothing, seed_results=nothing, sequential=false, start_from=nothing)
     t1 = time()
     # check if there is actually any variable to be profiled over, or if they are all just Numbers
     if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
         return scan(likelihood, priors, vars_to_scan, params)
     end
 
-    values, scanpoints = generate_scanpoints(vars_to_scan, priors)
+    values, scanpoints, mesh_flat = generate_scanpoints(vars_to_scan, priors)
     if !isnothing(cache_dir)
         if isdir(cache_dir)
             @info "Reusing cache dir `$(cache_dir)`"
@@ -887,12 +1165,86 @@ function profile(likelihood, priors, vars_to_scan, params; cache_dir=nothing, ma
             mkdir(cache_dir)
         end
     end
-    res = _profile(likelihood, scanpoints, params, cache_dir; map_func=map_func, adsel=adsel, starts=starts)
+    seed_params = nothing
+    if !isnothing(seed_result)
+        itps = make_seed_interpolants(seed_result)
+        param_keys = collect(keys(itps))
+        axis_keys  = keys(seed_result.axes)
+        n_axes = length(axis_keys)
+        seed_params = [let coords = Tuple(Float64(mesh_flat[i][d]) for d in 1:n_axes)
+            merge(params, NamedTuple{Tuple(param_keys)}(itps[k](coords...) for k in param_keys))
+        end for i in eachindex(mesh_flat)]
+        @info "Using per-point seeds from smoothed result ($(length(param_keys)) params interpolated)"
+    elseif !isnothing(seed_results)
+        merged_itps = make_merged_seed_interpolants(seed_results, keys(vars_to_scan))
+        merged_keys = collect(keys(merged_itps))
+        n_axes = length(keys(vars_to_scan))
+        seed_params = [let coords = Tuple(Float64(mesh_flat[i][d]) for d in 1:n_axes)
+            nt_vals = [merged_itps[k](coords...) for k in merged_keys]
+            merge(params, NamedTuple{Tuple(merged_keys)}(nt_vals))
+        end for i in eachindex(mesh_flat)]
+        @info "Using merged per-point seeds from $(length(seed_results)) files ($(length(merged_keys)) params interpolated)"
+    end
+
+    # Determine BFS center for sequential mode
+    center_linear = div(prod(size(scanpoints)), 2) + 1  # default: near center
+    if sequential
+        if !isnothing(start_from)
+            axis_keys = collect(keys(vars_to_scan))
+            indices = [begin
+                ax = values[findfirst(==(k), collect(keys(vars_to_scan)))]
+                argmin(abs.(ax .- Float64(start_from[k])))
+            end for k in axis_keys]
+            center_linear = LinearIndices(size(scanpoints))[CartesianIndex(Tuple(indices))]
+            @info "Sequential profile: starting from grid indices $indices (nearest to start_from)"
+        else
+            @info "Sequential profile: starting from central grid point (linear index $center_linear)"
+        end
+        isnothing(map_func) || @warn "sequential=true ignores map_func (distributed workers); running locally"
+    end
+
+    res = _profile(likelihood, scanpoints, params, cache_dir; map_func=map_func, adsel=adsel, starts=starts,
+                   nseeds=nseeds, seed_params=seed_params, sequential=sequential, center_linear=center_linear)
     t2 = time()
-    meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "starts"=>starts, "exec_time"=>t2-t1, "cache_dir"=>cache_dir)
+    meta = Dict("task"=> "profile", "priors"=>priors, "vars_to_scan"=>vars_to_scan, "params"=>params, "starts"=>starts, "exec_time"=>t2-t1, "cache_dir"=>cache_dir, "nseeds"=>nseeds, "sequential"=>sequential)
     add_meta!(meta)
     axes = NamedTuple{tuple(keys(vars_to_scan)...)}(values)
     result = NewtrinosResult(axes=axes, values=res, meta=meta)
+end
+
+"""
+    multistart_profile(likelihood, priors, vars_to_scan, starts; cache_dir=nothing, map_func=nothing)
+        -> NewtrinosResult
+
+Run [`profile`](@ref) once per starting point in `starts` over the same grid, then combine
+grid-point-by-grid-point, keeping whichever start achieved the higher `log_posterior` at each
+point. Guards against the local optimizer used by `find_mle`/`find_mle_cached` (gradient-based,
+single fixed starting point) getting stuck in the wrong basin — e.g. the θ₂₃ octant degeneracy
+in atmospheric oscillation fits — for part of the grid.
+
+# Arguments
+- `likelihood`, `priors`, `vars_to_scan`: same as [`profile`](@ref).
+- `starts::AbstractVector{<:NamedTuple}`: candidate starting parameter sets to try at every grid
+  point (e.g. one per θ₂₃ octant).
+- `cache_dir`, `map_func`: passed through to each underlying `profile` call. Safe to share one
+  `cache_dir` across all starts — `find_mle_cached`'s cache key hashes `(prior, params)`, and
+  `params` differs per start, so entries never collide.
+
+# Returns
+A [`NewtrinosResult`](@ref) with the same `axes` as a single `profile` call, and `values` taken
+pointwise from whichever start had the higher `log_posterior` at each grid point.
+"""
+function multistart_profile(likelihood, priors, vars_to_scan, starts; cache_dir=nothing, map_func=nothing)
+    results = [profile(likelihood, priors, vars_to_scan, s; cache_dir=cache_dir, map_func=map_func) for s in starts]
+
+    idx = CartesianIndices(results[1].values.log_posterior)
+    best_start = map(i -> argmax([r.values.log_posterior[i] for r in results]), idx)
+
+    combined = NamedTuple(
+        key => map(i -> results[best_start[i]].values[key][i], idx)
+        for key in keys(results[1].values)
+    )
+    NewtrinosResult(axes=results[1].axes, values=combined, meta=Dict("task"=>"multistart_profile", "n_starts"=>length(starts)))
 end
 
 """
@@ -1031,4 +1383,159 @@ function add_meta!(meta)
         meta["commit_hash"] = missing
         meta["repo_clean"] = missing
     end
+end
+
+function _gaussian_blur(arr::Array, sigma::Float64)
+    sigma <= 0 && return float.(arr)
+    result = float.(arr)
+    for d in 1:ndims(arr)
+        n = size(result, d)
+        radius = min(ceil(Int, 3 * sigma), n - 1)
+        k_range = -radius:radius
+        kernel = [exp(-k^2 / (2 * sigma^2)) for k in k_range]
+        old = copy(result)
+        for idx in CartesianIndices(size(old))
+            s = 0.0; w = 0.0
+            for (ki, delta) in enumerate(k_range)
+                ni = idx[d] + delta
+                1 <= ni <= n || continue
+                nidx = CartesianIndex(ntuple(i -> i == d ? ni : idx[i], ndims(arr)))
+                s += kernel[ki] * old[nidx]
+                w += kernel[ki]
+            end
+            result[idx] = s / w
+        end
+    end
+    result
+end
+
+"""
+    smooth_result(result; outlier_threshold=10.0, gaussian_sigma=1.0)
+
+Prepare a `NewtrinosResult` for use as per-point seeds in `refine_profile`:
+
+1. Detect outlier scan points where `log_posterior` is more than `outlier_threshold` below
+   the maximum of its direct grid neighbours (indicating a failed optimisation).
+2. Replace each outlier's parameter values with the mean of its valid (non-outlier) neighbours.
+3. Apply a Gaussian blur of width `gaussian_sigma` (in grid units) to all parameter arrays.
+
+Returns a new `NewtrinosResult` with smoothed values.
+"""
+function smooth_result(result::NewtrinosResult; outlier_threshold=10.0, gaussian_sigma=1.0)
+    lp = result.values.log_posterior        # already grid-shaped
+    grid_shape = size(lp)
+    ndim = ndims(lp)
+    param_keys = [k for k in keys(result.values) if k ∉ (:llh, :log_posterior)]
+
+    # Helper: direct grid neighbours of idx (in-bounds only)
+    function neighbor_indices(idx)
+        nbrs = CartesianIndex[]
+        for d in 1:ndim, delta in (-1, 1)
+            nidx = CartesianIndex(ntuple(i -> i == d ? idx[i] + delta : idx[i], ndim))
+            checkbounds(Bool, lp, nidx) && push!(nbrs, nidx)
+        end
+        nbrs
+    end
+
+    # 1. Detect outliers
+    is_outlier = falses(grid_shape)
+    for idx in CartesianIndices(grid_shape)
+        nbrs = neighbor_indices(idx)
+        isempty(nbrs) && continue
+        lp[idx] < maximum(lp[n] for n in nbrs) - outlier_threshold && (is_outlier[idx] = true)
+    end
+    @info "smooth_result: $(count(is_outlier)) outlier(s) detected in $(prod(grid_shape)) scan points"
+
+    # 2. Replace outlier param values with mean of valid neighbours, then Gaussian-blur
+    new_params = Dict{Symbol, Vector{Float64}}()
+    for k in param_keys
+        arr = reshape(copy(float.(result.values[k])), grid_shape)
+        for idx in CartesianIndices(grid_shape)
+            is_outlier[idx] || continue
+            valid_vals = [arr[n] for n in neighbor_indices(idx) if !is_outlier[n]]
+            isempty(valid_vals) || (arr[idx] = mean(valid_vals))
+        end
+        new_params[k] = vec(_gaussian_blur(arr, gaussian_sigma))
+    end
+
+    # Also repair log_posterior at outlier points (for reference only, not used as seeds)
+    new_lp = copy(float.(lp))
+    for idx in CartesianIndices(grid_shape)
+        is_outlier[idx] || continue
+        valid_vals = [lp[n] for n in neighbor_indices(idx) if !is_outlier[n]]
+        isempty(valid_vals) || (new_lp[idx] = mean(valid_vals))
+    end
+
+    new_values = NamedTuple{keys(result.values)}(
+        [k == :log_posterior ? new_lp :
+         k == :llh           ? result.values.llh :
+         new_params[k]
+         for k in keys(result.values)])
+    meta = merge(result.meta, Dict("smoothed"=>true,
+                                   "outlier_threshold"=>outlier_threshold,
+                                   "gaussian_sigma"=>gaussian_sigma))
+    NewtrinosResult(axes=result.axes, values=new_values, meta=meta)
+end
+
+"""
+    make_seed_interpolants(result)
+
+Build a linear interpolant (with linear extrapolation outside the grid) for each
+optimised parameter in `result`, indexed by the scan axis values.
+Returns a `Dict{Symbol, AbstractExtrapolation}`.
+"""
+function make_seed_interpolants(result::NewtrinosResult)
+    axis_vals = Tuple(collect(Float64, v) for v in values(result.axes))
+    grid_shape = size(result.values.log_posterior)
+    param_keys = [k for k in keys(result.values) if k ∉ (:llh, :log_posterior)]
+    itps = Dict{Symbol, Any}()
+    for k in param_keys
+        arr = Float64.(reshape(result.values[k], grid_shape))
+        itp = interpolate(axis_vals, arr, Gridded(Linear()))
+        itps[k] = extrapolate(itp, Linear())
+    end
+    itps
+end
+
+"""
+    make_merged_seed_interpolants(seed_results, joint_axis_keys)
+
+Build merged per-parameter seed evaluators from multiple `NewtrinosResult` files.
+
+For each parameter:
+- Present in one file: use that file's interpolant.
+- Present in multiple files: evaluate each and take the mean.
+
+`joint_axis_keys`: the scan axis symbols of the new joint scan (e.g. `keys(vars_to_scan)`).
+Source files scanned over a subset of these axes are handled via coordinate projection.
+
+Returns a `Dict{Symbol, Function}` where each function takes `(coords...)` positional
+coordinates aligned to `joint_axis_keys`.
+"""
+function make_merged_seed_interpolants(
+    seed_results::AbstractVector,
+    joint_axis_keys
+)
+    joint_keys = collect(joint_axis_keys)
+    source_groups = map(seed_results) do r
+        src_keys = collect(keys(r.axes))
+        idxs = [findfirst(==(ak), joint_keys) for ak in src_keys]
+        bad = findfirst(isnothing, idxs)
+        isnothing(bad) || error("Seed file axis $(src_keys[bad]) not in joint axes $joint_keys")
+        (idxs, make_seed_interpolants(r))
+    end
+
+    all_param_keys = unique(reduce(vcat, [collect(keys(sg[2])) for sg in source_groups]))
+
+    merged = Dict{Symbol, Function}()
+    for k in all_param_keys
+        sources_k = [(idxs, itps[k]) for (idxs, itps) in source_groups if haskey(itps, k)]
+        if length(sources_k) == 1
+            (idxs, itp) = sources_k[1]
+            merged[k] = (coords...) -> itp(coords[idxs]...)
+        else
+            merged[k] = (coords...) -> mean(itp(coords[idxs]...) for (idxs, itp) in sources_k)
+        end
+    end
+    merged
 end

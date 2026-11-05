@@ -9,7 +9,7 @@ include("../src/analysis/cli_common.jl")
 @testset "CLI Common" begin
 
     @testset "configure_experiments (defaults)" begin
-        experiments = configure_experiments(["dayabay"])
+        experiments = Newtrinos.configure_experiments(["dayabay"])
         @test haskey(experiments, :dayabay)
         @test experiments.dayabay isa Newtrinos.Experiment
     end
@@ -18,7 +18,7 @@ include("../src/analysis/cli_common.jl")
         osc = Newtrinos.osc.configure()
         osc_mod = @reset osc.params.θ₁₂ = 0.3   # differs from default ~0.588
         physics = (osc = osc_mod,)
-        experiments = configure_experiments(["dayabay"], physics)
+        experiments = Newtrinos.configure_experiments(["dayabay"], physics)
         @test experiments.dayabay isa Newtrinos.Experiment
         @test experiments.dayabay.physics.osc.params.θ₁₂ ≈ 0.3
     end

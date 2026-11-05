@@ -24,6 +24,13 @@ The package is written in Julia. If you're not yet familiar with Julia and want 
 - there also exists a [MATLAB-Python-Julia cheatsheet](https://cheatsheets.quantecon.org/)
 - this [article](https://www.stochasticlifestyle.com/why-numba-and-cython-are-not-substitutes-for-julia/) explains how Julia adresses several fundamental challenges inherent to scientific high-performance computing
 
+## Julia programming language
+
+The package is written in Julia. If you're not yet familiar with Julia and want to learn more about the language, here are a few resources to get started:
+- the [Julia Website](https://julialang.org/) offers many links to introductory videos and written tutorials. 
+- there also exists a [MATLAB-Python-Julia cheatsheet](https://cheatsheets.quantecon.org/)
+- this [article](https://www.stochasticlifestyle.com/why-numba-and-cython-are-not-substitutes-for-julia/) explains how Julia adresses several fundamental challenges inherent to scientific high-performance computing
+
 ## References
 
 Software paper:

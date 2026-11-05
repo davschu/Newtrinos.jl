@@ -5,3 +5,6 @@
 .DS_Store
 texput.log
 __pycache__/
+*.pdf
+*.jld2
+LocalPreferences.toml
