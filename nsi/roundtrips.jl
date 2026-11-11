@@ -380,7 +380,7 @@ nsi_param_names = (:Δ_eμ, :Δ_τμ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :�
 # prior (no natural 1σ concept, no band).
 nuisance_names = (
     :atm_flux_delta_spectral_index, :atm_flux_nuenuebar_sigma, :atm_flux_nuenumu_sigma,
-    :atm_flux_numunumubar_sigma, :atm_flux_updown_sigma, :atm_flux_uphorizonzal_sigma,
+    :atm_flux_numunumubar_sigma, :atm_flux_updown_sigma, :atm_flux_uphorizontal_sigma,
     :deepcore_atm_muon_scale, :deepcore_ice_absorption, :deepcore_ice_scattering,
     :deepcore_lifetime, :deepcore_opt_eff_headon, :deepcore_opt_eff_lateral,
     :deepcore_opt_eff_overall, :nc_norm, :nutau_cc_norm,
