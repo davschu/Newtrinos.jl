@@ -1,7 +1,8 @@
-#this file is for testing different optimizer settings for the nsi analysis via roundtrips with injected truths
+# Tests different optimizer settings via roundtrips with injected truths. Physics, experiments, priors and the
+# hypotheses come from a setup file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl); this script is model-independent.
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, "..", "..", "Newtrinos.jl"))
+Pkg.activate(joinpath(@__DIR__, "..", ".."))
 
 using Distributions
 using Distributed
@@ -29,15 +30,15 @@ function parse_command_line()
     s = ArgParseSettings()
 
     @add_arg_table s begin
-        "--experiments"
-        help = "List of experiments to run"
-        nargs = '+'
-        default = ["deepcore"]
+        "--setup"
+        help = "Setup file defining the physics, experiments, priors and hypotheses (it defines setup(; ftype) -- see nsi/setups/nsi_deepcore_3y.jl for the format)"
+        arg_type = String
+        required = true
 
         "--hypotheses"
-        help = "Subset of hypotheses to run, by name: eμ, eτ, μτ, ee_μμ, ττ_μμ, all. Space-separated; default runs all 6. Note 'all' here selects the single cp_all hypothesis (every NSI param free), not \"every hypothesis\" -- omit --hypotheses entirely to run all 6."
-        nargs = '+'
-        default = ["eμ", "eτ", "μτ", "ee_μμ", "ττ_μμ", "all"]
+        help = "Subset of the setup's hypotheses to run, by name, space-separated; default (flag omitted) runs all of them, in the order the setup lists them."
+        nargs = '*'
+        default = String[]
 
         "--name"
         help = "Name for outputs"
@@ -55,13 +56,15 @@ function parse_command_line()
         default = 1234
 
         "--truth-mode"
-        help = "How injected truths are generated: controlled (default -- only the hypothesis's free NSI parameter(s) [+ theta23/deltam31 if --vary-physics-truth] are drawn randomly, everything else pinned at nominal values) or random (every free parameter, including all nuisances, drawn randomly from its prior)"
+        help = "How injected truths are generated: controlled (default -- only the hypothesis's tested parameter(s) [+ the --vary-truth-params] are drawn randomly, everything else pinned at nominal values) or random (every free parameter, including all nuisances, drawn randomly from its prior)"
         arg_type = String
         default = "controlled"
 
-        "--vary-physics-truth"
-        help = "In --truth-mode controlled, also draw theta23's and deltam31's truths randomly from their priors instead of pinning them at their nominal values. No effect in --truth-mode random (they already vary there)."
-        action = :store_true
+        "--vary-truth-params"
+        help = "In --truth-mode controlled, also draw the truths of these parameters randomly from their priors instead of pinning them at their nominal values, e.g. --vary-truth-params θ₂₃ Δm²₃₁. No effect in --truth-mode random (all free parameters already vary there)."
+        arg_type = String
+        nargs = '*'
+        default = String[]
 
         "--data-mode"
         help = "Injected-data mode: asimov (expected values) or toy (Poisson-fluctuated)"
@@ -157,7 +160,7 @@ name           = args["name"]
 n_truths       = args["n-truths"]
 data_mode      = lowercase(args["data-mode"])
 truth_mode     = lowercase(args["truth-mode"])
-vary_physics   = args["vary-physics-truth"]
+vary_truth_params = Tuple(Symbol.(args["vary-truth-params"]))
 fit_method     = lowercase(args["fit-method"])
 optimizer_name = lowercase(args["optimizer"])
 objective      = lowercase(args["objective"])
@@ -183,22 +186,6 @@ truth_mode in ("controlled", "random") || error("--truth-mode must be 'controlle
 
 algorithm = make_algorithm(optimizer_name, step_size)
 
-### PHYSICS CONFIG ###
-
-function configure_physics()
-    osc = Newtrinos.osc.configure(
-        Newtrinos.osc.OscillationConfig(
-            flavour     = Newtrinos.osc.ThreeFlavour(),
-            interaction = Newtrinos.osc.NSI_Standard()
-        )
-    )
-    atm_flux     = Newtrinos.atm_flux.configure()
-    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
-    xsec         = Newtrinos.xsec.configure()
-    physics      = (; osc, atm_flux, earth_layers, xsec)
-    (; deepcore = Newtrinos.deepcore_3y.configure(physics))
-end
-
 # Set up distributed workers if requested
 if use_distributed
     addprocs(n_workers; exeflags="--threads=$n_threads")
@@ -219,56 +206,29 @@ if use_distributed
     end
 end
 
-experiments = configure_physics()
+### SETUP (physics, experiments, priors, hypotheses: defined by the setup file, see --setup) ###
 
-ftype=Float64
-p= Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5))
-priors = Newtrinos.condition(priors, conditional_vars, p)
-@reset priors.θ₂₃   = Uniform(ftype(30*π/180), ftype(60*π/180))
-@reset priors.Δm²₃₁ = Uniform(ftype(0.93e-3 + 7.40e-5), ftype(3.93e-3 + 7.40e-5))
+include(abspath(args["setup"]))
+S = finalize_setup(setup(; ftype = Float64))
 
-@reset priors.deepcore_lifetime        = Uniform(ftype(0), ftype(3.8))
-@reset priors.deepcore_ice_scattering  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_ice_absorption  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_opt_eff_lateral = Truncated(Normal(ftype(0), ftype(1.)), ftype(-2), ftype(2.5))
+experiments = S.experiments
+p = S.params
 
-# NSI parameter bounds — Standard parameterization
-@reset priors.Δ_eμ     = Uniform(-ftype(5),   ftype(5))
-@reset priors.Δ_τμ     = Uniform(-ftype(0.1), ftype(0.1))
-@reset priors.ε_eμ_abs = Uniform(ftype(0),    ftype(0.3))
-@reset priors.ε_eτ_abs = Uniform(ftype(0),    ftype(0.35))
-@reset priors.ε_μτ_abs = Uniform(ftype(0),    ftype(0.07))
-@reset priors.δ_eμ     = Uniform(ftype(0),    ftype(2π)) #used [0,π] for 0,180 degree with two gridpoints, but use [0,2π] for general grid scan
-@reset priors.δ_eτ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_μτ     = Uniform(ftype(0),    ftype(2π))
-
-#conditioned priors for 1-by-1 hypotheses
-cp_eμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_eτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_μτ => 0.0), p)
-cp_μτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0), p)
-cp_ee_μμ = Newtrinos.condition(priors, Dict(:Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_ττ_μμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-
-#all params non-zero hypothesis
-cp_all = deepcopy(priors) 
-
-all_cps   = [cp_eμ, cp_eτ, cp_μτ, cp_ee_μμ, cp_ττ_μμ, cp_all]
-all_names = ["eμ", "eτ", "μτ", "ee_μμ", "ττ_μμ", "all"] # 6 hypotheses
-interesting_nuisances = [:Δ_eμ, :Δ_τμ, :Δm²₃₁, :δ_eμ, :δ_eτ, :δ_μτ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :θ₂₃]
-nsi_param_names = (:Δ_eμ, :Δ_τμ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :δ_eμ, :δ_eτ, :δ_μτ)
-
-# Filter to the CLI-selected subset (default: all 6), always in the canonical
-# eμ/eτ/μτ/ee_μμ/ττ_μμ/all order regardless of the order flags were passed in.
-selected_hypotheses = args["hypotheses"]
+# Filter to the CLI-selected subset (default: all hypotheses of the setup), always in the order the
+# setup lists them regardless of the order the flags were passed in.
+all_names = collect(keys(S.hypotheses))
+selected_hypotheses = isempty(args["hypotheses"]) ? all_names : args["hypotheses"]
 for h in selected_hypotheses
     h in all_names || error("--hypotheses: unknown hypothesis '$h'. Choose from: $(join(all_names, ", "))")
 end
-keep_idx = [idx for (idx, nm) in enumerate(all_names) if nm in selected_hypotheses]
-cps  = all_cps[keep_idx]
-scan = all_names[keep_idx]
+scan = [nm for nm in all_names if nm in selected_hypotheses]
+hyps = [hypothesis_info(S, nm) for nm in scan]
+cps  = [h.prior for h in hyps]
 n_hyp = length(cps)
+
+# parameters whose truth is varied (and whose fit is plotted/summarized separately): the tested parameters
+# of the selected hypotheses plus --vary-truth-params
+plotted_params = unique(vcat([collect(h.tested) for h in hyps]..., collect(vary_truth_params)))
 
 
 ### ROUNDTRIPS WITH INJECTED TRUTH ###
@@ -286,7 +246,7 @@ for k in 1:n_work
     j, _ = work[k]
     prior_dist = distprod(;cps[j]...)
     truth_seeds[k] = truth_mode == "controlled" ?
-        controlled_truth(rng, p, cps[j], nsi_param_names; vary_physics=vary_physics) :
+        controlled_truth(rng, p, cps[j], hyps[j].tested; extra_names=vary_truth_params) :
         rand(rng, prior_dist)
     start_rngs[k]  = Random.Xoshiro(rand(rng, UInt))
 end
@@ -359,12 +319,12 @@ for j in 1:n_hyp, i in 1:n_truths
 end
 per_param_quality = Dict(k => per_param_sums[k] / per_param_counts[k] for k in keys(per_param_sums))
 
-# A_bar restricted to physics/NSI parameters (excludes nuisances). With controlled
+# A_bar restricted to the tested/varied parameters (excludes nuisances). With controlled
 # truths, nuisance truths are pinned at nominal (often 0.0), where fit_quality's
 # relative-error formula is degenerate (any nonzero fit reads as ~100% error regardless
 # of absolute closeness) -- A_bar_physical avoids that artifact by only averaging over
 # the parameters actually varied by --truth-mode controlled.
-physical_param_names = (nsi_param_names..., :θ₂₃, :Δm²₃₁)
+physical_param_names = Tuple(plotted_params)
 physical_keys = [k for k in keys(per_param_quality) if k in physical_param_names]
 A_bar_physical = isempty(physical_keys) ? NaN :
     sum(per_param_quality[k] for k in physical_keys) / length(physical_keys)
@@ -381,7 +341,7 @@ push!(summary_lines, "not converged: $n_not_converged / $n_total")
 push!(summary_lines, "tolerances: g_tol=$g_tol f_tol=$f_tol x_tol=$x_tol")
 push!(summary_lines, "mean iterations: $(mean_iterations)" * (fit_method == "optim" ? "" : " (n/a for --fit-method $fit_method)"))
 push!(summary_lines, "fit quality A_bar (mean over all roundtrips): $A_bar")
-push!(summary_lines, "fit quality A_bar_physical (mean over NSI/theta23/deltam31 params only): $A_bar_physical")
+push!(summary_lines, "fit quality A_bar_physical (mean over the tested/varied params only): $A_bar_physical")
 push!(summary_lines, "fit quality per parameter (mean squared relative error):")
 for k in sort(collect(keys(per_param_quality)))
     push!(summary_lines, "  $k: $(per_param_quality[k])")
@@ -394,7 +354,7 @@ println(summary_text)
 ### PLOTTING ###
 
 if args["plot"]
-    fig = Figure(size=(2000, 400 * (2 + length(interesting_nuisances))))
+    fig = Figure(size=(2000, 400 * (2 + length(plotted_params))))
 
     for j in 1:n_hyp
         #log_posterior -- when --objective likelihood, scan_results[j,i][2] is the
@@ -415,7 +375,7 @@ if args["plot"]
         scatter!(ax2, llh_truth, llh_scan)
         ablines!(ax2, 0, 1, color=:red)
 
-        for (nui, nuisance) in enumerate(interesting_nuisances)
+        for (nui, nuisance) in enumerate(plotted_params)
             ax_nui = Axis(fig[2 + nui, j], xlabel="truth value $(nuisance)", ylabel = "best fit value $(nuisance)")
             idxs = [i for i in 1:n_truths if haskey(random_truth_seeds[j,i], nuisance) && haskey(scan_results[j,i][3], nuisance)]
             if !isempty(idxs)
@@ -469,7 +429,7 @@ results_dict = Dict{String, Any}(
     "settings" => Dict(
         "data_mode"          => data_mode,
         "truth_mode"         => truth_mode,
-        "vary_physics"       => vary_physics,
+        "vary_truth_params"  => collect(string.(vary_truth_params)),
         "fit_method"         => fit_method,
         "optimizer"          => optimizer_name,
         "objective"          => objective,
@@ -485,7 +445,7 @@ results_dict = Dict{String, Any}(
         "trace_plots"        => trace_plots,
         "n_truths"           => n_truths,
         "seed"               => args["seed"],
-        "experiments"        => args["experiments"],
+        "setup"              => S.name,
     ),
     "hypotheses"           => scan,
     "truth_params"         => random_truth_seeds,

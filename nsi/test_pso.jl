@@ -1,5 +1,6 @@
 # PSO settings performance test: injects several random known-truth (optionally
-# nuisance-fluctuated) Asimov data realizations for a chosen NSI hypothesis, then runs
+# nuisance-fluctuated) Asimov data realizations for a chosen hypothesis of a setup file
+# (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl), then runs
 # several CLI-specified PSO seed-search settings ("combos") against every truth point and
 # checks how well PSO ALONE (no LBFGS polish) recovers the injected truth.
 #
@@ -44,16 +45,17 @@
 #   2. Δχ²_optimizer_residual = 2*(log_post - ref_log_post): final PSO result vs. the
 #      truth-seeded LBFGS reference optimum (same reference as #1, evaluated only at
 #      PSO's final point instead of at every generation) -- saved only.
-#   3. nsi_param_diff (fit - truth per scanned NSI param) -- saved only.
+#   3. tested_param_diff (fit - truth per tested parameter) -- saved only.
 #   4. plateau_gen: earliest PSO generation within --plateau-frac-thresh of the trace's
 #      total start->end drop -- saved only.
 #   5. seed_elapsed: PSO wall time -- saved only.
 # Diagnostics 2-5 are only saved to the .jld2 (not plotted) -- inspect them there directly.
 #
-# Usage: julia --threads=8 test_pso.jl --hypothesis ττ_μμ --n-points 10 \
+# Usage: julia --threads=8 test_pso.jl --setup nsi/setups/nsi_deepcore_3y.jl --hypothesis ττ_μμ --n-points 10 \
 #            --pso-particles 20 40 60 --global-iterations 20 50 100 [--pso-subruns 5]
 #
-# Output: nsi/pso_test_results/pso_test_<hypothesis>_<fluctuated|nominal>_<n>points[_subruns<N>][_<suffix>].{jld2,pdf}
+# Output (in --results-dir, default results/<setup name>/pso_test):
+#   pso_test_<hypothesis>_<fluctuated|nominal>_<n>points[_subruns<N>][_<suffix>].{jld2,pdf}
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
@@ -76,8 +78,6 @@ import Optim
 
 include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
 
-const RESULTS_DIR = joinpath(@__DIR__, "pso_test_results")
-
 # LBFGS settings for the Phase-1 truth-seeded reference fit -- the ONLY LBFGS call in this
 # script, so these are hardcoded rather than CLI flags (the PSO-settings sweep in Phase 2
 # never calls LBFGS at all).
@@ -92,10 +92,20 @@ const REF_LBFGS_XTOL       = 0.0
 function parse_command_line()
     s = ArgParseSettings()
     @add_arg_table s begin
+        "--setup"
+        help = "Setup file defining the physics, experiments, priors and hypotheses (it defines setup(; ftype) -- see nsi/setups/nsi_deepcore_3y.jl for the format)"
+        arg_type = String
+        default = joinpath(@__DIR__, "setups", "nsi_deepcore_3y.jl")
+
         "--hypothesis"
-        help = "Which hypothesis to test: eμ, eτ, μτ, ee_μμ, ττ_μμ, all"
+        help = "Name of the hypothesis (from the setup file) to test"
         arg_type = String
         default = "ττ_μμ"
+
+        "--results-dir"
+        help = "Output folder for the saved results and plots (default: results/<setup name>/pso_test, relative to the working directory)"
+        arg_type = String
+        default = ""
 
         "--n-points"
         help = "Number of independent randomly-generated truth points"
@@ -120,12 +130,14 @@ function parse_command_line()
         default = 1
 
         "--fluctuate-nuisances"
-        help = "Additionally draw every nuisance parameter from its own prior per truth point (the \"(fluctuated) asimov\" mode) -- NSI truth is unaffected"
+        help = "Additionally draw every other free parameter of the hypothesis (nuisances, and e.g. θ₂₃/Δm²₃₁) from its own prior per truth point (the \"(fluctuated) asimov\" mode) -- the tested parameters' truth is unaffected"
         action = :store_true
 
-        "--vary-physics-truth"
-        help = "Also draw θ₂₃'s and Δm²₃₁'s truth randomly from their priors (passed to controlled_truth's vary_physics)"
-        action = :store_true
+        "--vary-truth-params"
+        help = "Names of additional parameters whose truth is drawn randomly from their priors, besides the tested parameters of the hypothesis, e.g. --vary-truth-params θ₂₃ Δm²₃₁ (passed to controlled_truth's extra_names)"
+        arg_type = String
+        nargs = '*'
+        default = String[]
 
         "--plateau-frac-thresh"
         help = "Plateau-detection threshold: earliest PSO generation within this fraction of the trace's total start->end drop"
@@ -152,7 +164,7 @@ pso_particles_list       = args["pso-particles"]
 global_iterations_list   = args["global-iterations"]
 pso_subruns              = args["pso-subruns"]
 fluctuate_nuisances_flag = args["fluctuate-nuisances"]
-vary_physics_truth_flag  = args["vary-physics-truth"]
+vary_truth_params       = Tuple(Symbol.(args["vary-truth-params"]))
 plateau_frac_thresh      = args["plateau-frac-thresh"]
 suffix                   = args["suffix"]
 
@@ -190,69 +202,19 @@ function plateau_generation(f_trace::Vector{Float64}; frac_thresh::Float64=0.01)
     length(f_trace)
 end
 
-### PHYSICS CONFIG (mirrors roundtrips.jl / optimizer_tests.jl) ###
+### SETUP (physics, experiments, priors, hypotheses: defined by the setup file, see --setup) ###
 
-function configure_physics()
-    osc = Newtrinos.osc.configure(
-        Newtrinos.osc.OscillationConfig(
-            flavour     = Newtrinos.osc.ThreeFlavour(),
-            interaction = Newtrinos.osc.NSI_Standard()
-        )
-    )
-    atm_flux     = Newtrinos.atm_flux.configure()
-    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
-    xsec         = Newtrinos.xsec.configure()
-    physics      = (; osc, atm_flux, earth_layers, xsec)
-    (; deepcore = Newtrinos.deepcore_3y.configure(physics))
-end
+include(abspath(args["setup"]))
+S = finalize_setup(setup(; ftype = Float64))
+hyp = hypothesis_info(S, hypothesis_name)
 
-experiments = configure_physics()
-
-ftype = Float64
-p = Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5),
-                         :atm_flux_updown_sigma=>ftype(0.0), :atm_flux_nuenuebar_sigma=>ftype(0.0))
-priors = Newtrinos.condition(priors, conditional_vars, p)
-@reset priors.θ₂₃   = Uniform(ftype(30*π/180), ftype(60*π/180))
-@reset priors.Δm²₃₁ = Uniform(ftype(0.93e-3 + 7.40e-5), ftype(3.93e-3 + 7.40e-5))
-
-@reset priors.deepcore_lifetime        = Uniform(ftype(0), ftype(3.8))
-@reset priors.deepcore_ice_scattering  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_ice_absorption  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_opt_eff_lateral = Truncated(Normal(ftype(0), ftype(1.)), ftype(-2), ftype(2.5))
-
-@reset priors.Δ_eμ     = Uniform(-ftype(5),   ftype(5))
-@reset priors.Δ_τμ     = Uniform(-ftype(0.1), ftype(0.1))
-@reset priors.ε_eμ_abs = Uniform(ftype(0),    ftype(0.3))
-@reset priors.ε_eτ_abs = Uniform(ftype(0),    ftype(0.35))
-@reset priors.ε_μτ_abs = Uniform(ftype(0),    ftype(0.07))
-@reset priors.δ_eμ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_eτ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_μτ     = Uniform(ftype(0),    ftype(2π))
-
-cp_eμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_eτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_μτ => 0.0), p)
-cp_μτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0), p)
-cp_ee_μμ = Newtrinos.condition(priors, Dict(:Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_ττ_μμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_all = deepcopy(priors)
-
-all_cps = Dict("eμ" => cp_eμ, "eτ" => cp_eτ, "μτ" => cp_μτ, "ee_μμ" => cp_ee_μμ, "ττ_μμ" => cp_ττ_μμ, "all" => cp_all)
-hypothesis_name in keys(all_cps) || error("--hypothesis must be one of $(join(sort(collect(keys(all_cps))), ", ")), got '$hypothesis_name'")
-cp_hyp = all_cps[hypothesis_name]
-
-nsi_param_names = (:Δ_eμ, :Δ_τμ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :δ_eμ, :δ_eτ, :δ_μτ)
-nuisance_names = (
-    :atm_flux_delta_spectral_index, :atm_flux_nuenuebar_sigma, :atm_flux_nuenumu_sigma,
-    :atm_flux_numunumubar_sigma, :atm_flux_updown_sigma, :atm_flux_uphorizontal_sigma,
-    :deepcore_atm_muon_scale, :deepcore_ice_absorption, :deepcore_ice_scattering,
-    :deepcore_lifetime, :deepcore_opt_eff_headon, :deepcore_opt_eff_lateral,
-    :deepcore_opt_eff_overall, :nc_norm, :nutau_cc_norm,
-)
-physics_names = (:θ₂₃, :Δm²₃₁)
-
-scan_keys = [k for k in nsi_param_names if !(cp_hyp[k] isa ValueShapes.ConstValueDist) && !(cp_hyp[k] isa Number)]
+experiments = S.experiments
+p = S.params
+cp_hyp = hyp.prior                  # prior of the hypothesis under test
+tested_names = hyp.tested           # tested parameters = keys of the hypothesis' `null`
+fluctuated_names = hyp.fluctuated   # all other free parameters: redrawn by --fluctuate-nuisances
+scan_keys = collect(tested_names)
+results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "pso_test") : args["results-dir"]
 
 prior_dist = distprod(;cp_hyp...)
 algorithm  = make_algorithm("lbfgs", REF_LBFGS_STEP_SIZE)
@@ -270,8 +232,8 @@ println("Phase 1: building $n_points truth points + reference fits...")
 
 Threads.@threads for t in 1:n_points
     truth_rng = Random.Xoshiro(args["seed"] + t)
-    truth_param = controlled_truth(truth_rng, p, cp_hyp, nsi_param_names; vary_physics=vary_physics_truth_flag)
-    truth_param = fluctuate_nuisances_flag ? fluctuate_nuisances(truth_rng, truth_param, cp_hyp, nuisance_names) : truth_param
+    truth_param = controlled_truth(truth_rng, p, cp_hyp, tested_names; extra_names=vary_truth_params)
+    truth_param = fluctuate_nuisances_flag ? fluctuate_nuisances(truth_rng, truth_param, cp_hyp, fluctuated_names) : truth_param
 
     injected_data    = Newtrinos.generate_asimov_data(experiments, truth_param)
     truth_likelihood = Newtrinos.generate_likelihood(experiments, injected_data)
@@ -336,12 +298,12 @@ Threads.@threads for k in 1:n_tasks
 
         Δχ²_optimizer_residual = 2 * (log_post - tp.ref_log_post)
         Δχ²_recovery            = 2 * (log_post - tp.truth_log_post)
-        nsi_param_diff = Dict{Symbol,Float64}(sk => Float64(fit_param[sk]) - Float64(tp.truth_param[sk]) for sk in scan_keys)
+        tested_param_diff = Dict{Symbol,Float64}(sk => Float64(fit_param[sk]) - Float64(tp.truth_param[sk]) for sk in scan_keys)
         plateau_gen = plateau_generation(pso_trace; frac_thresh=plateau_frac_thresh)
 
         subruns[m] = (fit_param=fit_param, llh=llh, log_post=log_post,
                       Δχ²_optimizer_residual=Δχ²_optimizer_residual, Δχ²_recovery=Δχ²_recovery,
-                      nsi_param_diff=nsi_param_diff, plateau_gen=plateau_gen,
+                      tested_param_diff=tested_param_diff, plateau_gen=plateau_gen,
                       pso_trace=pso_trace, seed_elapsed=seed_elapsed)
     end
 
@@ -379,17 +341,17 @@ end
 # alongside just that combo's Phase-2 results, so a given combo's results never need to be
 # picked back out of interleaved cross-combo arrays.
 
-mkpath(RESULTS_DIR)
+mkpath(results_dir)
 
 for (c, combo) in enumerate(combos)
     rows = filter(r -> r.combo_idx == c, phase2)  # this combo's n_points tasks, already truth_idx-ordered
     combo_tag = combo_label(combo.n_particles, combo.global_iterations)
 
-    nsi_param_diff_flat = Dict{String, Vector{Float64}}(
-        "nsi_param_diff_$(k)" => [r.nsi_param_diff[k] for r in rows] for k in scan_keys
+    tested_param_diff_flat = Dict{String, Vector{Float64}}(
+        "tested_param_diff_$(k)" => [r.tested_param_diff[k] for r in rows] for k in scan_keys
     )
 
-    FileIO.save(joinpath(RESULTS_DIR, "pso_test_$(output_tag)_$(combo_tag).jld2"), Dict(
+    FileIO.save(joinpath(results_dir, "pso_test_$(output_tag)_$(combo_tag).jld2"), Dict(
         "hypothesis"  => hypothesis_name,
         "scan_keys"   => collect(scan_keys),
         "output_tag"  => output_tag,
@@ -414,8 +376,8 @@ for (c, combo) in enumerate(combos)
         "log_post"         => [r.log_post for r in rows],
         "Δχ²_optimizer_residual" => [r.Δχ²_optimizer_residual for r in rows],
         "Δχ²_recovery"           => [r.Δχ²_recovery for r in rows],
-        "nsi_param_diff"   => [r.nsi_param_diff for r in rows],
-        nsi_param_diff_flat...,
+        "tested_param_diff"   => [r.tested_param_diff for r in rows],
+        tested_param_diff_flat...,
         "plateau_gen"      => [r.plateau_gen for r in rows],
         "pso_trace"        => [r.pso_trace for r in rows],
         "seed_elapsed"     => [r.seed_elapsed for r in rows],
@@ -437,7 +399,8 @@ for (c, combo) in enumerate(combos)
             "combo_global_iterations" => combo.global_iterations,
             "pso_subruns"          => pso_subruns,
             "fluctuate_nuisances"  => fluctuate_nuisances_flag,
-            "vary_physics_truth"   => vary_physics_truth_flag,
+            "vary_truth_params"    => collect(string.(vary_truth_params)),
+            "setup"                => S.name,
             "plateau_frac_thresh"  => plateau_frac_thresh,
             "seed"                 => args["seed"],
             "ref_lbfgs_iterations" => REF_LBFGS_ITERATIONS,
@@ -451,11 +414,12 @@ for (c, combo) in enumerate(combos)
         "settings_combo_global_iterations" => combo.global_iterations,
         "settings_pso_subruns"         => pso_subruns,
         "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
-        "settings_vary_physics_truth"  => vary_physics_truth_flag,
+        "settings_vary_truth_params"   => collect(string.(vary_truth_params)),
+        "settings_setup"               => S.name,
         "settings_plateau_frac_thresh" => plateau_frac_thresh,
         "settings_seed"                => args["seed"],
     ))
-    println("Saved results for combo $combo_tag to $(joinpath(RESULTS_DIR, "pso_test_$(output_tag)_$(combo_tag).jld2"))")
+    println("Saved results for combo $combo_tag to $(joinpath(results_dir, "pso_test_$(output_tag)_$(combo_tag).jld2"))")
 end
 
 ### PLOT: trace diagnostics only (diagnostic #1) ###
@@ -509,5 +473,5 @@ Label(fig[0, 1:n_cols], "PSO trace diagnostics -- hypothesis=$hypothesis_name, n
       fontsize=16, font=:bold)
 
 resize_to_layout!(fig)
-save(joinpath(RESULTS_DIR, "pso_test_$(output_tag).pdf"), fig; pt_per_unit=1.0)
-println("Saved plot to $(joinpath(RESULTS_DIR, "pso_test_$(output_tag).pdf"))")
+save(joinpath(results_dir, "pso_test_$(output_tag).pdf"), fig; pt_per_unit=1.0)
+println("Saved plot to $(joinpath(results_dir, "pso_test_$(output_tag).pdf"))")

@@ -6,8 +6,8 @@
 # This is a diagnostic-only script to decide whether Metaheuristics.jl is worth adopting --
 # it does NOT touch nsi_scan.jl, test_pso.jl, roundtrips.jl, or optimizer_tests_common.jl.
 #
-# Hypothesis tested: cp_eμ only (2 free NSI params: ε_eμ_abs, δ_eμ) -- the simplest case,
-# fast enough to sanity-check trace shapes before considering a harder (e.g. cp_all) case.
+# Hypothesis tested: one hypothesis of the setup file (default "eμ": 2 tested parameters) -- the
+# simplest case, fast enough to sanity-check trace shapes before considering a harder (e.g. all-parameter) case.
 #
 # For each of N_TRUTH independently drawn truth points, every algorithm is run ONCE with
 # the SAME total evaluation budget, and its best-so-far objective value is recorded against
@@ -21,9 +21,10 @@
 # independent: its own RNG, own Asimov data/likelihood, own result slot) -- run with
 # `julia --threads=N` to use it; per-thread progress lines may interleave in stdout.
 #
-# Usage: julia --threads=4 nsi/compare_pso_metaheuristics.jl
+# Usage: julia --threads=4 nsi/compare_pso_metaheuristics.jl [setup file [hypothesis name [results dir]]]
+#   defaults: nsi/setups/nsi_deepcore_3y.jl, "eμ", results/<setup name>/pso_metaheuristics
 #
-# Output: nsi/pso_metaheuristics_results/compare_eμ_<n>points.{jld2,pdf}
+# Output (in the results dir): compare_<hypothesis>_<n>points.{jld2,pdf}
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
@@ -45,8 +46,6 @@ import Metaheuristics
 
 include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
 
-const RESULTS_DIR = joinpath(@__DIR__, "pso_metaheuristics_results")
-
 ### SETTINGS ###
 
 const N_TRUTH      = 4      # independent random truth points
@@ -54,6 +53,8 @@ const N_PARTICLES  = 100     # population size, shared across all 4 algorithms
 const GLOBAL_ITERS = 100     # Optim PSO generation budget -- defines the shared eval budget
 const FEVALS       = N_PARTICLES * GLOBAL_ITERS
 const SEED         = 1234
+const SETUP_FILE   = length(ARGS) >= 1 ? ARGS[1] : joinpath(@__DIR__, "setups", "nsi_deepcore_3y.jl")
+const HYPOTHESIS   = length(ARGS) >= 2 ? ARGS[2] : "eμ"
 
 # LBFGS settings for the truth-seeded reference fit (mirrors test_pso.jl's REF_LBFGS_*).
 const REF_LBFGS_ITERATIONS = 1000
@@ -62,56 +63,23 @@ const REF_LBFGS_STEP_SIZE  = 1.0
 const REF_LBFGS_FTOL       = 0.0
 const REF_LBFGS_XTOL       = 0.0
 
-### PHYSICS CONFIG (mirrors test_pso.jl / nsi_scan.jl) ###
+### SETUP (physics, experiments, priors, hypotheses: defined by the setup file) ###
 
-function configure_physics()
-    osc = Newtrinos.osc.configure(
-        Newtrinos.osc.OscillationConfig(
-            flavour     = Newtrinos.osc.ThreeFlavour(),
-            interaction = Newtrinos.osc.NSI_Standard()
-        )
-    )
-    atm_flux     = Newtrinos.atm_flux.configure()
-    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
-    xsec         = Newtrinos.xsec.configure()
-    physics      = (; osc, atm_flux, earth_layers, xsec)
-    (; deepcore = Newtrinos.deepcore_3y.configure(physics))
-end
+include(abspath(SETUP_FILE))
+S = finalize_setup(setup(; ftype = Float64))
+hyp = hypothesis_info(S, HYPOTHESIS)
 
-experiments = configure_physics()
+experiments = S.experiments
+p = S.params
+cp_hyp = hyp.prior                  # prior of the hypothesis under test
+tested_names = hyp.tested           # tested parameters = keys of the hypothesis' `null`
+scan_keys = collect(tested_names)
+const RESULTS_DIR = length(ARGS) >= 3 ? ARGS[3] : joinpath("results", S.name, "pso_metaheuristics")
 
-ftype = Float64
-p = Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5),
-                         :atm_flux_updown_sigma=>ftype(0.0), :atm_flux_nuenuebar_sigma=>ftype(0.0))
-priors = Newtrinos.condition(priors, conditional_vars, p)
-@reset priors.θ₂₃   = Uniform(ftype(30*π/180), ftype(60*π/180))
-@reset priors.Δm²₃₁ = Uniform(ftype(0.93e-3 + 7.40e-5), ftype(3.93e-3 + 7.40e-5))
-
-@reset priors.deepcore_lifetime        = Uniform(ftype(0), ftype(3.8))
-@reset priors.deepcore_ice_scattering  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_ice_absorption  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_opt_eff_lateral = Truncated(Normal(ftype(0), ftype(1.)), ftype(-2), ftype(2.5))
-
-@reset priors.Δ_eμ     = Uniform(-ftype(5),   ftype(5))
-@reset priors.Δ_τμ     = Uniform(-ftype(0.1), ftype(0.1))
-@reset priors.ε_eμ_abs = Uniform(ftype(0),    ftype(0.3))
-@reset priors.ε_eτ_abs = Uniform(ftype(0),    ftype(0.35))
-@reset priors.ε_μτ_abs = Uniform(ftype(0),    ftype(0.07))
-@reset priors.δ_eμ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_eτ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_μτ     = Uniform(ftype(0),    ftype(2π))
-
-cp_eμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-
-nsi_param_names = (:Δ_eμ, :Δ_τμ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :δ_eμ, :δ_eτ, :δ_μτ)
-scan_keys = [k for k in nsi_param_names if !(cp_eμ[k] isa ValueShapes.ConstValueDist) && !(cp_eμ[k] isa Number)]
-
-prior_dist = distprod(;cp_eμ...)
+prior_dist = distprod(;cp_hyp...)
 algorithm  = make_algorithm("lbfgs", REF_LBFGS_STEP_SIZE)
 
-println("Hypothesis 'eμ': scan_keys=$(Tuple(scan_keys)), n_truth=$N_TRUTH, " *
+println("Hypothesis '$HYPOTHESIS': scan_keys=$(Tuple(scan_keys)), n_truth=$N_TRUTH, " *
         "n_particles=$N_PARTICLES, global_iters=$GLOBAL_ITERS, total_fevals=$FEVALS")
 
 ### OBJECTIVE (same posterior objective global_seed_search uses, built directly here so it
@@ -145,7 +113,7 @@ println("Running $N_TRUTH truth points x 4 algorithms (Optim-PSO, MH-PSO, MH-DE,
 
 Threads.@threads for t in 1:N_TRUTH
     truth_rng = Random.Xoshiro(SEED + t)
-    truth_param = controlled_truth(truth_rng, p, cp_eμ, nsi_param_names; vary_physics=false)
+    truth_param = controlled_truth(truth_rng, p, cp_hyp, tested_names)
 
     injected_data    = Newtrinos.generate_asimov_data(experiments, truth_param)
     truth_likelihood = Newtrinos.generate_likelihood(experiments, injected_data)
@@ -162,7 +130,7 @@ Threads.@threads for t in 1:N_TRUTH
     println("  [truth $t/$N_TRUTH] ref_log_post=$(round(ref_log_post,digits=4)) " *
             "ref_converged=$ref_converged ref_elapsed=$(round(ref_elapsed,digits=1))s")
 
-    b = extract_bounds(cp_eμ, p)
+    b = extract_bounds(cp_hyp, p)
     obj = make_objective(truth_likelihood, b)
 
     algo_runs = Vector{AlgoRun}(undef, 4)
@@ -170,7 +138,7 @@ Threads.@threads for t in 1:N_TRUTH
     # 1) Optim.jl PSO -- reuse global_seed_search as-is, no reimplementation.
     rng1 = Random.Xoshiro(SEED + 1_000_000 + t)
     t0 = time()
-    _, f_trace = global_seed_search(truth_likelihood, cp_eμ, p, "pso", GLOBAL_ITERS, rng1;
+    _, f_trace = global_seed_search(truth_likelihood, cp_hyp, p, "pso", GLOBAL_ITERS, rng1;
                                      n_particles=N_PARTICLES, return_trace=true, objective="posterior")
     elapsed1 = time() - t0
     best_so_far1 = accumulate(min, f_trace)
@@ -215,12 +183,13 @@ end
 ### SAVE RESULTS (.jld2, before plotting) ###
 
 mkpath(RESULTS_DIR)
-output_tag = "eμ_$(N_TRUTH)points"
+output_tag = "$(HYPOTHESIS)_$(N_TRUTH)points"
 
 algo_names = [r.name for r in truth_results[1].algo_runs]
 
 FileIO.save(joinpath(RESULTS_DIR, "compare_$(output_tag).jld2"), Dict(
-    "hypothesis"  => "eμ",
+    "hypothesis"  => HYPOTHESIS,
+    "setup"       => S.name,
     "scan_keys"   => collect(scan_keys),
     "n_truth"     => N_TRUTH,
     "algo_names"  => algo_names,
@@ -249,7 +218,7 @@ FileIO.save(joinpath(RESULTS_DIR, "compare_$(output_tag).jld2"), Dict(
          for (i, name) in enumerate(algo_names)]...)...),
 
     "settings" => Dict(
-        "hypothesis"   => "eμ",
+        "hypothesis"   => HYPOTHESIS,
         "n_truth"      => N_TRUTH,
         "n_particles"  => N_PARTICLES,
         "global_iters" => GLOBAL_ITERS,
@@ -302,7 +271,7 @@ for t in 1:N_TRUTH
     t == 1 && axislegend(ax; position=:rt, framevisible=false)
 end
 
-Label(fig[0, 1:n_cols], "PSO/DE/ABC convergence comparison -- hypothesis=eμ, n_truth=$N_TRUTH, " *
+Label(fig[0, 1:n_cols], "PSO/DE/ABC convergence comparison -- hypothesis=$HYPOTHESIS, n_truth=$N_TRUTH, " *
       "n_particles=$N_PARTICLES, total_fevals=$FEVALS", fontsize=16, font=:bold)
 
 resize_to_layout!(fig)

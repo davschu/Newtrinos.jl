@@ -1,3 +1,7 @@
+# Generic roundtrip scan. Physics, experiments, priors and the hypotheses to test come from a setup
+# file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl; see there for how a hypothesis is specified); this
+# script contains no model-specific code. --hypothesis selects one of the setup's hypotheses.
+#
 # Thesis-style roundtrip scan: replicates the dissertation's "recovering injected NSI
 # hypotheses" test (section 7.6.2, nuisances/theta23/deltam31 pinned at nominal) and,
 # with --fluctuate-nuisances, its "recovering fluctuated nuisance parameters" test
@@ -6,24 +10,24 @@
 # Δχ²_mod histogram) are combined into ONE figure/ONE output file per run -- no separate
 # "_nuisances.pdf" file.
 #
-# Per-hypothesis NSI panel(s):
-#   - 1D hypotheses (single real-valued NSI param, e.g. Δ_τμ): one truth-vs-fit diagonal
-#     panel.
-#   - 2D hypotheses (magnitude+phase pair, e.g. ε_eμ_abs+δ_eμ): THREE panels -- the
-#     (magnitude, phase) plane with truth and fit as separate point sets (matching the
-#     dissertation's Fig. 7.14b layout), plus two diagonal truth-vs-fit panels (one for
-#     magnitude, one for phase), same visual language as the nuisance panels.
-#   - "all" (8 free NSI params, Sobol sample): 8 truth-vs-fit diagonal panels, one per
-#     free NSI param.
+# Per-hypothesis panel(s), by the number of tested parameters of the hypothesis (keys of its `null`):
+#   - 1 tested parameter: one truth-vs-fit diagonal panel.
+#   - 2 tested parameters (e.g. a magnitude+phase pair): THREE panels -- the plane of the two
+#     parameters with truth and fit as separate point sets (matching the dissertation's Fig.
+#     7.14b layout), plus two diagonal truth-vs-fit panels (one per parameter), same visual
+#     language as the nuisance panels.
+#   - more than 2 (Sobol sample): one truth-vs-fit diagonal panel per tested parameter.
 #
 # The GRID controls only how truths are injected (via truth_grid, optimizer_tests_common.jl)
 # -- it does NOT restrict the fit. Every fit is still free to vary every non-fixed
-# parameter in the hypothesis's prior (all physics params + all 15 nuisances), exactly
+# parameter in the hypothesis's prior (all physics params + all nuisances), exactly
 # like any other roundtrip; only the injected truth is simplified to isolate the scan to
 # the NSI parameter(s) being tested (plus, under --fluctuate-nuisances, the nuisances and
 # θ₂₃/Δm²₃₁).
 #
-# --hypothesis: one of eμ, eτ, μτ, ee_μμ, ττ_μμ, all.
+# --setup: setup file defining physics, experiments, priors and hypotheses (required).
+# --hypothesis: name of one of the setup's hypotheses.
+# --results-dir: output folder (default results/<setup name>/roundtrip, relative to the working directory).
 #
 # Δχ²_mod statistic -- pick ONE via mutually-exclusive flags (--chi2-recovery is default):
 #   --chi2-recovery: Δχ²_recovery = 2*(log_post_fit - log_post_truth), i.e. how far the
@@ -79,9 +83,9 @@
 # truth) -- runs via Threads.@threads, same index-owned-output pattern as
 # test_global_seed.jl. Launch with multiple threads to parallelize, e.g.:
 #
-# Usage: julia --threads=8 truth_grid_scan.jl --hypothesis ττ_μμ
+# Usage: julia --threads=8 roundtrips.jl --setup nsi/setups/nsi_deepcore_3y.jl --hypothesis ττ_μμ
 #
-# Output directory: Optimization_tests/roundtrip_results/ (created if missing).
+# Output directory: --results-dir (created if missing).
 # Output filenames: grid_roundtrip_<asimov|toydata>_<fluctuated|nominal>_<hypothesis>_<posteriorfit|likelihoodfit>[_<suffix>].{pdf,jld2}
 # -- "asimov"/"toydata" reflects whether --toydata was set, "fluctuated"/"nominal" reflects
 # whether --fluctuate-nuisances was set, "posteriorfit"/"likelihoodfit" reflects --objective;
@@ -102,25 +106,33 @@ using Statistics
 using Distributed
 using SlurmClusterManager
 
-const RESULTS_DIR = joinpath(@__DIR__, "roundtrip_results")
-
 ### CLI ###
 
 function parse_command_line()
     s = ArgParseSettings()
     @add_arg_table s begin
+        "--setup"
+        help = "Setup file defining the physics, experiments, priors and hypotheses (it defines setup(; ftype) -- see nsi/setups/nsi_deepcore_3y.jl for the format)"
+        arg_type = String
+        required = true
+
         "--hypothesis"
-        help = "Which hypothesis to scan: eμ, eτ, μτ, ee_μμ, ττ_μμ, all (all uses Sobol quasi-random sampling over all 8 free NSI params instead of a factorial grid -- use a larger --n-points, e.g. 100-200)"
+        help = "Name of the hypothesis (from the setup file) to scan. A hypothesis with more than 2 tested parameters uses Sobol quasi-random sampling instead of a factorial grid -- use a larger --n-points, e.g. 100-200"
         arg_type = String
         default = "ττ_μμ"
 
+        "--results-dir"
+        help = "Output folder for the saved results and plots (default: results/<setup name>/roundtrip, relative to the working directory)"
+        arg_type = String
+        default = ""
+
         "--n-points"
-        help = "Total sample points (1D: evenly-spaced values; 2D: round(sqrt(n)) per dimension; all: Sobol quasi-random samples -- recommend 100-200)"
+        help = "Total sample points (1 tested parameter: evenly-spaced values; 2: round(sqrt(n)) per dimension; more: Sobol quasi-random samples -- recommend 100-200)"
         arg_type = Int
         default = 25
 
         "--fluctuate-nuisances"
-        help = "Replicate the dissertation's section 7.6.3 test: also randomly draw every nuisance parameter, plus θ₂₃/Δm²₃₁, from their own priors (NSI truth from --hypothesis's grid/Sobol point is unaffected). Adds per-parameter truth-vs-fit panels and a Δχ²_mod histogram to the output figure. Also selects the 'fluctuated' vs 'nominal' output filename tag."
+        help = "Replicate the dissertation's section 7.6.3 test: also randomly draw every other free parameter of the hypothesis (nuisances, and e.g. θ₂₃/Δm²₃₁) from its own prior (the tested parameters' truth from --hypothesis's grid/Sobol point is unaffected). Adds per-parameter truth-vs-fit panels and a Δχ²_mod histogram to the output figure. Also selects the 'fluctuated' vs 'nominal' output filename tag."
         action = :store_true
 
         "--chi2-recovery"
@@ -317,88 +329,26 @@ end
     include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
 end
 
-### PHYSICS CONFIG (mirrors optimizer_tests.jl / test_global_seed.jl) ###
+### SETUP (physics, experiments, priors, hypotheses: defined by the setup file, see --setup) ###
 
-function configure_physics()
-    osc = Newtrinos.osc.configure(
-        Newtrinos.osc.OscillationConfig(
-            flavour     = Newtrinos.osc.ThreeFlavour(),
-            interaction = Newtrinos.osc.NSI_Standard()
-        )
-    )
-    atm_flux     = Newtrinos.atm_flux.configure()
-    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
-    xsec         = Newtrinos.xsec.configure()
-    physics      = (; osc, atm_flux, earth_layers, xsec)
-    (; deepcore = Newtrinos.deepcore_3y.configure(physics))
-end
+include(abspath(args["setup"]))
+S = finalize_setup(setup(; ftype = Float64))
+hyp = hypothesis_info(S, hypothesis_name)
 
-experiments = configure_physics()
-
-ftype = Float64
-p = Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5),
-                         :atm_flux_updown_sigma=>ftype(0.0), :atm_flux_nuenuebar_sigma=>ftype(0.0))
-priors = Newtrinos.condition(priors, conditional_vars, p)
-@reset priors.θ₂₃   = Uniform(ftype(30*π/180), ftype(60*π/180))
-@reset priors.Δm²₃₁ = Uniform(ftype(0.93e-3 + 7.40e-5), ftype(3.93e-3 + 7.40e-5))
-
-@reset priors.deepcore_lifetime        = Uniform(ftype(0), ftype(3.8))
-@reset priors.deepcore_ice_scattering  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_ice_absorption  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_opt_eff_lateral = Truncated(Normal(ftype(0), ftype(1.)), ftype(-2), ftype(2.5))
-
-@reset priors.Δ_eμ     = Uniform(-ftype(5),   ftype(5))
-@reset priors.Δ_τμ     = Uniform(-ftype(0.1), ftype(0.1))
-@reset priors.ε_eμ_abs = Uniform(ftype(0),    ftype(0.3))
-@reset priors.ε_eτ_abs = Uniform(ftype(0),    ftype(0.35))
-@reset priors.ε_μτ_abs = Uniform(ftype(0),    ftype(0.07))
-@reset priors.δ_eμ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_eτ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_μτ     = Uniform(ftype(0),    ftype(2π))
-
-#conditioned priors for 1-by-1 hypotheses (mirrors optimizer_tests.jl exactly)
-cp_eμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_eτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_μτ => 0.0), p)
-cp_μτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0), p)
-cp_ee_μμ = Newtrinos.condition(priors, Dict(:Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_ττ_μμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_all = deepcopy(priors)
-cp_sm = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-
-all_cps = Dict("eμ" => cp_eμ, "eτ" => cp_eτ, "μτ" => cp_μτ, "ee_μμ" => cp_ee_μμ, "ττ_μμ" => cp_ττ_μμ, "all" => cp_all)
-hypothesis_name in keys(all_cps) || error("--hypothesis must be one of $(join(sort(collect(keys(all_cps))), ", ")), got '$hypothesis_name'")
-cp_hyp = all_cps[hypothesis_name]
-is_all = hypothesis_name == "all"
-
-nsi_param_names = (:Δ_eμ, :Δ_τμ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :δ_eμ, :δ_eτ, :δ_μτ)
-
-# All 15 nuisance parameters (everything free in the prior that isn't an NSI or
-# physics-of-interest param). Confirmed directly against Newtrinos.get_priors: 12 have a
-# Truncated(Normal(μ,σ)) prior (get a 1σ shaded band in the panel), 3 have a Uniform
-# prior (no natural 1σ concept, no band).
-nuisance_names = (
-    :atm_flux_delta_spectral_index, :atm_flux_nuenuebar_sigma, :atm_flux_nuenumu_sigma,
-    :atm_flux_numunumubar_sigma, :atm_flux_updown_sigma, :atm_flux_uphorizontal_sigma,
-    :deepcore_atm_muon_scale, :deepcore_ice_absorption, :deepcore_ice_scattering,
-    :deepcore_lifetime, :deepcore_opt_eff_headon, :deepcore_opt_eff_lateral,
-    :deepcore_opt_eff_overall, :nc_norm, :nutau_cc_norm,
-)
-
-# Physics-of-interest params (kept separate from `nuisance_names` conceptually -- these
-# are the oscillation parameters `truth_grid`/`controlled_truth` normally pin at nominal
-# -- but fluctuated and plotted alongside the nuisances under --fluctuate-nuisances,
-# since the dissertation's 7.6.3 test treats them the same way: both are "not the NSI
-# parameter(s) under test" but are free to fluctuate/be refit).
-physics_names = (:θ₂₃, :Δm²₃₁)
-fluctuated_names = (nuisance_names..., physics_names...)
+experiments = S.experiments
+p = S.params
+cp_hyp = hyp.prior                  # prior of the hypothesis under test
+cp_sm = hyp.null_prior              # the same prior with the tested parameters at their null values
+tested_names = hyp.tested           # tested parameters = keys of the hypothesis' `null`
+fluctuated_names = hyp.fluctuated   # all other free parameters: redrawn by --fluctuate-nuisances, shown in the extra panels
+results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "roundtrip") : args["results-dir"]
 
 ### BUILD THE TRUTH GRID ###
 
-truths, scan_keys, grid_coords = truth_grid(cp_hyp, p, nsi_param_names; n_points=n_points)
+truths, scan_keys, grid_coords = truth_grid(cp_hyp, p, tested_names; n_points=n_points)
 n_grid = length(truths)
-is_2d = length(scan_keys) == 2 && !is_all
+is_many = length(scan_keys) > 2   # Sobol sample instead of a grid
+is_2d = length(scan_keys) == 2
 
 println("Truth grid built for hypothesis '$hypothesis_name': $(n_grid) points, scanning $(scan_keys)")
 
@@ -437,7 +387,7 @@ cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
 ctx = (; experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p, algorithm,
        nseeds, seed_strategy, lbfgs_iterations, g_tol, f_tol, x_tol, objective,
        global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
-       fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_all, is_2d,
+       fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_many, is_2d,
        fluctuate_nuisances_flag)
 use_distributed && @everywhere ctx = $ctx
 
@@ -462,7 +412,7 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
     experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p, algorithm,
         nseeds, seed_strategy, lbfgs_iterations, g_tol, f_tol, x_tol, objective,
         global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
-        fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_all, is_2d,
+        fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_many, is_2d,
         fluctuate_nuisances_flag = ctx
     seed_rng = Random.Xoshiro(1000 + k)
     truth_param = fluctuate_nuisances_flag ?
@@ -520,26 +470,11 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
             sm_res = local_find_mle(truth_likelihood, distprod(;cp_sm...), sm_init;
                 fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
                 ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
-            # The SM fit pins every NSI param exactly at 0 -- for NSI params whose prior
-            # lower bound is also 0 (ε_eμ_abs/ε_eτ_abs/ε_μτ_abs), that leaves the main
-            # fit's init point sitting exactly on a Uniform boundary. bat_findmode's
-            # PriorToNormal reparametrization maps bounded priors to an unconstrained
-            # space (e.g. probit/logit-like), and a boundary point maps to a non-finite
-            # value there. The SAME failure mode also hits any OTHER free parameter whose
-            # own optimum under the SM fit happens to land on (or at) ITS bound -- e.g.
-            # deepcore_atm_muon_scale (Uniform(0,2)) or deepcore_opt_eff_headon
-            # (Uniform(-5,2)) -- not just the NSI params, since the SM fit optimizes every
-            # free nuisance/physics parameter too. Either way the main LBFGS fit's very
-            # first line-search step hits AssertionError: isfinite(phi_c) &&
-            # isfinite(dphi_c) inside LineSearches, and local_find_mle silently returns
-            # NaN for that attempt. Nudge EVERY free parameter of cp_hyp (not just the
-            # scanned NSI keys) away from its own bound by the same ε=1e-8 extract_bounds
-            # (optimizer_tests_common.jl) already uses for exactly this reason, before
-            # handing the seed on to the main fit -- reuse extract_bounds itself rather
-            # than reimplementing its bound-finding/clamping logic.
-            b_sm = extract_bounds(cp_hyp, sm_res[3])
-            nudged = Dict(k => b_sm.x0_vec[b_sm.free_x_index[i]] for (i, k) in enumerate(b_sm.all_keys) if b_sm.is_free_mask[i])
-            merge(sm_res[3], NamedTuple(nudged))
+            # The null-model fit leaves the tested parameters at their null values, which can sit exactly on
+            # a prior bound (e.g. 0 for a magnitude), and other free parameters may land on a bound too.
+            # local_find_mle moves start values off the bounds itself (_nudge_into_bounds), so the
+            # fit result can be handed on as the seed unchanged.
+            sm_res[3]
         elseif seed_strategy == "random"
             # Plain random draw from the (conditioned) hypothesis prior -- fixed/conditioned
             # entries just resample their own constant.
@@ -663,10 +598,10 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
     total_elapsed = seed_elapsed + lbfgs_elapsed + profile_elapsed + prior_pull_elapsed
     Δχ²_mod = chi2_mode == "mis-modeling" ? Δχ²_mis_modeling : Δχ²_recovery
 
-    # Fit-minus-truth diff for the hypothesis's actually-scanned NSI parameter(s) only
+    # Fit-minus-truth diff for the hypothesis's actually-scanned (tested) parameter(s) only
     # (scan_keys -- 1 for 1D hypotheses, 2 for magnitude/phase pairs, up to 8 for "all"),
     # matching what the truth-vs-fit diagonal panels already plot.
-    nsi_param_diff = Dict{Symbol,Float64}(k => Float64(fit_param[k]) - Float64(truth_param[k]) for k in scan_keys)
+    tested_param_diff = Dict{Symbol,Float64}(k => Float64(fit_param[k]) - Float64(truth_param[k]) for k in scan_keys)
 
     result = (
         truth_param=truth_param, fit_param=fit_param, converged=converged,
@@ -676,9 +611,9 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
         n_iters=n_iters, grid_coord=grid_coords[k],
         seed_elapsed=seed_elapsed, lbfgs_elapsed=lbfgs_elapsed, profile_elapsed=profile_elapsed,
         prior_pull_elapsed=prior_pull_elapsed,
-        total_elapsed=total_elapsed, nsi_param_diff=nsi_param_diff,
+        total_elapsed=total_elapsed, tested_param_diff=tested_param_diff,
     )
-    coord_str = if is_all
+    coord_str = if is_many
         "[" * join(round.(grid_coords[k], digits=4), ", ") * "]"
     elseif is_2d
         "($(round(grid_coords[k][1],digits=4)), $(round(grid_coords[k][2],digits=4)))"
@@ -719,17 +654,17 @@ println("Timing: total=$(round(total_wall_s,digits=1))s (summed per-point; wall 
 ### SAVE RESULTS ###
 # Saved before plotting so the numeric results survive even if CairoMakie plotting fails.
 
-mkpath(RESULTS_DIR)
+mkpath(results_dir)
 
 # Flat per-key arrays (fit - truth), one Vector{Float64} per scanned NSI param, aligned
 # 1:1 with truth_params/fit_params -- alongside the Vector{Dict} form above, since generic
 # JLD2/HDF5 viewers can't render a Vector{Dict} nicely (it shows as an opaque reference
 # table), but flat numeric vectors display normally.
-nsi_param_diff_flat = Dict{String, Vector{Float64}}(
-    "nsi_param_diff_$(k)" => [r.nsi_param_diff[k] for r in results] for k in scan_keys
+tested_param_diff_flat = Dict{String, Vector{Float64}}(
+    "tested_param_diff_$(k)" => [r.tested_param_diff[k] for r in results] for k in scan_keys
 )
 
-FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
+FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "hypothesis"      => hypothesis_name,
     "output_tag"      => output_tag,
     "scan_keys"       => collect(scan_keys),
@@ -745,8 +680,9 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "Δχ²_mis_modeling" => [r.Δχ²_mis_modeling for r in results],
     "Δχ²_prior_pull"        => [r.Δχ²_prior_pull for r in results],
     "Δχ²_optimizer_residual" => [r.Δχ²_optimizer_residual for r in results],
-    "nsi_param_diff"  => [r.nsi_param_diff for r in results],
-    nsi_param_diff_flat...,
+    "tested_param_diff"  => [r.tested_param_diff for r in results],
+    "setup"           => S.name,
+    tested_param_diff_flat...,
     "n_iters"         => [r.n_iters for r in results],
     "seed_elapsed"    => [r.seed_elapsed for r in results],
     "lbfgs_elapsed"   => [r.lbfgs_elapsed for r in results],
@@ -773,10 +709,11 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
         "toydata"           => toydata_flag,
         "nseeds"            => nseeds,
         "seed_strategy"     => seed_strategy,
+        "setup"             => S.name,
     ),
     # Same settings again, flattened to top-level scalar entries -- a nested Dict (like
     # "settings" above) shows as an opaque reference table in generic JLD2/HDF5 viewers
-    # (same issue nsi_param_diff had); flat top-level scalars display normally.
+    # (same issue tested_param_diff had); flat top-level scalars display normally.
     "settings_objective"           => objective,
     "settings_n_points"            => n_points,
     "settings_global_iterations"   => global_iterations,
@@ -791,8 +728,9 @@ FileIO.save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
     "settings_nseeds"              => nseeds,
     "settings_seed_strategy"       => seed_strategy,
+    "settings_setup"               => S.name,
 ))
-println("Saved results to $(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).jld2"))")
+println("Saved results to $(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"))")
 
 ### PLOT ###
 # Single combined figure: NSI panel(s) first, then (if --fluctuate-nuisances) nuisance +
@@ -842,7 +780,7 @@ end
 show_all_params = fluctuate_nuisances_flag || toydata_flag # show all parameter plots also for toydata runs
 panel_specs = NamedTuple[]
 
-if is_all
+if is_many
     for k in scan_keys
         push!(panel_specs, (kind=:diagonal, key=k, xlabel="truth $(k)", ylabel="fit $(k)", title="$(k)"))
     end
@@ -864,7 +802,7 @@ end
 push!(panel_specs, (kind=:histogram,))
 
 n_panels = length(panel_specs)
-n_cols = is_all || show_all_params || is_2d ? 3 : 1
+n_cols = is_many || show_all_params || is_2d ? 3 : 1
 n_rows = cld(n_panels, n_cols)
 fig = Figure(size=(n_cols == 1 ? 950 : 600 * n_cols, max(700, 380 * n_rows)))
 
@@ -879,7 +817,7 @@ for (idx, spec) in enumerate(panel_specs)
         local truth_vals = [r.truth_param[k] for r in results]
         local fit_vals   = [r.fit_param[k] for r in results]
 
-        if k in nuisance_names || k in physics_names
+        if k in fluctuated_names
             local d = cp_hyp[k]
             if d isa Truncated{<:Normal}
                 local μ, σ = d.untruncated.μ, d.untruncated.σ
@@ -936,9 +874,9 @@ legend_elems = [
 Legend(fig[1:n_rows, 1], legend_elems, ["converged", "not converged"]; tellwidth=true, tellheight=false)
 
 title_suffix = fluctuate_nuisances_flag ? ", fluctuated nuisances" : ""
-sample_kind = is_all ? "Sobol sample, " : ""
+sample_kind = is_many ? "Sobol sample, " : ""
 fit_kind = objective == "likelihood" ? "llh-fit" : "scan"
 Label(fig[0, 1:(2*n_cols + 1)], "Truth-vs-fit $fit_kind (hypothesis: $hypothesis_name, $(sample_kind)n=$n_grid$title_suffix)", fontsize=18, font=:bold)
 
-save(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).pdf"), fig)
-println("Saved plot to $(joinpath(RESULTS_DIR, "grid_roundtrip_$(output_tag).pdf"))")
+save(joinpath(results_dir, "grid_roundtrip_$(output_tag).pdf"), fig)
+println("Saved plot to $(joinpath(results_dir, "grid_roundtrip_$(output_tag).pdf"))")

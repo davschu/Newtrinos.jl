@@ -19,17 +19,21 @@ import Sobol
 using ProgressMeter
 import Optim
 
-include(joinpath(@__DIR__, "..", "src", "analysis", "cli_common.jl"))
 include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
 
 function parse_command_line()
     s = ArgParseSettings()
 
     @add_arg_table s begin
-        "--experiments"
-        help = "List of experiments to run"
-        nargs = '+'
-        required = true
+        "--setup"
+        help = "Setup file defining the physics, experiments, priors and hypotheses (it defines setup(; ftype) -- see nsi/setups/nsi_deepcore_3y.jl for the format)"
+        arg_type = String
+        default = joinpath(@__DIR__, "setups", "nsi_deepcore_3y.jl")
+
+        "--results-dir"
+        help = "Output folder for the saved results (default: results/<setup name>/scan, relative to the working directory)"
+        arg_type = String
+        default = ""
 
         "--name"
         help = "Name for outputs"
@@ -42,7 +46,7 @@ function parse_command_line()
         required = true
 
         "--hypothesis" # maybe change to profile-vars - would be more general - do when modifying for generic usage
-        help = "Hypothesis to test: eμ, eτ, μτ, ee_μμ, ττ_μμ, all"
+        help = "Name of the hypothesis (from the setup file) to test"
         arg_type = String
         required = true
 
@@ -133,7 +137,6 @@ use_distributed = n_workers > 1
 multi_node_flag && !use_distributed &&
     error("--multi-node requires --workers > 1 (got --workers $n_workers).")
 ftype = Float64
-mkpath("scan_results")
 
 map_func = nothing
 
@@ -175,22 +178,16 @@ if use_distributed
         import Sobol
         import Optim
 
-        include(joinpath($(@__DIR__), "..", "src", "analysis", "cli_common.jl"))
         include(joinpath($(@__DIR__), "..", "src", "analysis", "optimizer_tests_common.jl"))
 
-        ##### CONFIGURATION (built independently on every worker) #####
-        osc = Newtrinos.osc.configure(
-                Newtrinos.osc.OscillationConfig(
-                    flavour     = Newtrinos.osc.ThreeFlavour(),
-                    interaction = Newtrinos.osc.NSI_Standard()
-                )
-            )
-        atm_flux     = Newtrinos.atm_flux.configure()
-        earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
-        xsec         = Newtrinos.xsec.configure()
-        physics      = (; osc, atm_flux, earth_layers, xsec)
-        experiments  = Newtrinos.configure_experiments(args["experiments"], physics)
+    end
 
+    # every process (workers and driver) builds its own experiments and likelihood from the setup file;
+    # separate @everywhere calls, so that the setup function is defined before it is called
+    @everywhere include($(abspath(args["setup"])))
+    @everywhere begin
+        S = finalize_setup(setup(; ftype = Float64))
+        experiments = S.experiments
         likelihood = Newtrinos.generate_likelihood(experiments)
     end
 
@@ -199,65 +196,22 @@ else
     adsel = AutoForwardDiff()
     context = set_batcontext(ad = adsel)
 
-    ##### CONFIGURATION #####
-    osc = Newtrinos.osc.configure(
-            Newtrinos.osc.OscillationConfig(
-                flavour     = Newtrinos.osc.ThreeFlavour(),
-                interaction = Newtrinos.osc.NSI_Standard()
-            )
-        )
-    atm_flux     = Newtrinos.atm_flux.configure()
-    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
-    xsec         = Newtrinos.xsec.configure()
-    physics      = (; osc, atm_flux, earth_layers, xsec)
-    experiments  = Newtrinos.configure_experiments(args["experiments"], physics)
-
+    ##### CONFIGURATION (from the setup file) #####
+    include(abspath(args["setup"]))
+    S = finalize_setup(setup(; ftype = Float64))
+    experiments = S.experiments
     likelihood = Newtrinos.generate_likelihood(experiments)
 end
 
-##### SPECIFY PARAMETER SPACE, PRIORS #####
+##### PARAMETERS, PRIORS AND HYPOTHESIS (from the setup file) #####
 
-p = Newtrinos.get_params(experiments)
-priors = Newtrinos.get_priors(experiments)
-
-#specifying priors
-
-# Standard oscillation priors fixed to paper values
-conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5))
-priors = Newtrinos.condition(priors, conditional_vars, p)
-@reset priors.θ₂₃   = Uniform(ftype(30*π/180), ftype(60*π/180))
-@reset priors.Δm²₃₁ = Uniform(ftype(0.93e-3 + 7.40e-5), ftype(3.93e-3 + 7.40e-5))#paper sets range for deltam^2_23 so just use flat prior from sum in NO: Δm²₃₁ = Δm²₂₃ + Δm²₂₁ with Δm²₂₁ fixed
-
-# Detector-systematic prior ranges corrected to match paper Table III 
-@reset priors.deepcore_lifetime        = Uniform(ftype(0), ftype(3.8)) #lifetime: paper allows [0, 3.8] years
-@reset priors.deepcore_ice_scattering  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1)) # ice scattering/absorption: paper truncates at ±1σ (Normal(1,0.1) -> [0.9,1.1])
-@reset priors.deepcore_ice_absorption  = Truncated(Normal(ftype(1), ftype(0.1)), ftype(0.9), ftype(1.1))
-@reset priors.deepcore_opt_eff_lateral = Truncated(Normal(ftype(0), ftype(1.)), ftype(-2), ftype(2.5)) #paper's truncation is asymmetric, +2.5σ/-2σ
-
-# NSI parameter bounds — Standard parameterization
-@reset priors.Δ_eμ     = Uniform(-ftype(5),   ftype(5))
-@reset priors.Δ_τμ     = Uniform(-ftype(0.1), ftype(0.1))
-@reset priors.ε_eμ_abs = Uniform(ftype(0),    ftype(0.3))
-@reset priors.ε_eτ_abs = Uniform(ftype(0),    ftype(0.35))
-@reset priors.ε_μτ_abs = Uniform(ftype(0),    ftype(0.07))
-@reset priors.δ_eμ     = Uniform(ftype(0),    ftype(2π)) #used [0,π] for 0,180 degree with two gridpoints, but use [0,2π] for general grid scan
-@reset priors.δ_eτ     = Uniform(ftype(0),    ftype(2π))
-@reset priors.δ_μτ     = Uniform(ftype(0),    ftype(2π))
-
-##### SPECIFY HYPOTHESIS AND GRIDPOINTS #####
-
-cp_eμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_eτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_μτ => 0.0), p)
-cp_μτ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0), p)
-cp_ee_μμ = Newtrinos.condition(priors, Dict(:Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_ττ_μμ = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-cp_all = deepcopy(priors)
-cp_sm = Newtrinos.condition(priors, Dict(:Δ_eμ => 0.0, :Δ_τμ => 0.0, :ε_eμ_abs => 0.0, :ε_eτ_abs => 0.0, :ε_μτ_abs => 0.0, :δ_eμ => 0.0, :δ_eτ => 0.0, :δ_μτ => 0.0), p)
-
-all_cps = Dict("eμ" => cp_eμ, "eτ" => cp_eτ, "μτ" => cp_μτ, "ee_μμ" => cp_ee_μμ, "ττ_μμ" => cp_ττ_μμ, "all" => cp_all)
-hypothesis_name in keys(all_cps) || error("--hypothesis must be one of $(join(sort(collect(keys(all_cps))), ", ")), got '$hypothesis_name'")
-cp_hyp = all_cps[hypothesis_name]
-is_all = hypothesis_name == "all" # bool for special case of scanning all nsi params
+p = S.params
+priors = S.priors
+hyp = hypothesis_info(S, hypothesis_name)
+cp_hyp = hyp.prior       # prior of the hypothesis under test
+cp_sm = hyp.null_prior   # the same prior with the tested parameters at their null values (used by --seed-strategy smseed)
+results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "scan") : args["results-dir"]
+mkpath(results_dir)
 
 #ToDo: implement profile scan
 #ToDo: implement saving of results to file
@@ -310,16 +264,16 @@ elseif seed_strategy == "mle" # Random start + a full local MLE fit per seed -- 
         seed_params[s] = res[3]
     end
 elseif seed_strategy == "smseed"
-    # SM-first seeding: fit the nuisance/physics parameters with every free NSI parameter
-    # of this hypothesis pinned to 0 (the SM point), then hand that fit's result -- nuisances
-    # tuned, NSI params still sitting at 0 -- on as the seed. The idea is that the systematics
-    # land at a reasonable point from the SM fit alone, so the subsequent NSI fit mostly has
-    # to tune the NSI parameters themselves rather than re-discovering good nuisance values
-    # from scratch. The SM fit doesn't depend on `s`, so it only needs to run once; it's
+    # Null-model seeding: fit the nuisance/physics parameters with the tested parameters of this
+    # hypothesis pinned at their null values (e.g. the SM point), then hand that fit's result --
+    # nuisances tuned, tested parameters still sitting at their null values -- on as the seed. The idea
+    # is that the systematics land at a reasonable point from the null fit alone, so the subsequent fit
+    # mostly has to tune the tested parameters themselves rather than re-discovering good nuisance
+    # values from scratch. The SM fit doesn't depend on `s`, so it only needs to run once; it's
     # reused for every one of the `nseeds` seeds (matching "mle"/"random"'s per-seed slot
     # convention, just with identical contents across seeds here).
     # `ExplicitInit` strictly validates the init point against every constant entry of
-    # `cp_sm`'s prior (its conditioned oscillation params + all 8 NSI params pinned to 0)
+    # `cp_sm`'s prior (its conditioned parameters + the tested parameters pinned at their null values)
     # -- `p` itself (Newtrinos.get_params's raw nominal values) doesn't necessarily agree
     # with those constants, so every key `cp_sm` holds fixed must be forced to its exact
     # conditioned value first, or `bat_findmode` throws `ArgumentError("Cannot set
@@ -346,9 +300,8 @@ end
 
 ##### specify gridpoints for scan/profile #####
 
-# grid over #grid-points total points in the free NSI parameter space, for >2 free nsi params, use a sobol sequence to sample the space quasi-randomly.
-nsi_param_names = (:Δ_eμ, :Δ_τμ, :ε_eμ_abs, :ε_eτ_abs, :ε_μτ_abs, :δ_eμ, :δ_eτ, :δ_μτ)
-scan_keys = [k for k in nsi_param_names if !(cp_hyp[k] isa ValueShapes.ConstValueDist) && !(cp_hyp[k] isa Number)]
+# grid over #grid-points total points in the space of the tested parameters; for more than 2, use a sobol sequence to sample the space quasi-randomly.
+scan_keys = collect(hyp.tested)
 grid_points = args["grid-points"]
 
 if length(scan_keys) in (1, 2)
@@ -357,8 +310,8 @@ if length(scan_keys) in (1, 2)
     init_values, scanpoints = Newtrinos.generate_scanpoints(vars_to_scan, cp_hyp)
     mesh_flat = vec(Newtrinos._generate_grid(vars_to_scan, cp_hyp)[3])  # grid points in the order of `scanpoints`
 else
-    # "all": 8 free NSI params -- grid-points quasi-random samples via a Sobol low-discrepancy
-    # sequence over all 8 dimensions jointly, built the same way generate_scanpoints's own
+    # more than 2 tested parameters -- grid-points quasi-random samples via a Sobol low-discrepancy
+    # sequence over all tested dimensions jointly, built the same way generate_scanpoints's own
     # make_prior closure builds each scan point (fix the scanned keys, keep everything else free).
     los = Float64[Float64(minimum(cp_hyp[k])) for k in scan_keys]
     his = Float64[Float64(maximum(cp_hyp[k])) for k in scan_keys]
@@ -473,8 +426,9 @@ if lowercase(args["task"]) == "profile"
         "nseeds"        => nseeds,
         "seed_strategy" => seed_strategy,
         "objective"     => objective,
+        "setup"         => S.name,
     )
-    FileIO.save(joinpath("scan_results/", name * "_profile_$(hypothesis_name)_$(grid_points)points_$(seed_strategy)seed$(nseeds)" * ".jld2"), result) 
+    FileIO.save(joinpath(results_dir, name * "_profile_$(hypothesis_name)_$(grid_points)points_$(seed_strategy)seed$(nseeds)" * ".jld2"), result) 
 
 elseif lowercase(args["task"]) == "scan"
     # No optimization -- straight likelihood evaluation with every non-scanned parameter
@@ -487,9 +441,9 @@ elseif lowercase(args["task"]) == "scan"
             point = merge(p, NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i]))))
             llhs[i] = logdensityof(likelihood, point)
         end
-        result = Dict("hypothesis"=>hypothesis_name, "scan_keys"=>Tuple(scan_keys), "mesh_flat"=>mesh_flat, "llh"=>llhs, "n_grid"=>n_grid)
+        result = Dict("hypothesis"=>hypothesis_name, "scan_keys"=>Tuple(scan_keys), "mesh_flat"=>mesh_flat, "llh"=>llhs, "n_grid"=>n_grid, "setup"=>S.name)
     end
-    FileIO.save(joinpath("scan_results/", name * "_scan_$(hypothesis_name)_$(grid_points)points" * ".jld2"), result)
+    FileIO.save(joinpath(results_dir, name * "_scan_$(hypothesis_name)_$(grid_points)points" * ".jld2"), result)
 else
     error("--task must be 'Profile' or 'Scan' (case-insensitive), got '$(args["task"])'")
 end

@@ -18,6 +18,55 @@ function make_algorithm(optimizer_name, step_size)
     end
 end
 
+# ---- analysis setups ----------------------------------------------------------------------------
+# A setup file (see nsi/setups/nsi_deepcore_3y.jl) defines `setup(; ftype)` returning
+# `(; name, experiments, params, priors, hypotheses)`, with `hypotheses` a Dict name => (; prior, null).
+
+"""True for a parameter prior that holds the parameter fixed (`ConstValueDist` / raw `Number`)."""
+_is_fixed(d) = d isa ValueShapes.ConstValueDist || d isa Number
+
+"""
+    finalize_setup(S) -> S
+
+Check that the NamedTuple `S` returned by a setup file has the required fields
+(`name, experiments, params, priors, hypotheses`) and that every hypothesis is a
+`(; prior, null)` whose tested parameters (`keys(null)`) are free in its `prior`.
+"""
+function finalize_setup(S)
+    for f in (:name, :experiments, :params, :priors, :hypotheses)
+        f in keys(S) || error("setup is missing the field `$f` (required: name, experiments, params, priors, hypotheses)")
+    end
+    for (hname, h) in S.hypotheses
+        (:prior in keys(h) && :null in keys(h)) || error("hypothesis '$hname' must be a NamedTuple (; prior, null)")
+        for k in keys(h.null)
+            k in keys(h.prior) || error("hypothesis '$hname': tested parameter $k is not a parameter of its prior")
+            _is_fixed(h.prior[k]) && error("hypothesis '$hname': tested parameter $k is fixed in its prior, it must be free")
+        end
+    end
+    S
+end
+
+"""
+    hypothesis_info(S, hypothesis_name) -> NamedTuple
+
+Everything the scripts derive from one hypothesis of a setup `S`:
+`(; name, prior, tested, null_prior, fluctuated)` with
+- `tested`: the tested parameters, `keys(null)` (their order is the order of the scan axes),
+- `null_prior`: `prior` with the tested parameters fixed at their null values (the model without
+  the effect under test),
+- `fluctuated`: all other free parameters of `prior`; the ones redrawn from their priors by
+  `--fluctuate-nuisances`.
+"""
+function hypothesis_info(S, hypothesis_name)
+    haskey(S.hypotheses, hypothesis_name) ||
+        error("--hypothesis must be one of $(join(sort(collect(keys(S.hypotheses))), ", ")), got '$hypothesis_name'")
+    h = S.hypotheses[hypothesis_name]
+    tested = Tuple(keys(h.null))
+    null_prior = Newtrinos.condition(h.prior, Dict{Symbol, Float64}(k => Float64(h.null[k]) for k in tested), S.params)
+    fluctuated = Tuple(k for k in keys(h.prior) if !_is_fixed(h.prior[k]) && !(k in tested))
+    (; name = hypothesis_name, prior = h.prior, tested, null_prior, fluctuated)
+end
+
 """
     extract_bounds(prior, params)
 
@@ -139,39 +188,33 @@ function randomize_free_params(rng, params, prior)
 end
 
 """
-    controlled_truth(rng, nominal_params, prior, nsi_param_names; vary_physics=false)
+    controlled_truth(rng, nominal_params, prior, tested_names; extra_names=())
 
 Build an injected-truth NamedTuple starting from `nominal_params` (e.g.
 `Newtrinos.get_params(experiments)`), overriding: (1) every free (non-fixed) parameter
-in `prior` whose key is in `nsi_param_names`, drawn randomly from its prior
-distribution, (2) `:θ₂₃` and `:Δm²₃₁`, drawn randomly from their priors, only if
-`vary_physics`, and (3) every parameter `prior` holds **fixed** (`ConstValueDist` /
-`Number`, e.g. δCP/θ₁₂/θ₁₃/Δm²₂₁ conditioned in `optimizer_tests.jl`), forced to that
+in `prior` whose key is in `tested_names` (the parameters under test of a hypothesis),
+drawn randomly from its prior distribution, (2) every free parameter in `prior` whose key
+is in `extra_names` (e.g. `(:θ₂₃, :Δm²₃₁)` to also vary those), drawn randomly from its prior,
+and (3) every parameter `prior` holds **fixed** (`ConstValueDist` /
+`Number`, e.g. oscillation parameters conditioned in a setup file), forced to that
 exact fixed value -- `nominal_params` (`Newtrinos.get_params`'s own defaults) can
 disagree with the specific constants a hypothesis's `prior` was conditioned to (verified
 directly: `p[:δCP]=1.0` vs. the conditioned `0.0`), and `bat_findmode`'s `ExplicitInit`
 strictly validates the init point against the prior's constants, raising
 `ArgumentError("Cannot set constant value to a different value")` if they differ.
 
-Every other parameter -- nuisances, θ₂₃/Δm²₃₁ (unless varied) -- stays at its nominal
-value. This isolates truth variation to the NSI parameter(s) actually being tested by
+Every other parameter -- nuisances and the `extra_names` not given -- stays at its nominal
+value. This isolates truth variation to the parameter(s) actually being tested by
 `prior`'s hypothesis, avoiding prior-pull artifacts from randomly-fluctuated nuisance
 parameters landing in low-density prior regions by chance (see `randomize_free_params`
 for the same fixed-parameter check used here).
 """
-function controlled_truth(rng, nominal_params, prior, nsi_param_names; vary_physics=false)
+function controlled_truth(rng, nominal_params, prior, tested_names; extra_names=())
     overrides = Dict{Symbol, Float64}()
-    for k in nsi_param_names
+    for k in (tested_names..., extra_names...)
         d = prior[k]
-        (d isa ValueShapes.ConstValueDist || d isa Number) && continue
+        _is_fixed(d) && continue
         overrides[k] = rand(rng, d)
-    end
-    if vary_physics
-        for k in (:θ₂₃, :Δm²₃₁)
-            d = prior[k]
-            (d isa ValueShapes.ConstValueDist || d isa Number) && continue
-            overrides[k] = rand(rng, d)
-        end
     end
     _fix_conditioned(merge(nominal_params, NamedTuple(overrides)), prior)
 end
@@ -221,64 +264,50 @@ end
 
 
 """
-    truth_grid(prior, nominal_params, nsi_param_names; n_points=25)
+    truth_grid(prior, nominal_params, tested_names; n_points=25)
 
-Generate a grid of `n_points` Asimov-truth NamedTuples scanning the free NSI
-parameter(s) of `prior`'s hypothesis, matching the dissertation's "recovering injected
-NSI hypotheses" test (section 7.6.2): nuisances/θ₂₃/Δm²₃₁ pinned at `nominal_params`
-(and every prior-fixed parameter forced to its exact conditioned value, via
-`_fix_conditioned` -- same as `controlled_truth`), only the hypothesis's free NSI
-parameter(s) varied. `fit_param`/optimization itself is NOT restricted by this
-function -- it only controls how the injected truth is built; the subsequent fit is
-still free to vary every non-fixed parameter in `prior` (physics + nuisances), exactly
-like any other roundtrip.
+Generate a grid of `n_points` Asimov-truth NamedTuples scanning the free tested parameters of
+a hypothesis (`tested_names`, e.g. `keys(null)` of a setup's hypothesis). All other parameters
+stay at `nominal_params`, except the ones `prior` holds fixed, which are forced to their fixed
+value (`_fix_conditioned`, same as `controlled_truth`). The grid only controls how the injected
+truth is built; the subsequent fit is still free to vary every non-fixed parameter in `prior`.
 
-Auto-detects sampling strategy from which of `nsi_param_names` are free in `prior`:
-- Exactly 1 free param that's a lone real-valued NSI param (`:Δ_eμ` or `:Δ_τμ`): 1D
-  grid, `n_points` evenly-spaced values across `[minimum(d), maximum(d)]`.
-- Exactly 2 free params forming a magnitude/phase pair (`:ε_eμ_abs`+`:δ_eμ`,
-  `:ε_eτ_abs`+`:δ_eτ`, or `:ε_μτ_abs`+`:δ_μτ`): 2D grid, `round(sqrt(n_points))` points
-  per dimension (e.g. 5x5=25 for `n_points=25`), magnitude x phase.
-- More than 2 free params (e.g. `cp_all`'s 8 free NSI params): a full factorial grid is
-  combinatorially infeasible (`n_points^8` for an 8D hypothesis at `n_points`/dim), so
-  instead draws `n_points` quasi-random samples via a `Sobol.jl` low-discrepancy
-  sequence (`SobolSeq`) over all free dimensions simultaneously -- far better space-
-  filling coverage of the joint parameter space than either a factorial grid or
-  independent-uniform random draws, at a fixed, chosen sample budget.
-- 0 free NSI params is not a valid hypothesis for this function and errors.
+The sampling strategy follows from the number of FREE tested parameters:
+- 1 parameter: `n_points` evenly spaced values over its prior range (1D).
+- 2 parameters: a 2D grid with `round(sqrt(n_points))` points per dimension (e.g. 5x5=25 for
+  `n_points=25`), in the order of `tested_names` (first name = first coordinate).
+- more than 2: a quasi-random Sobol sequence (`SobolSeq`) over all free dimensions
+  simultaneously, far better space-filling than a factorial grid in that many dimensions.
+- 0 free tested parameters is not a valid hypothesis and errors.
 
-Returns `(truths, scan_keys, grid_coords)`: `truths::Vector{<:NamedTuple}` (the sampled
-truths), `scan_keys::Tuple` (which key(s) were scanned), and `grid_coords` aligned 1:1
-with `truths` (`Vector{Float64}` for 1D, `Vector{Tuple{Float64,Float64}}` for 2D,
+Returns `(truths, scan_keys, grid_coords)`: `truths` is the vector of truth NamedTuples,
+`scan_keys` the tuple of scanned parameter names, `grid_coords` the scanned coordinates with
+`truths` (`Vector{Float64}` for 1D, `Vector{Tuple{Float64,Float64}}` for 2D,
 `Vector{Vector{Float64}}` -- one vector per sample, ordered to match `scan_keys` -- for
 the >2D Sobol case).
 """
-function truth_grid(prior, nominal_params, nsi_param_names; n_points=25)
-    free_nsi = [k for k in nsi_param_names if !(prior[k] isa ValueShapes.ConstValueDist) && !(prior[k] isa Number)]
+function truth_grid(prior, nominal_params, tested_names; n_points=25)
+    free = [k for k in tested_names if !_is_fixed(prior[k])]
 
-    magnitude_phase_pairs = Dict(:ε_eμ_abs => :δ_eμ, :ε_eτ_abs => :δ_eτ, :ε_μτ_abs => :δ_μτ)
-    standalone_real = (:Δ_eμ, :Δ_τμ)
-
-    if length(free_nsi) == 1 && free_nsi[1] in standalone_real
-        k = free_nsi[1]
+    if length(free) == 1
+        k = free[1]
         d = prior[k]
         lo, hi = Float64(minimum(d)), Float64(maximum(d))
         grid_coords = collect(range(lo, hi, length=n_points))
         truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(k,)}((v,))), prior) for v in grid_coords]
         return truths, (k,), grid_coords
-    elseif length(free_nsi) == 2 && haskey(magnitude_phase_pairs, free_nsi[1]) &&
-           magnitude_phase_pairs[free_nsi[1]] == free_nsi[2]
-        mag_key, phase_key = free_nsi[1], free_nsi[2]
-        mag_d, phase_d = prior[mag_key], prior[phase_key]
+    elseif length(free) == 2
+        key1, key2 = free[1], free[2]
+        d1, d2 = prior[key1], prior[key2]
         n_per_dim = Int(round(sqrt(n_points)))
-        mag_vals   = collect(range(Float64(minimum(mag_d)), Float64(maximum(mag_d)), length=n_per_dim))
-        phase_vals = collect(range(Float64(minimum(phase_d)), Float64(maximum(phase_d)), length=n_per_dim))
-        grid_coords = [(m, ph) for m in mag_vals for ph in phase_vals]
-        truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(mag_key,phase_key)}((m,ph))), prior)
-                  for (m,ph) in grid_coords]
-        return truths, (mag_key, phase_key), grid_coords
-    elseif length(free_nsi) > 2
-        scan_keys = Tuple(free_nsi)
+        vals1 = collect(range(Float64(minimum(d1)), Float64(maximum(d1)), length=n_per_dim))
+        vals2 = collect(range(Float64(minimum(d2)), Float64(maximum(d2)), length=n_per_dim))
+        grid_coords = [(a, b) for a in vals1 for b in vals2]
+        truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(key1,key2)}((a,b))), prior)
+                  for (a,b) in grid_coords]
+        return truths, (key1, key2), grid_coords
+    elseif length(free) > 2
+        scan_keys = Tuple(free)
         los = Float64[Float64(minimum(prior[k])) for k in scan_keys]
         his = Float64[Float64(maximum(prior[k])) for k in scan_keys]
         seq = Sobol.SobolSeq(los, his)
@@ -291,10 +320,8 @@ function truth_grid(prior, nominal_params, nsi_param_names; n_points=25)
         end
         return truths, scan_keys, grid_coords
     else
-        error("truth_grid: unsupported free-NSI-parameter combination $(free_nsi) -- " *
-              "expected exactly one of $(standalone_real), one of the magnitude/phase " *
-              "pairs $(collect(magnitude_phase_pairs)), or more than 2 free params for " *
-              "Sobol sampling (e.g. cp_all).")
+        error("truth_grid: none of the tested parameters $(collect(tested_names)) is free in the prior -- " *
+              "a hypothesis needs at least one free tested parameter.")
     end
 end
 
@@ -358,6 +385,30 @@ function global_seed_search(likelihood, prior, params, strategy, global_iters, r
 end
 
 """
+    _nudge_into_bounds(prior, params; ε=1e-8)
+
+Return `params` with every free parameter moved at least `ε` inside the bounds of its prior
+(`[lo+ε, hi-ε]`; an infinite side is left alone), and fixed parameters untouched. A start
+exactly on a bound makes BAT's transformation of bounded priors to an unconstrained space
+non-finite, so the fit would fail; interior start values are returned unchanged.
+"""
+function _nudge_into_bounds(prior, params; ε=1e-8)
+    nudged = Dict{Symbol, Any}()
+    for k in keys(params)
+        k in keys(prior) || continue
+        d = prior[k]
+        _is_fixed(d) && continue
+        lo, hi = minimum(d), maximum(d)
+        v = params[k]
+        nv = v
+        isfinite(lo) && nv < lo + ε && (nv = lo + ε)
+        isfinite(hi) && nv > hi - ε && (nv = hi - ε)
+        nv == v || (nudged[k] = convert(typeof(v), nv))
+    end
+    isempty(nudged) ? params : merge(params, NamedTuple(nudged))
+end
+
+"""
     local_find_mle(likelihood, prior, params; fit_method, algorithm, iterations, g_tol, f_tol, x_tol)
 
 Find the MLE using either:
@@ -410,6 +461,7 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
     end
 
     # fit_method == "optim"
+    params = _nudge_into_bounds(prior, params)  # a start on a prior bound would make BAT's transformation non-finite
     target_prior = objective == "likelihood" ? flat_prior(prior) : prior
     posterior = PosteriorMeasure(likelihood, target_prior)
     n_free = count(!(d isa ValueShapes.ConstValueDist) && !(d isa Number) for d in values(prior))
