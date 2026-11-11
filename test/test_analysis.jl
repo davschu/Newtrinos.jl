@@ -864,19 +864,4 @@ DensityInterface.logdensityof(::BimodalNuisanceDensity, p) =
         @test abs(result.b) < 0.1
     end
 
-    @testset "configure_experiments" begin
-        experiments = Newtrinos.configure_experiments(["deepcore"])
-        @test haskey(experiments, :deepcore)
-        @test experiments.deepcore isa Newtrinos.Experiment
-
-        physics = (
-            osc          = Newtrinos.osc.configure(),
-            atm_flux     = Newtrinos.atm_flux.configure(),
-            earth_layers = Newtrinos.earth_layers.configure(),
-            xsec         = Newtrinos.xsec.configure(),
-        )
-        experiments2 = Newtrinos.configure_experiments(["deepcore"], physics)
-        @test haskey(experiments2, :deepcore)
-    end
-
 end

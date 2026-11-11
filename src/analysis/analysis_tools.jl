@@ -70,25 +70,6 @@ end
 # AD backend is set via set_ad_backend() + set_batcontext(ad = select_ad(n))
 # Do NOT set a hardcoded default here — it overrides user selection
 
-# ── Experiment Configuration ───────────────────────────────────────
-
-"""
-    configure_experiments(experiment_list)
-    configure_experiments(experiment_list, physics)
-
-Construct a NamedTuple of configured experiments from a list of experiment name strings.
-Optionally pass a shared `physics` override.
-"""
-function configure_experiments(experiment_list)
-    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)() for exp in experiment_list)
-    return (; pairs...)
-end
-
-function configure_experiments(experiment_list, physics)
-    pairs = (Symbol(lowercase(exp)) => getproperty(getproperty(Newtrinos, Symbol(lowercase(exp))), :configure)(physics) for exp in experiment_list)
-    return (; pairs...)
-end
-
 adsel = AutoForwardDiff()
 set_batcontext(ad = adsel)
 

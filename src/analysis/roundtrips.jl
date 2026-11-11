@@ -83,7 +83,7 @@
 # truth) -- runs via Threads.@threads, same index-owned-output pattern as
 # test_global_seed.jl. Launch with multiple threads to parallelize, e.g.:
 #
-# Usage: julia --threads=8 roundtrips.jl --setup nsi/setups/nsi_deepcore_3y.jl --hypothesis ττ_μμ
+# Usage: julia --threads=8 src/analysis/roundtrips.jl --setup nsi/setups/nsi_deepcore_3y.jl --hypothesis ττ_μμ
 #
 # Output directory: --results-dir (created if missing).
 # Output filenames: grid_roundtrip_<asimov|toydata>_<fluctuated|nominal>_<hypothesis>_<posteriorfit|likelihoodfit>[_<suffix>].{pdf,jld2}
@@ -93,7 +93,7 @@
 # Results (.jld2) are saved BEFORE plotting, so they survive even if plotting fails.
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.activate(joinpath(@__DIR__, "..", ".."))
 
 # Driver-only packages: CLI parsing happens before we know --workers/--threads (needed to
 # decide whether/how to addprocs), and saving/plotting only ever run on the driver after
@@ -326,7 +326,7 @@ end
 # so keep this split defensively rather than relying on that happening to be true today.
 @everywhere begin
     using Accessors
-    include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
+    include(joinpath(@__DIR__, "optimizer_tests_common.jl"))
 end
 
 ### SETUP (physics, experiments, priors, hypotheses: defined by the setup file, see --setup) ###
