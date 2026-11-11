@@ -354,7 +354,8 @@ grid_points = args["grid-points"]
 if length(scan_keys) in (1, 2)
     n_per_dim = length(scan_keys) == 1 ? grid_points : round(Int, sqrt(grid_points)) #take sqrt for 2D scan to keep total points ~ grid_points
     vars_to_scan = OrderedDict{Symbol,Int}(k => n_per_dim for k in scan_keys)
-    init_values, scanpoints, mesh_flat = Newtrinos.generate_scanpoints(vars_to_scan, cp_hyp)
+    init_values, scanpoints = Newtrinos.generate_scanpoints(vars_to_scan, cp_hyp)
+    mesh_flat = vec(Newtrinos._generate_grid(vars_to_scan, cp_hyp)[3])  # grid points in the order of `scanpoints`
 else
     # "all": 8 free NSI params -- grid-points quasi-random samples via a Sobol low-discrepancy
     # sequence over all 8 dimensions jointly, built the same way generate_scanpoints's own
