@@ -434,7 +434,10 @@ elseif lowercase(args["task"]) == "scan"
     # No optimization -- straight likelihood evaluation with every non-scanned parameter
     # frozen at its nominal value `p` (matches Newtrinos.scan's own semantics).
     if length(scan_keys) in (1, 2)
-        result = Newtrinos.scan(likelihood, cp_hyp, vars_to_scan, p)
+        r = Newtrinos.scan(likelihood, cp_hyp, vars_to_scan, p)
+        # FileIO/JLD2 cannot save the NewtrinosResult struct directly -> store its fields in a Dict
+        result = Dict("hypothesis"=>hypothesis_name, "scan_keys"=>Tuple(scan_keys), "axes"=>r.axes,
+                      "values"=>r.values, "meta"=>r.meta, "mesh_flat"=>mesh_flat, "n_grid"=>n_grid, "setup"=>S.name)
     else
         llhs = Vector{Float64}(undef, n_grid)
         @showprogress Threads.@threads for i in 1:n_grid
