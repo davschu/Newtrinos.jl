@@ -1,5 +1,26 @@
-# Tests different optimizer settings via roundtrips with injected truths. Physics, experiments, priors and the
-# hypotheses come from a setup file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl); this script is model-independent.
+# Compares optimizers on the same problems. For each of several injected truth points of one hypothesis of a setup
+# file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl) every optimizer given in --optimizers is run (--nrepeats times,
+# each with its own random seed) with the same objective, bounds and start point and the same evaluation budget, and
+# compared with
+#   * the log-posterior of the injected truth (a successful optimizer ends at or above it), and
+#   * a truth-seeded reference fit (--reference, by default a long LBFGS fit started at the truth).
+# Timing, number of objective evaluations, per-parameter errors and the convergence trace (best objective value so far
+# against evaluations) are recorded for every run.
+#
+# Optimizers are named entries of the registry in optimizer_tests_common.jl (`OPTIMIZERS`); a spec is "name" or
+# "name:key=val,key=val", e.g.
+#   --optimizers optim-lbfgs "optim-pso:particles=50" mh-de "mh-de:N=30,F=0.5" bbo-xnes
+# (run with --list-optimizers to see the names and their settings). Every run is one task; with --workers N the tasks
+# are distributed over N single-threaded worker processes, so timings are comparable.
+#
+# Start point of every optimizer: the setup's nominal parameters (blind, NOT the truth). Gradient-free global methods
+# search the box of the free parameters' prior bounds and start from nothing (optim-pso / optim-sa from that start).
+#
+# Output (in --results-dir, default results/<setup name>/optimizer_tests):
+#   <name>_<hypothesis>_summary.txt      table per optimizer spec
+#   <name>_<hypothesis>_results.jld2     every run (parameters, scores, calls, time, trace), truths, reference fits
+#   <name>_<hypothesis>_traces.pdf       best objective value so far vs evaluations, one panel per truth
+#   <name>_<hypothesis>_summary.pdf      distance to the reference per optimizer, and time vs distance
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, "..", ".."))
@@ -17,6 +38,7 @@ using Accessors
 using ArgParse
 using CairoMakie
 using Random
+using Statistics
 import Optim
 import ForwardDiff
 using ProgressMeter
@@ -33,35 +55,54 @@ function parse_command_line()
         "--setup"
         help = "Setup file defining the physics, experiments, priors and hypotheses (it defines setup(; ftype) -- see nsi/setups/nsi_deepcore_3y.jl for the format)"
         arg_type = String
-        required = true
+        default = ""
 
-        "--hypotheses"
-        help = "Subset of the setup's hypotheses to run, by name, space-separated; default (flag omitted) runs all of them, in the order the setup lists them."
-        nargs = '*'
-        default = String[]
+        "--list-optimizers"
+        help = "Print the registered optimizers with their settings and exit"
+        action = :store_true
 
-        "--name"
-        help = "Name for outputs"
+        "--optimizers"
+        help = "Optimizer specs to compare, space-separated, each \"name\" or \"name:key=val,key=val\" (see --list-optimizers); the same optimizer may appear several times with different settings"
         arg_type = String
-        default = "optimizer_tests"
+        nargs = '+'
+        default = ["optim-lbfgs", "optim-pso:particles=20", "mh-de"]
+
+        "--hypothesis"
+        help = "Name of the hypothesis (from the setup file) to test; default: the first one of the setup"
+        arg_type = String
+        default = ""
+
+        "--budget"
+        help = "Maximum number of objective evaluations per run, for the global optimizers (local optimizers are limited by their own `iterations`; global ones may stop earlier through their own settings, e.g. optim-pso:iters=...)"
+        arg_type = Int
+        default = 2000
 
         "--n-truths"
-        help = "Number of injected truths per hypothesis"
+        help = "Number of injected truth points"
         arg_type = Int
-        default = 20
+        default = 3
 
-        "--seed"
-        help = "RNG seed for truth injection and random starts"
+        "--nrepeats"
+        help = "Independent runs (different random seeds) of every optimizer on every truth point"
         arg_type = Int
-        default = 1234
+        default = 1
 
-        "--truth-mode"
-        help = "How injected truths are generated: controlled (default -- only the hypothesis's tested parameter(s) [+ the --vary-truth-params] are drawn randomly, everything else pinned at nominal values) or random (every free parameter, including all nuisances, drawn randomly from its prior)"
+        "--reference"
+        help = "Optimizer spec of the truth-seeded reference fit (started AT the truth)"
         arg_type = String
-        default = "controlled"
+        default = "optim-lbfgs:iterations=1000"
+
+        "--tol"
+        help = "A run counts as 'reached the reference' if its score is within this value of the reference's score (log-posterior units)"
+        arg_type = Float64
+        default = 0.1
+
+        "--fluctuate-nuisances"
+        help = "Also draw every other free parameter of the hypothesis from its prior for each truth point (the tested parameters' truth is unaffected)"
+        action = :store_true
 
         "--vary-truth-params"
-        help = "In --truth-mode controlled, also draw the truths of these parameters randomly from their priors instead of pinning them at their nominal values, e.g. --vary-truth-params θ₂₃ Δm²₃₁. No effect in --truth-mode random (all free parameters already vary there)."
+        help = "Names of additional parameters whose truth is drawn randomly from their priors, besides the tested parameters of the hypothesis, e.g. --vary-truth-params θ₂₃ Δm²₃₁"
         arg_type = String
         nargs = '*'
         default = String[]
@@ -71,81 +112,32 @@ function parse_command_line()
         arg_type = String
         default = "asimov"
 
-        "--fit-method"
-        help = "Fit method: optim (tunable BAT.bat_findmode + OptimAlg, see --optimizer etc.), newtrinos (standard Newtrinos.find_mle), or ext (Newtrinos.find_mle_ext) -- newtrinos/ext are unmodified, for comparison"
-        arg_type = String
-        default = "optim"
-
-        "--optimizer"
-        help = "Optim.jl algorithm: lbfgs, gradientdescent, conjugategradient, neldermead (only used when --fit-method optim)"
-        arg_type = String
-        default = "lbfgs"
-
         "--objective"
-        help = "What bat_findmode maximizes for --fit-method optim: posterior (likelihood x prior, i.e. MAP -- default) or likelihood (likelihood only, via a flat prior over the same bounds -- i.e. MLE). Ignored for --fit-method newtrinos/ext."
+        help = "What the optimizers maximize: posterior (likelihood x prior, i.e. MAP -- default) or likelihood (likelihood only). Scores are log_posterior resp. llh."
         arg_type = String
         default = "posterior"
 
-        "--iterations"
-        help = "Max iterations for the local optimizer (outer_iterations for Fminbox)"
+        "--seed"
+        help = "Base RNG seed for the truth points and the optimizer runs"
         arg_type = Int
-        default = 2000
+        default = 1234
 
-        "--step-size"
-        help = "Initial step size (alphaguess) for first-order algorithms"
-        arg_type = Float64
-        default = 1.0
-
-        "--g-tol"
-        help = "Gradient-norm convergence tolerance"
-        arg_type = Float64
-        default = 1e-6
-
-        "--f-tol"
-        help = "Function-value relative convergence tolerance"
-        arg_type = Float64
-        default = 0.0
-
-        "--x-tol"
-        help = "Parameter-value relative convergence tolerance"
-        arg_type = Float64
-        default = 0.0
-
-        "--seed-strategy"
-        help = "Starting-point strategy: random, pso, or sa"
+        "--name"
+        help = "Name prefix for the output files"
         arg_type = String
-        default = "random"
+        default = "optimizer_tests"
 
-        "--global-iterations"
-        help = "Iteration budget for the PSO/SA global seed-search stage"
-        arg_type = Int
-        default = 100
+        "--results-dir"
+        help = "Output folder (default: results/<setup name>/optimizer_tests, relative to the working directory)"
+        arg_type = String
+        default = ""
 
-        "--nseeds"
-        help = "Number of independent local-optimizer starts+fits per roundtrip; keeps the best log_posterior (mirrors Newtrinos.profile's nseeds)"
-        arg_type = Int
-        default = 1
-
-        "--pso-particles"
-        help = "Swarm size (n_particles) for Optim.ParticleSwarm during the global seed-search stage (only used with --seed-strategy pso)"
-        arg_type = Int
-        default = 10
-
-        "--plot"
-        help = "Enable plotting"
-        action = :store_true
-
-        "--trace-plots"
-        help = "Save PSO/LBFGS convergence-trace plots per hypothesis (adds trace-collection overhead to do_roundtrip; requires --plot, otherwise has no effect)"
+        "--no-warmup"
+        help = "Skip the warm-up run of every optimizer on every worker (without it the first run of each optimizer includes compilation time in its timing)"
         action = :store_true
 
         "--workers"
-        help = "Number of distributed workers (default: 1, no distributed)"
-        arg_type = Int
-        default = 1
-
-        "--threads"
-        help = "Number of threads per worker (only used when --workers > 1)"
+        help = "Number of distributed single-threaded worker processes (default: 1, no distributed: tasks run one after the other in this process)"
         arg_type = Int
         default = 1
     end
@@ -154,41 +146,41 @@ function parse_command_line()
 end
 
 args = parse_command_line()
-run_start_time = time()
 
-name           = args["name"]
-n_truths       = args["n-truths"]
-data_mode      = lowercase(args["data-mode"])
-truth_mode     = lowercase(args["truth-mode"])
+if args["list-optimizers"]
+    for nm in sort(collect(keys(OPTIMIZERS)))
+        e = OPTIMIZERS[nm]
+        println(rpad(nm, 26), rpad(String(e.kind), 8), isempty(e.defaults) ? "(no settings)" : join(("$k=$(repr(v))" for (k, v) in pairs(e.defaults)), ", "))
+    end
+    exit(0)
+end
+isempty(args["setup"]) && error("--setup is required (e.g. --setup nsi/setups/nsi_deepcore_3y.jl)")
+
+run_start_time = time()
+name       = args["name"]
+n_truths   = args["n-truths"]
+nrepeats   = args["nrepeats"]
+budget     = args["budget"]
+tol        = args["tol"]
+objective  = lowercase(args["objective"])
+data_mode  = lowercase(args["data-mode"])
 vary_truth_params = Tuple(Symbol.(args["vary-truth-params"]))
-fit_method     = lowercase(args["fit-method"])
-optimizer_name = lowercase(args["optimizer"])
-objective      = lowercase(args["objective"])
-iterations     = args["iterations"]
-step_size      = args["step-size"]
-g_tol          = args["g-tol"]
-f_tol          = args["f-tol"]
-x_tol          = args["x-tol"]
-seed_strategy  = lowercase(args["seed-strategy"])
-global_iters   = args["global-iterations"]
-nseeds         = args["nseeds"]
-pso_particles  = args["pso-particles"]
-trace_plots    = args["trace-plots"]
-n_workers      = args["workers"]
-n_threads      = args["threads"]
+n_workers  = args["workers"]
 use_distributed = n_workers > 1
 
 data_mode in ("asimov", "toy") || error("--data-mode must be 'asimov' or 'toy', got '$data_mode'")
-fit_method in ("optim", "newtrinos", "ext") || error("--fit-method must be 'optim', 'newtrinos' or 'ext', got '$fit_method'")
-seed_strategy in ("random", "pso", "sa") || error("--seed-strategy must be 'random', 'pso', or 'sa', got '$seed_strategy'")
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
-truth_mode in ("controlled", "random") || error("--truth-mode must be 'controlled' or 'random', got '$truth_mode'")
 
-algorithm = make_algorithm(optimizer_name, step_size)
+specs    = [parse_optimizer_spec(s) for s in args["optimizers"]]
+ref_spec = parse_optimizer_spec(args["reference"])
+OPTIMIZERS[ref_spec.name].kind == :local || @warn "the reference is normally a local fit started at the truth; got a global optimizer ($(ref_spec.name))"
+n_specs  = length(specs)
+labels   = [s.label for s in specs]
+length(unique(labels)) == n_specs || error("--optimizers: every spec must be different (got duplicates: $labels)")
 
-# Set up distributed workers if requested
+# Distributed workers: single-threaded, so that wall times of different optimizers are comparable
 if use_distributed
-    addprocs(n_workers; exeflags="--threads=$n_threads")
+    addprocs(n_workers; exeflags = "--threads=1")
 
     @everywhere begin
         using Distributions
@@ -199,9 +191,12 @@ if use_distributed
         using ADTypes
         using Newtrinos
         using ValueShapes
-        using Accessors
         import Optim
         import ForwardDiff
+    end
+    # SEPARATE block: `using Accessors` must be loaded before the helper file defines methods using it
+    @everywhere begin
+        using Accessors
         include(joinpath($(@__DIR__), "optimizer_tests_common.jl"))
     end
 end
@@ -211,263 +206,222 @@ end
 include(abspath(args["setup"]))
 S = finalize_setup(setup(; ftype = Float64))
 
+hyp_name = isempty(args["hypothesis"]) ? first(keys(S.hypotheses)) : args["hypothesis"]
+hyp = hypothesis_info(S, hyp_name)
 experiments = S.experiments
 p = S.params
-
-# Filter to the CLI-selected subset (default: all hypotheses of the setup), always in the order the
-# setup lists them regardless of the order the flags were passed in.
-all_names = collect(keys(S.hypotheses))
-selected_hypotheses = isempty(args["hypotheses"]) ? all_names : args["hypotheses"]
-for h in selected_hypotheses
-    h in all_names || error("--hypotheses: unknown hypothesis '$h'. Choose from: $(join(all_names, ", "))")
+prior = hyp.prior
+prior_dist = distprod(; prior...)
+tested_names = hyp.tested
+fluctuated_names = hyp.fluctuated
+for k in vary_truth_params
+    k in keys(prior) || error("--vary-truth-params: unknown parameter $k")
 end
-scan = [nm for nm in all_names if nm in selected_hypotheses]
-hyps = [hypothesis_info(S, nm) for nm in scan]
-cps  = [h.prior for h in hyps]
-n_hyp = length(cps)
+plotted_params = unique([collect(tested_names); collect(vary_truth_params)])   # parameters whose recovery is reported
+results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "optimizer_tests") : args["results-dir"]
+mkpath(results_dir)
+out_prefix = joinpath(results_dir, "$(name)_$(hyp_name)")
 
-# parameters whose truth is varied (and whose fit is plotted/summarized separately): the tested parameters
-# of the selected hypotheses plus --vary-truth-params
-plotted_params = unique(vcat([collect(h.tested) for h in hyps]..., collect(vary_truth_params)))
+println("setup $(S.name), hypothesis '$hyp_name' (tested: $(join(tested_names, ", "))), $n_truths truths x $n_specs optimizers x $nrepeats repeats, budget $budget evaluations")
 
-
-### ROUNDTRIPS WITH INJECTED TRUTH ###
+### TRUTH POINTS ###
 
 rng = Random.Xoshiro(args["seed"])
-
-# Pre-generate all truths and per-task RNGs from the single seeded `rng` before
-# parallelizing, so results are reproducible regardless of thread/worker scheduling order.
-work = Tuple{Int,Int}[(j, i) for j in 1:n_hyp for i in 1:n_truths]
-n_work = length(work)
-
-truth_seeds = Vector{Any}(undef, n_work)
-start_rngs  = Vector{Random.Xoshiro}(undef, n_work)
-for k in 1:n_work
-    j, _ = work[k]
-    prior_dist = distprod(;cps[j]...)
-    truth_seeds[k] = truth_mode == "controlled" ?
-        controlled_truth(rng, p, cps[j], hyps[j].tested; extra_names=vary_truth_params) :
-        rand(rng, prior_dist)
-    start_rngs[k]  = Random.Xoshiro(rand(rng, UInt))
+truths = Vector{Any}(undef, n_truths)
+for i in 1:n_truths
+    t = controlled_truth(rng, p, prior, tested_names; extra_names = vary_truth_params)
+    truths[i] = args["fluctuate-nuisances"] ? fluctuate_nuisances(rng, t, prior, fluctuated_names) : t
 end
 
-random_truth_seeds                 = Matrix{Any}(undef, n_hyp, n_truths)
-likelihoods_for_random_truth_seeds = Matrix{Any}(undef, n_hyp, n_truths)
-scan_results                       = Matrix{Any}(undef, n_hyp, n_truths)
-random_truth_posteriors            = Matrix{Any}(undef, n_hyp, n_truths)
-fit_quality_A                      = Matrix{Float64}(undef, n_hyp, n_truths)
-fit_quality_per_param              = Matrix{Any}(undef, n_hyp, n_truths)
-all_traces                         = Matrix{Any}(undef, n_hyp, n_truths)
+### TASKS ###
 
-if use_distributed
-    @everywhere experiments = $experiments
-    results_flat = @showprogress pmap(1:n_work) do k
-        do_roundtrip(k, work, truth_seeds, data_mode, experiments, cps, seed_strategy,
-                     global_iters, start_rngs, fit_method, algorithm, iterations, g_tol, f_tol, x_tol;
-                     nseeds=nseeds, pso_particles=pso_particles, trace_plots=trace_plots, objective=objective)
+start = _fix_conditioned(p, prior)   # nominal parameters with the prior's pinned parameters forced to their pinned values
+ctx = (; experiments, prior, prior_dist, start, truths, data_mode, objective, budget, specs, ref_spec, seed = args["seed"])
+use_distributed && @everywhere ctx = $ctx
+
+# One task = one optimizer run on one truth point: t = (; i, s, r) -- truth i, spec s (0: the reference fit), repeat r.
+# `ctx` is a per-process global (see roundtrips.jl for why it is broadcast once instead of captured).
+@everywhere function opt_task(t)
+    c = ctx
+    truth = c.truths[t.i]
+    data = c.data_mode == "toy" ? Newtrinos.generate_toy_data(c.experiments, truth) : Newtrinos.generate_asimov_data(c.experiments, truth)
+    L = Newtrinos.generate_likelihood(c.experiments, data)
+    score(r) = c.objective == "likelihood" ? r.llh : r.log_post
+    seed = c.seed + 1_000_003 * t.i + 10_007 * t.s + t.r
+    Random.seed!(seed)                       # the (task-local) global RNG: used by Optim's PSO and BlackBoxOptim
+    if t.s == 0                              # reference fit, started at the truth; also the truth's own score
+        r = run_optimizer(c.ref_spec, L, c.prior_dist, truth; rng = Random.Xoshiro(seed), objective = c.objective)
+        truth_score = c.objective == "likelihood" ? logdensityof(L, truth) : logdensityof(PosteriorMeasure(L, c.prior_dist), truth)
+        return merge(r, (; i = t.i, s = 0, r = t.r, score = score(r), truth_score))
     end
-else
-    results_flat = Vector{Any}(undef, n_work)
-    @showprogress Threads.@threads for k in 1:n_work
-        results_flat[k] = do_roundtrip(k, work, truth_seeds, data_mode, experiments, cps, seed_strategy,
-                                        global_iters, start_rngs, fit_method, algorithm, iterations, g_tol, f_tol, x_tol;
-                                        nseeds=nseeds, pso_particles=pso_particles, trace_plots=trace_plots, objective=objective)
+    r = run_optimizer(c.specs[t.s], L, c.prior, c.start; budget = c.budget, rng = Random.Xoshiro(seed), objective = c.objective)
+    merge(r, (; i = t.i, s = t.s, r = t.r, score = score(r), truth_score = NaN))
+end
+
+# Warm-up: run every optimizer once, tiny, on every worker (and here) so that compilation does not enter the timings
+@everywhere function warmup_task(w)
+    c = ctx
+    truth = c.truths[1]
+    L = Newtrinos.generate_likelihood(c.experiments, Newtrinos.generate_asimov_data(c.experiments, truth))
+    for sp in vcat(c.specs, [c.ref_spec])
+        d = OPTIMIZERS[sp.name].defaults
+        st = sp.settings
+        :iterations in keys(d) && (st = merge(st, (; iterations = 2)))
+        :iters in keys(d) && (st = merge(st, (; iters = 1)))
+        run_optimizer((; sp..., settings = st), L, c.prior, c.start; budget = 40, rng = Random.Xoshiro(1), objective = c.objective)
     end
+    nothing
 end
 
-for (j, i, truth_param, truth_likelihood, fit_result, posterior, A, per_param, all_seed_traces) in results_flat
-    random_truth_seeds[j,i]                 = truth_param
-    likelihoods_for_random_truth_seeds[j,i]  = truth_likelihood
-    scan_results[j,i]                        = fit_result
-    random_truth_posteriors[j,i]             = posterior
-    fit_quality_A[j,i]                       = A
-    fit_quality_per_param[j,i]               = per_param
-    all_traces[j,i]                          = all_seed_traces
-end
-
-for j in 1:n_hyp
-    println("scans for $(scan[j]) completed")
-end
-
-
-### SUMMARY OUTPUT ###
-
-# quantify fit quality with A = 1/n_params * Σ[|param_i_fit - param_i_truth|/(|param_i_truth| + |param_i_fit| + ϵ)]^2     for each injected truth
-# build mean for combined information of several roundtrips with same settings A_bar = 1/n_truths * Σ[A]
-# (computed per-roundtrip in do_roundtrip/fit_quality; here we aggregate across all n_hyp*n_truths roundtrips)
-
-n_total = n_hyp * n_truths
-converged_flags = [scan_results[j,i][4] for j in 1:n_hyp, i in 1:n_truths]
-n_converged     = count(identity, converged_flags)
-n_not_converged = n_total - n_converged
-
-iters_all = [scan_results[j,i][5] for j in 1:n_hyp, i in 1:n_truths]
-iters_valid = filter(x -> !ismissing(x), vec(iters_all))
-mean_iterations = isempty(iters_valid) ? missing : sum(iters_valid) / length(iters_valid)
-
-A_bar = sum(fit_quality_A) / length(fit_quality_A)
-
-# Per-parameter quality: mean squared relative error for each parameter, averaged over
-# every roundtrip where that parameter was free (which hypotheses vary by parameter).
-per_param_sums   = Dict{Symbol, Float64}()
-per_param_counts = Dict{Symbol, Int}()
-for j in 1:n_hyp, i in 1:n_truths
-    for (k, v) in fit_quality_per_param[j,i]
-        per_param_sums[k]   = get(per_param_sums, k, 0.0) + v
-        per_param_counts[k] = get(per_param_counts, k, 0) + 1
+if !args["no-warmup"]
+    println("warm-up (compilation) ...")
+    if use_distributed
+        @sync for w in workers()
+            @async remotecall_wait(warmup_task, w, 1)
+        end
+    else
+        warmup_task(1)
     end
 end
-per_param_quality = Dict(k => per_param_sums[k] / per_param_counts[k] for k in keys(per_param_sums))
 
-# A_bar restricted to the tested/varied parameters (excludes nuisances). With controlled
-# truths, nuisance truths are pinned at nominal (often 0.0), where fit_quality's
-# relative-error formula is degenerate (any nonzero fit reads as ~100% error regardless
-# of absolute closeness) -- A_bar_physical avoids that artifact by only averaging over
-# the parameters actually varied by --truth-mode controlled.
-physical_param_names = Tuple(plotted_params)
-physical_keys = [k for k in keys(per_param_quality) if k in physical_param_names]
-A_bar_physical = isempty(physical_keys) ? NaN :
-    sum(per_param_quality[k] for k in physical_keys) / length(physical_keys)
+ref_tasks = [(; i, s = 0, r = 1) for i in 1:n_truths]
+opt_tasks = [(; i, s, r) for i in 1:n_truths for s in 1:n_specs for r in 1:nrepeats]
+run_tasks(tasks) = use_distributed ? @showprogress(pmap(opt_task, tasks)) : @showprogress(map(opt_task, tasks))
+println("running $(length(ref_tasks)) reference fits + $(length(opt_tasks)) optimizer runs ...")
+ref_records = run_tasks(ref_tasks)
+records     = run_tasks(opt_tasks)
 
-total_elapsed_s = time() - run_start_time
+### EVALUATION ###
+
+b = extract_bounds(prior, p)
+width = Dict(k => b.hi_vec[b.free_x_index[findfirst(==(k), b.all_keys)]] - b.lo_vec[b.free_x_index[findfirst(==(k), b.all_keys)]]
+             for k in plotted_params if k in b.all_keys && b.is_free_mask[findfirst(==(k), b.all_keys)])
+ref_by_truth = Dict(r.i => r for r in ref_records)
+
+# excess_*: how much worse than the truth / the reference a run is (>= 0: worse or equal; < 0: better)
+excess_truth(r) = ref_by_truth[r.i].truth_score - r.score
+excess_ref(r)   = ref_by_truth[r.i].score - r.score
+param_err(r, k) = haskey(width, k) ? abs(Float64(r.params[k]) - Float64(truths[r.i][k])) / width[k] : NaN
+fin(x) = filter(isfinite, x)
+med(x) = isempty(fin(x)) ? NaN : median(fin(x))
 
 summary_lines = String[]
 push!(summary_lines, "=== optimizer_tests summary ===")
-push!(summary_lines, "name: $name")
-push!(summary_lines, "total roundtrips: $n_total ($n_hyp hypotheses [$(join(scan, ", "))] x $n_truths truths)")
-push!(summary_lines, "total wall time: $(round(total_elapsed_s, digits=1))s ($(round(total_elapsed_s/60, digits=1)) min)")
-push!(summary_lines, "converged: $n_converged / $n_total")
-push!(summary_lines, "not converged: $n_not_converged / $n_total")
-push!(summary_lines, "tolerances: g_tol=$g_tol f_tol=$f_tol x_tol=$x_tol")
-push!(summary_lines, "mean iterations: $(mean_iterations)" * (fit_method == "optim" ? "" : " (n/a for --fit-method $fit_method)"))
-push!(summary_lines, "fit quality A_bar (mean over all roundtrips): $A_bar")
-push!(summary_lines, "fit quality A_bar_physical (mean over the tested/varied params only): $A_bar_physical")
-push!(summary_lines, "fit quality per parameter (mean squared relative error):")
-for k in sort(collect(keys(per_param_quality)))
-    push!(summary_lines, "  $k: $(per_param_quality[k])")
+push!(summary_lines, "setup: $(S.name)   hypothesis: $hyp_name (tested: $(join(tested_names, ", ")))")
+push!(summary_lines, "$n_truths truths x $nrepeats repeats, budget $budget evaluations, objective $objective, data $data_mode" *
+                     (args["fluctuate-nuisances"] ? ", nuisances fluctuated" : "") *
+                     (isempty(vary_truth_params) ? "" : ", varied truth params: $(join(vary_truth_params, ", "))"))
+push!(summary_lines, "reference: $(ref_spec.label) at the truth; score = " * (objective == "likelihood" ? "llh" : "log_posterior"))
+push!(summary_lines, "excess = reference score - score of the run (0: as good as the reference; > 0: worse; < 0: better); the plots show Δχ²_ref = 2 × excess")
+push!(summary_lines, "below truth = run ended with a score lower than the injected truth's (a failure of the optimizer)")
+push!(summary_lines, "reached = excess <= $tol")
+push!(summary_lines, "param err = |fit - truth| / prior width, median over runs")
+push!(summary_lines, "")
+header = rpad("optimizer", 34) * rpad("runs", 6) * rpad("med excess", 12) * rpad("max excess", 12) * rpad("reached", 9) *
+         rpad("below truth", 12) * rpad("med calls", 11) * rpad("med time/s", 11) * rpad("failed", 7) * "param err (" * join(plotted_params, ", ") * ")"
+push!(summary_lines, header)
+spec_summaries = Dict{String, Any}()
+for (s, sp) in enumerate(specs)
+    rs = [r for r in records if r.s == s]
+    ex = [excess_ref(r) for r in rs]
+    below = count(r -> isfinite(r.score) && r.score < ref_by_truth[r.i].truth_score - 1e-6, rs)
+    reached = count(e -> isfinite(e) && e <= tol, ex)
+    nfail = count(r -> !isfinite(r.score), rs)
+    perr = [med([param_err(r, k) for r in rs]) for k in plotted_params]
+    spec_summaries[sp.label] = (; n = length(rs), median_excess = med(ex), max_excess = isempty(fin(ex)) ? NaN : maximum(fin(ex)), reached, below_truth = below,
+                                median_calls = med([Float64(coalesce(r.n_calls, NaN)) for r in rs]), median_time = med([r.time for r in rs]), failed = nfail, param_err = perr)
+    sm = spec_summaries[sp.label]
+    push!(summary_lines, rpad(sp.label, 34) * rpad(string(sm.n), 6) * rpad(string(round(sm.median_excess, sigdigits = 3)), 12) *
+        rpad(string(round(sm.max_excess, sigdigits = 3)), 12) * rpad("$(reached)/$(sm.n)", 9) * rpad(string(below), 12) *
+        rpad(string(round(sm.median_calls, digits = 0)), 11) * rpad(string(round(sm.median_time, digits = 1)), 11) * rpad(string(nfail), 7) *
+        join(round.(perr, sigdigits = 2), "  "))
 end
+push!(summary_lines, "")
+push!(summary_lines, "reference fits: median time $(round(med([r.time for r in ref_records]), digits = 1)) s, converged $(count(r -> r.converged === true, ref_records))/$(length(ref_records))" *
+                     ", reference score minus truth score: " * join(round.([r.score - r.truth_score for r in ref_records], sigdigits = 3), ", ") *
+                     " (negative: the reference did not reach the truth's own value)")
+push!(summary_lines, "total wall time: $(round(time() - run_start_time, digits = 1)) s")
 summary_text = join(summary_lines, "\n")
-
 println(summary_text)
+write(out_prefix * "_summary.txt", summary_text * "\n")
 
+### PLOTS ###
 
-### PLOTTING ###
+colors = Makie.to_colormap(:tab10)
+speccolor(s) = colors[mod1(s, length(colors))]
+Δ_label = rich("Δχ", superscript("2"), subscript("ref"))   # Δχ²_ref = 2 (reference score - score of the run)
+ysc = Makie.Symlog10(0.1)   # linear within ±0.1, logarithmic outside: 0 (the reference) and negative values (better than the reference) fit on the axis
 
-if args["plot"]
-    fig = Figure(size=(2000, 400 * (2 + length(plotted_params))))
-
-    for j in 1:n_hyp
-        #log_posterior -- when --objective likelihood, scan_results[j,i][2] is the
-        #flat-prior pseudo-posterior (≈ llh + const, see local_find_mle's docstring),
-        #NOT the true MAP posterior log_p_truth is computed from -- label this clearly
-        #so the mismatch is visible rather than silently misread as MAP recovery.
-        fit_ylabel = objective == "likelihood" ? "best fit flat-prior log_post (∝ llh)" : "best fit value log_p"
-        ax = Axis(fig[1, j], xlabel = "truth value log_p", ylabel = fit_ylabel, title = "$(scan[j])")
-        log_p_truth = [logdensityof(random_truth_posteriors[j,i], random_truth_seeds[j,i]) for i in 1:n_truths]
-        log_p_scan  = [scan_results[j,i][2] for i in 1:n_truths]
-        scatter!(ax, log_p_truth, log_p_scan)
-        ablines!(ax, 0, 1, color=:red) # 0 = x-intercept, 1 = slope
-
-        #log likelihood
-        ax2 = Axis(fig[2, j], xlabel = "truth value llh", ylabel = "best fit value llh")
-        llh_truth = [logdensityof(likelihoods_for_random_truth_seeds[j,i], random_truth_seeds[j,i]) for i in 1:n_truths]
-        llh_scan  = [scan_results[j,i][1] for i in 1:n_truths]
-        scatter!(ax2, llh_truth, llh_scan)
-        ablines!(ax2, 0, 1, color=:red)
-
-        for (nui, nuisance) in enumerate(plotted_params)
-            ax_nui = Axis(fig[2 + nui, j], xlabel="truth value $(nuisance)", ylabel = "best fit value $(nuisance)")
-            idxs = [i for i in 1:n_truths if haskey(random_truth_seeds[j,i], nuisance) && haskey(scan_results[j,i][3], nuisance)]
-            if !isempty(idxs)
-                nui_truth = [random_truth_seeds[j,i][nuisance] for i in idxs]
-                nui_scan  = [scan_results[j,i][3][nuisance] for i in idxs]
-                scatter!(ax_nui, nui_truth, nui_scan)
-                ablines!(ax_nui, 0, 1, color=:red)
-            end
-        end
+# Trace of a run in Δχ²_ref = 2 × (excess above the reference) against evaluations. Global optimizers: the trace of the best
+# objective value so far per evaluation. Local fits: Optim's per-iteration trace (in BAT's transformed space, shifted to
+# end at the run's final objective value), with the iterations spread evenly over the run's likelihood calls.
+function trace_xy(r)
+    ref_obj = -ref_by_truth[r.i].score
+    if r.trace_evals === missing
+        tr = collect(Float64, r.trace_best)
+        isempty(tr) && return Float64[], Float64[]
+        tr = tr .- tr[end] .- r.score
+        n = length(tr)
+        calls = r.n_calls === missing ? n : r.n_calls
+        x = n == 1 ? [Float64(calls)] : [1 + (calls - 1) * (j - 1) / (n - 1) for j in 1:n]
+        return x, 2 .* (tr .- ref_obj)
     end
-
-    save(name * "_roundtrips.pdf", fig)
+    Float64.(r.trace_evals), 2 .* (r.trace_best .- ref_obj)
 end
 
-
-### OPTIMIZER TRACE PLOTTING ###
-
-# Per hypothesis: one combined PSO panel and one combined LBFGS panel, overlaying every
-# truth (one color per truth) and every seed's individual trajectory (nseeds>1) in that
-# truth's color, with a dashed horizontal line at that truth's -logposterior.
-if args["plot"] && trace_plots
-    fig2 = Figure(size=(1200, 400 * n_hyp))
-    truth_colors = Makie.wong_colors()
-
-    for j in 1:n_hyp
-        ax_pso   = Axis(fig2[j, 1], xlabel="PSO generation", ylabel="-logposterior (obj)",
-                         yscale=log10, title="$(scan[j]) -- PSO seed search")
-        ax_lbfgs = Axis(fig2[j, 2], xlabel="LBFGS iteration", ylabel="-logposterior",
-                         yscale=log10, title="$(scan[j]) -- LBFGS polish")
-
-        for i in 1:n_truths
-            color = truth_colors[mod1(i, length(truth_colors))]
-            truth_neglogpost = -logdensityof(random_truth_posteriors[j,i], random_truth_seeds[j,i])
-            for (pso_trace, lbfgs_trace) in all_traces[j,i]
-                !isempty(pso_trace)   && lines!(ax_pso,   0:length(pso_trace)-1,   max.(pso_trace, eps());   color=color, label="truth $i")
-                !isempty(lbfgs_trace) && lines!(ax_lbfgs, 0:length(lbfgs_trace)-1, max.(lbfgs_trace, eps()); color=color, label="truth $i")
-            end
-            hlines!(ax_pso,   [max(truth_neglogpost, eps())]; color=color, linestyle=:dash)
-            hlines!(ax_lbfgs, [max(truth_neglogpost, eps())]; color=color, linestyle=:dash)
-        end
-        axislegend(ax_lbfgs, merge=true, unique=true, position=:rt)
+ncols = min(n_truths, 3)
+nrows = cld(n_truths, ncols)
+fig = Figure(size = (550 * ncols, 420 * nrows + 60))
+for i in 1:n_truths
+    ax = Axis(fig[(i - 1) ÷ ncols + 1, (i - 1) % ncols + 1], xlabel = "objective evaluations", ylabel = Δ_label, title = "truth $i",
+              xscale = log10, yscale = ysc)
+    for r in records
+        r.i == i || continue
+        x, y = trace_xy(r)
+        isempty(x) && continue
+        lines!(ax, x, y; color = speccolor(r.s), label = labels[r.s])
     end
-
-    save(name * "_optimizer_traces.pdf", fig2)
+    hlines!(ax, [0.0]; color = :black, linestyle = :dash)                                                        # the reference fit
+    hlines!(ax, [2 * (ref_by_truth[i].score - ref_by_truth[i].truth_score)]; color = :gray, linestyle = :dot)   # the injected truth's own value
 end
+Legend(fig[nrows + 1, 1:ncols], [LineElement(color = speccolor(s)) for s in 1:n_specs], labels, orientation = :horizontal, tellwidth = false)
+save(out_prefix * "_traces.pdf", fig)
 
+fig2 = Figure(size = (1300, 480))
+ax1 = Axis(fig2[1, 1], ylabel = Δ_label, yscale = ysc,
+           xticks = (1:n_specs, labels), xticklabelrotation = π / 6, title = "distance to the reference")
+for (s, sp) in enumerate(specs)
+    rs = [r for r in records if r.s == s]
+    ex = [2 * excess_ref(r) for r in rs]
+    ok = isfinite.(ex)
+    any(ok) && scatter!(ax1, fill(s, count(ok)) .+ 0.12 .* (rand(count(ok)) .- 0.5), ex[ok]; color = speccolor(s))
+end
+hlines!(ax1, [0.0]; color = :black, linestyle = :dash)   # the reference fit
+hlines!(ax1, [2 * tol]; color = :gray, linestyle = :dot)   # 'reached' threshold
+ax2 = Axis(fig2[1, 2], xlabel = "wall time / s", ylabel = Δ_label, xscale = log10, yscale = ysc, title = "time vs distance")
+for (s, sp) in enumerate(specs)
+    rs = [r for r in records if r.s == s && isfinite(excess_ref(r))]
+    isempty(rs) || scatter!(ax2, [r.time for r in rs], [2 * excess_ref(r) for r in rs]; color = speccolor(s), label = labels[s])
+end
+hlines!(ax2, [0.0]; color = :black, linestyle = :dash)
+Legend(fig2[1, 3], ax2, framevisible = false)
+save(out_prefix * "_summary.pdf", fig2)
 
 ### SAVE RESULTS ###
 
 results_dict = Dict{String, Any}(
-    "settings" => Dict(
-        "data_mode"          => data_mode,
-        "truth_mode"         => truth_mode,
-        "vary_truth_params"  => collect(string.(vary_truth_params)),
-        "fit_method"         => fit_method,
-        "optimizer"          => optimizer_name,
-        "objective"          => objective,
-        "iterations"         => iterations,
-        "step_size"          => step_size,
-        "g_tol"              => g_tol,
-        "f_tol"              => f_tol,
-        "x_tol"              => x_tol,
-        "seed_strategy"      => seed_strategy,
-        "global_iterations"  => global_iters,
-        "nseeds"             => nseeds,
-        "pso_particles"      => pso_particles,
-        "trace_plots"        => trace_plots,
-        "n_truths"           => n_truths,
-        "seed"               => args["seed"],
-        "setup"              => S.name,
-    ),
-    "hypotheses"           => scan,
-    "truth_params"         => random_truth_seeds,
-    "fitted_llh"           => [scan_results[j,i][1] for j in 1:n_hyp, i in 1:n_truths],
-    "fitted_log_posterior" => [scan_results[j,i][2] for j in 1:n_hyp, i in 1:n_truths],
-    "fitted_params"        => [scan_results[j,i][3] for j in 1:n_hyp, i in 1:n_truths],
-    "converged"            => [scan_results[j,i][4] for j in 1:n_hyp, i in 1:n_truths],
-    "n_iterations"         => iters_all,
-    "fit_quality_A"        => fit_quality_A,
-    "fit_quality_per_param_per_roundtrip" => fit_quality_per_param,
-    "optimizer_traces"     => all_traces,
-    "summary" => Dict(
-        "n_total"                  => n_total,
-        "n_converged"              => n_converged,
-        "n_not_converged"          => n_not_converged,
-        "mean_iterations"          => mean_iterations,
-        "fit_quality_A_bar"        => A_bar,
-        "fit_quality_A_bar_physical" => A_bar_physical,
-        "fit_quality_per_param"    => per_param_quality,
-        "total_elapsed_s"          => total_elapsed_s,
-        "text"                     => summary_text,
-    ),
+    "settings" => Dict("setup" => S.name, "hypothesis" => hyp_name, "tested" => collect(string.(tested_names)), "optimizers" => labels,
+                       "reference" => ref_spec.label, "budget" => budget, "n_truths" => n_truths, "nrepeats" => nrepeats,
+                       "objective" => objective, "data_mode" => data_mode, "fluctuate_nuisances" => args["fluctuate-nuisances"],
+                       "vary_truth_params" => collect(string.(vary_truth_params)), "seed" => args["seed"], "tol" => tol,
+                       "workers" => n_workers),
+    "truths"          => truths,
+    "reference_fits"  => ref_records,
+    "records"         => records,
+    "excess_ref"      => [excess_ref(r) for r in records],
+    "excess_truth"    => [excess_truth(r) for r in records],
+    "summary"         => spec_summaries,
+    "summary_text"    => summary_text,
 )
-
-FileIO.save(name * "_roundtrip_results.jld2", results_dict)
+FileIO.save(out_prefix * "_results.jld2", results_dict)
+println("saved results to $results_dir")

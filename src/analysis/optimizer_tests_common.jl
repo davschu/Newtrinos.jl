@@ -2,6 +2,11 @@
 # and (via @everywhere) on distributed workers, so it must not reference any variable
 # that isn't passed in as an argument.
 
+import Random
+import Metaheuristics
+import BlackBoxOptim
+import OptimizationLBFGSB
+
 """Build an Optim.jl algorithm object from the CLI-selected name and step size."""
 function make_algorithm(optimizer_name, step_size)
     alphaguess = Optim.LineSearches.InitialStatic(alpha=step_size)
@@ -141,31 +146,6 @@ function flat_prior(prior)
         for (k, d) in pairs(prior)
     ]
     distprod(; NamedTuple(kvs)...)
-end
-
-"""
-    fit_quality(truth_param, fit_param, prior; eps=1e-8)
-
-Per-roundtrip fit-quality measure over the parameters that were free in `prior`
-(fixed/conditioned parameters are excluded, matching `extract_bounds`):
-
-    A = 1/n_params * Σ [ |fit_i - truth_i| / (|truth_i| + |fit_i| + eps) ]^2
-
-Returns `(A, per_param)` where `per_param` is a `Dict{Symbol,Float64}` of each free
-parameter's individual squared relative error (before averaging), so per-parameter
-quality can be aggregated separately across roundtrips.
-"""
-function fit_quality(truth_param, fit_param, prior; eps=1e-8)
-    per_param = Dict{Symbol, Float64}()
-    for k in keys(prior)
-        d = prior[k]
-        (d isa ValueShapes.ConstValueDist || d isa Number) && continue
-        t = Float64(truth_param[k])
-        f = Float64(fit_param[k])
-        per_param[k] = ((abs(f - t)) / (abs(t) + abs(f) + eps))^2
-    end
-    A = isempty(per_param) ? NaN : sum(values(per_param)) / length(per_param)
-    (A, per_param)
 end
 
 """
@@ -325,41 +305,83 @@ function truth_grid(prior, nominal_params, tested_names; n_points=25)
     end
 end
 
+# ---- optimizer registry ----------------------------------------------------------------------------
+# One table of named optimizers. A spec string "name:key=val,key=val" (see `parse_optimizer_spec`) selects an
+# entry and overrides some of its defaults. Two kinds:
+#   :global  gradient-free search in the box [lo, hi] of the free parameters, backend
+#            `fn(counter, b, cfg, budget, rng) -> (; converged, n_iters, native)`; run by `global_find_mle`.
+#   :local   gradient-based fit through `local_find_mle`, run by `run_optimizer`.
+# To add an optimizer write a backend function and call `register_optimizer!` (end of this section).
+
+const OPTIMIZERS = Dict{String, NamedTuple}()
+
 """
-    global_seed_search(likelihood, prior, params, strategy, global_iters, rng; n_particles=10)
+    register_optimizer!(name, kind, fn, defaults)
 
-2-stage seeding: runs a short bounded, gradient-free global search (PSO or simulated
-annealing) over the free parameters and returns an updated `params` NamedTuple with the
-free entries replaced by the global search's best point, to be used as the starting
-point for the local optimizer's polish step. `strategy == "random"` bypasses this and
-just draws a fresh random start from the priors via `randomize_free_params`.
-
-`n_particles` sets `Optim.ParticleSwarm`'s swarm size (`strategy == "pso"` only —
-`SimulatedAnnealing` is a single-trajectory method with no equivalent knob).
-
-`objective` (matches `local_find_mle`'s convention) selects what this *global* search
-stage targets: `"posterior"` (default, unchanged behavior -- `-(llh + log_prior)` over
-`prior`'s real, possibly non-flat, distributions) or `"likelihood"` (`-llh` alone, no
-prior term -- consistent with how `local_find_mle` switches to `flat_prior(prior)` under
-`objective="likelihood"`, see its docstring). Pass the same `objective` to both this
-function and the subsequent `local_find_mle` call so the seed-search and polish stages
-target the same thing; otherwise a posterior-biased seed (pulled toward high-prior-density
-regions by e.g. `Truncated(Normal)` nuisance priors or bounded NSI params) gets handed to
-a purely-likelihood-targeting local polish.
-
-`return_trace=true` additionally returns the best-objective-value-so-far at each
-generation (`Optim.f_trace(result)`), for diagnosing how many generations the global
-search actually needs before plateauing; default `false` keeps the normal single-value
-return for all existing callers.
+Add (or replace) an entry of the optimizer registry. `kind` is `:global` or `:local`; `defaults` is the NamedTuple
+of settings the entry understands (a spec may override only these keys, the type of a default decides how a
+command-line value is parsed; a default of `nothing` means "unset, parse as number or string").
 """
-function global_seed_search(likelihood, prior, params, strategy, global_iters, rng; n_particles=10, return_trace=false, objective="posterior")
-    if strategy == "random"
-        seeded = randomize_free_params(rng, params, prior)
-        return return_trace ? (seeded, Float64[]) : seeded
+function register_optimizer!(name::AbstractString, kind::Symbol, fn, defaults::NamedTuple)
+    kind in (:global, :local) || error("register_optimizer!: kind must be :global or :local, got $kind")
+    OPTIMIZERS[String(name)] = (; kind, fn, defaults)
+    nothing
+end
+
+function _parse_setting(default, v::AbstractString)
+    v = strip(v)
+    default isa Bool    && return parse(Bool, v)
+    default isa Symbol  && return Symbol(v)
+    default isa Integer && return something(tryparse(Int, v), Int(round(parse(Float64, v))))
+    default isa AbstractFloat && return parse(Float64, v)
+    default isa AbstractString && return String(v)
+    # default === nothing: number if it looks like one, else string
+    n = tryparse(Int, v);  n === nothing || return n
+    x = tryparse(Float64, v);  x === nothing || return x
+    String(v)
+end
+
+"""
+    parse_optimizer_spec(str) -> (; name, label, settings)
+
+Parse `"name"` or `"name:key=val,key=val"`. `settings` holds only the keys given in `str`; an unknown optimizer name
+or setting key is an error that lists the valid ones. `label` is the spec string itself (used to tell apart several
+specs of the same optimizer in tables and plots).
+"""
+function parse_optimizer_spec(str::AbstractString)
+    name, rest = occursin(':', str) ? String.(split(str, ':'; limit = 2)) : (String(str), "")
+    haskey(OPTIMIZERS, name) || error("unknown optimizer '$name'. Registered: $(join(sort(collect(keys(OPTIMIZERS))), ", "))")
+    defaults = OPTIMIZERS[name].defaults
+    kv = Pair{Symbol, Any}[]
+    for item in split(rest, ','; keepempty = false)
+        occursin('=', item) || error("optimizer spec '$str': expected key=value, got '$item'")
+        k, v = split(item, '='; limit = 2)
+        sym = Symbol(strip(k))
+        sym in keys(defaults) || error("optimizer '$name' has no setting '$sym'. Valid settings: $(join(keys(defaults), ", "))")
+        push!(kv, sym => _parse_setting(defaults[sym], v))
     end
+    (; name, label = String(str), settings = NamedTuple(kv))
+end
 
+function _merge_settings(name, defaults, settings)
+    for k in keys(settings)
+        k in keys(defaults) || error("optimizer '$name' has no setting '$k'. Valid settings: $(join(keys(defaults), ", "))")
+    end
+    merge(defaults, settings)
+end
+
+# ---- shared objective and evaluation counter ----
+
+"""
+    make_objective(likelihood, prior, params; objective="posterior") -> (obj, b)
+
+The function that the gradient-free optimizers minimize, `obj(x)` for the vector `x` of the FREE parameters of `prior`
+(in prior order; fixed parameters sit at their fixed value, `b = extract_bounds(prior, params)`):
+`-(llh + log prior)` for `objective="posterior"`, `-llh` for `"likelihood"`, `Inf` where not finite. It is the
+quantity `local_find_mle` maximizes (up to the sign), so values from both kinds of optimizer are comparable.
+"""
+function make_objective(likelihood, prior, params; objective = "posterior")
     b = extract_bounds(prior, params)
-
     function obj(x::AbstractVector)
         all_x = [b.is_free_mask[i] ? x[b.free_x_index[i]] : b.fixed_float[i] for i in 1:length(b.all_keys)]
         full_params = NamedTuple{b.all_keys}(Tuple(all_x))
@@ -371,18 +393,255 @@ function global_seed_search(likelihood, prior, params, strategy, global_iters, r
             isfinite(llh_val) && isfinite(prior_val) ? -(llh_val + prior_val) : Inf
         end
     end
-
-    galg = strategy == "pso" ? Optim.ParticleSwarm(lower=b.lo_vec, upper=b.hi_vec, n_particles=n_particles) :
-                                Optim.SimulatedAnnealing()
-
-    x0 = clamp.(b.x0_vec, b.lo_vec, b.hi_vec)
-    result = Optim.optimize(obj, x0, galg, Optim.Options(iterations=global_iters, store_trace=return_trace))
-    x_best = Optim.minimizer(result)
-
-    all_x = [b.is_free_mask[i] ? x_best[b.free_x_index[i]] : b.fixed_float[i] for i in 1:length(b.all_keys)]
-    seeded = NamedTuple{b.all_keys}(Tuple(all_x))
-    return_trace ? (seeded, Optim.f_trace(result)) : seeded
+    obj, b
 end
+
+"""Thrown by a `CountingObjective` whose evaluation budget is used up (caught by `global_find_mle`)."""
+struct BudgetExhausted <: Exception end
+
+"""
+    CountingObjective(f, budget)
+
+Callable wrapper around the objective `f` that records the cumulative number of evaluations and the best value so far
+at every call (`evals`, `bests`) plus the best point (`best_x`), whatever library calls it, and throws
+`BudgetExhausted` once `budget` evaluations are used (`budget = nothing`: no limit). One instance per optimizer run
+(not thread-safe).
+"""
+mutable struct CountingObjective{F}
+    f::F
+    budget::Union{Int, Nothing}
+    n::Int
+    best::Float64
+    best_x::Vector{Float64}
+    evals::Vector{Int}
+    bests::Vector{Float64}
+end
+CountingObjective(f, budget) = CountingObjective(f, budget, 0, Inf, Float64[], Int[], Float64[])
+
+function (c::CountingObjective)(x::AbstractVector)
+    !isnothing(c.budget) && c.n >= c.budget && throw(BudgetExhausted())
+    v = Float64(c.f(x))
+    c.n += 1
+    if isempty(c.best_x) || v < c.best
+        c.best = v
+        c.best_x = Vector{Float64}(x)
+    end
+    push!(c.evals, c.n)
+    push!(c.bests, c.best)
+    v
+end
+
+# ---- global backends: fn(counter, b, cfg, budget, rng) ----
+
+function _backend_optim_pso(counter, b, cfg, budget, rng)
+    iters = !isnothing(cfg.iters) ? cfg.iters :
+            !isnothing(budget)    ? max(1, budget ÷ cfg.particles) :
+            error("optim-pso needs `iters` or a budget")
+    x0  = clamp.(b.x0_vec, b.lo_vec, b.hi_vec)
+    alg = Optim.ParticleSwarm(lower = b.lo_vec, upper = b.hi_vec, n_particles = cfg.particles)
+    res = Optim.optimize(counter, x0, alg, Optim.Options(iterations = iters, store_trace = true))
+    (; converged = missing, n_iters = Optim.iterations(res), native = Optim.f_trace(res))
+end
+
+function _backend_optim_sa(counter, b, cfg, budget, rng)
+    iters = !isnothing(cfg.iters) ? cfg.iters : !isnothing(budget) ? budget : error("optim-sa needs `iters` or a budget")
+    x0  = clamp.(b.x0_vec, b.lo_vec, b.hi_vec)
+    res = Optim.optimize(counter, x0, Optim.SimulatedAnnealing(), Optim.Options(iterations = iters, store_trace = true))
+    (; converged = missing, n_iters = Optim.iterations(res), native = Optim.f_trace(res))
+end
+
+function _mh_run(counter, b, budget, alg_fn, rng)
+    isnothing(budget) && error("Metaheuristics optimizers need a budget (function evaluations)")
+    bounds = permutedims(hcat(b.lo_vec, b.hi_vec))
+    # `iterations` is large so that f_calls_limit (not the default iteration cap) is the stopping rule
+    opts = Metaheuristics.Options(f_calls_limit = budget, iterations = 10_000_000, seed = rand(rng, 1:10^9))
+    state = Metaheuristics.optimize(x -> counter(x), bounds, alg_fn(opts))   # (it wants a plain function, not a callable struct)
+    (; converged = missing, n_iters = state.iteration, native = Float64[])
+end
+_backend_mh_pso(counter, b, cfg, budget, rng) = _mh_run(counter, b, budget, o -> Metaheuristics.PSO(N = cfg.N, C1 = cfg.C1, C2 = cfg.C2, ω = cfg.ω, options = o), rng)
+_backend_mh_de(counter, b, cfg, budget, rng)  = _mh_run(counter, b, budget, o -> Metaheuristics.DE(N = cfg.N, F = cfg.F, CR = cfg.CR, options = o), rng)
+_backend_mh_abc(counter, b, cfg, budget, rng) = _mh_run(counter, b, budget, o -> Metaheuristics.ABC(N = cfg.N, Ne = cfg.Ne, No = cfg.No, limit = cfg.limit, options = o), rng)
+
+function _backend_bbo(counter, b, cfg, budget, rng)
+    isnothing(budget) && error("BlackBoxOptim optimizers need a budget (function evaluations)")
+    kw = Pair{Symbol, Any}[:SearchRange => [(b.lo_vec[i], b.hi_vec[i]) for i in eachindex(b.lo_vec)],
+                           :Method => cfg.method, :MaxFuncEvals => budget, :TraceMode => :silent]
+    isnothing(cfg.population) || push!(kw, :PopulationSize => cfg.population)
+    # BlackBoxOptim draws from the (task-local) global RNG: seed it before the call (see `run_optimizer`)
+    res = BlackBoxOptim.bboptimize(counter; kw...)
+    (; converged = missing, n_iters = BlackBoxOptim.f_calls(res), native = Float64[])
+end
+
+"""
+    global_find_mle(likelihood, prior, params, name; budget=nothing, settings=(;), rng, objective="posterior",
+                    return_trace=false)
+
+Gradient-free global search for the best point of the free parameters of `prior` (bounded box), using the registered
+`:global` optimizer `name` (`optim-pso`, `optim-sa`, `mh-pso`, `mh-de`, `mh-abc`, `bbo`, ... see `OPTIMIZERS`) with
+`settings` overriding its defaults. `budget` is the maximum number of objective evaluations (`nothing`: the
+optimizer's own limit, e.g. `iters` of `optim-pso`). Not seeded from `params` except that `optim-pso`/`optim-sa`
+start from it.
+
+Returns `(llh, log_posterior, params, converged, n_iters)` like `local_find_mle`, except that `converged` is always `missing`:
+a global search has no convergence criterion (it normally ends on its budget); a failed fit is signalled by `NaN` values. With `return_trace=true` a 6th element
+`(; evals, best, native)`: cumulative objective evaluations and best objective value so far (`-log posterior` for the
+posterior objective) at every call, and the library's own per-iteration trace if it has one. `log_posterior` is
+`llh` for `objective="likelihood"` (flat prior; compare `llh`).
+"""
+function global_find_mle(likelihood, prior, params, name::AbstractString; budget = nothing, settings = (;),
+                         rng = Random.default_rng(), objective = "posterior", return_trace = false)
+    haskey(OPTIMIZERS, name) || error("unknown optimizer '$name'. Registered: $(join(sort(collect(keys(OPTIMIZERS))), ", "))")
+    entry = OPTIMIZERS[name]
+    entry.kind == :global || error("optimizer '$name' is a local optimizer; use `run_optimizer`/`local_find_mle`")
+    cfg = _merge_settings(name, entry.defaults, settings)
+    obj, b = make_objective(likelihood, prior, params; objective)
+    all(isfinite, b.lo_vec) && all(isfinite, b.hi_vec) ||
+        error("global optimizer '$name' needs finite bounds for every free parameter")
+    counter = CountingObjective(obj, budget)
+    info = try
+        entry.fn(counter, b, cfg, budget, rng)
+    catch e
+        e isa BudgetExhausted || rethrow(e)
+        (; converged = missing, n_iters = missing, native = Float64[])
+    end
+    if isempty(counter.best_x) || !isfinite(counter.best)
+        nan_params = NamedTuple{b.all_keys}(ntuple(_ -> NaN, length(b.all_keys)))
+        result = (NaN, NaN, nan_params, missing, missing)
+        return return_trace ? (result..., (; evals = counter.evals, best = counter.bests, native = info.native)) : result
+    end
+    all_x = [b.is_free_mask[i] ? counter.best_x[b.free_x_index[i]] : b.fixed_float[i] for i in 1:length(b.all_keys)]
+    fit = NamedTuple{b.all_keys}(Tuple(all_x))
+    llh = logdensityof(likelihood, fit)
+    log_post = objective == "likelihood" ? llh : -counter.best
+    result = (llh, log_post, fit, info.converged, info.n_iters)
+    return_trace ? (result..., (; evals = counter.evals, best = counter.bests, native = info.native)) : result
+end
+
+"""
+    generate_seed(likelihood, prior, params, strategy, global_iters, rng; n_particles=10, return_trace=false, objective="posterior")
+
+Start point for the local optimizer. `strategy == "random"`: a fresh random draw from the priors
+(`randomize_free_params`). `"pso"` / `"sa"`: a short bounded global search (`optim-pso` with `n_particles` and
+`global_iters` generations, resp. `optim-sa`) via `global_find_mle`; its best point (free entries; fixed entries at their
+fixed values) is returned as a `params` NamedTuple. Any other registered `:global` optimizer name works too, with a
+budget of `global_iters * n_particles` evaluations.
+
+`objective` ("posterior" or "likelihood") selects the target of the global search; pass the same `objective` to the
+subsequent `local_find_mle`, otherwise a posterior-biased seed is handed to a likelihood-only polish.
+
+`return_trace=true` additionally returns the best objective value so far per generation (Optim's own trace) for
+`"pso"`/`"sa"`, or per evaluation for the other optimizers.
+"""
+function generate_seed(likelihood, prior, params, strategy, global_iters, rng; n_particles = 10, return_trace = false, objective = "posterior")
+    if strategy == "random"
+        seeded = randomize_free_params(rng, params, prior)
+        return return_trace ? (seeded, Float64[]) : seeded
+    end
+    res = if strategy == "pso"
+        global_find_mle(likelihood, prior, params, "optim-pso"; settings = (; particles = n_particles, iters = global_iters),
+                        rng, objective, return_trace = true)
+    elseif strategy == "sa"
+        global_find_mle(likelihood, prior, params, "optim-sa"; settings = (; iters = global_iters),
+                        rng, objective, return_trace = true)
+    else
+        global_find_mle(likelihood, prior, params, strategy; budget = global_iters * n_particles,
+                        rng, objective, return_trace = true)
+    end
+    seeded = res[3]
+    if !return_trace
+        return seeded
+    end
+    tr = res[6]
+    (seeded, strategy in ("pso", "sa") ? tr.native : tr.best)
+end
+
+# ---- run any registered optimizer on one problem ----
+
+"""
+    run_optimizer(spec, likelihood, prior, params; budget=nothing, rng, objective="posterior") -> NamedTuple
+
+Run the optimizer described by `spec` (a string, see `parse_optimizer_spec`, or its parsed NamedTuple) on one
+problem and return a uniform record
+`(; label, llh, log_post, params, converged, n_iters, n_calls, time, trace_evals, trace_best)`:
+(`converged` is `missing` for the `:global` optimizers: they end on their budget, there is no convergence criterion),
+wall time of the fit, the number of objective evaluations (`n_calls`; for `:local` optimizers the number of
+likelihood calls including every ForwardDiff pass, `missing` if it could not be counted), and the trace of the best
+objective value so far (`-log posterior` for the posterior objective) against cumulative evaluations (for `:local`
+optimizers per iteration, with `trace_evals = missing`). `prior` is a NamedTuple of distributions or its `distprod`.
+"""
+function run_optimizer(spec, likelihood, prior, params; budget = nothing, rng = Random.default_rng(), objective = "posterior")
+    spec isa AbstractString && (spec = parse_optimizer_spec(spec))
+    entry = OPTIMIZERS[spec.name]
+    cfg = _merge_settings(spec.name, entry.defaults, spec.settings)
+    t0 = time()
+    if entry.kind == :global
+        r = global_find_mle(likelihood, prior, params, spec.name; budget, settings = spec.settings, rng, objective, return_trace = true)
+        return (; label = spec.label, llh = r[1], log_post = r[2], params = r[3], converged = r[4], n_iters = r[5],
+                n_calls = isempty(r[6].evals) ? 0 : r[6].evals[end], time = time() - t0,
+                trace_evals = r[6].evals, trace_best = r[6].best)
+    end
+    prior_local = prior isa NamedTuple ? distprod(; prior...) : prior   # BAT needs the distprod-wrapped prior
+    r = entry.fn(likelihood, prior_local, params, cfg, objective)   # (llh, log_post, params, converged, n_iters, trace, n_calls)
+    (; label = spec.label, llh = r[1], log_post = r[2], params = r[3], converged = r[4], n_iters = r[5],
+       n_calls = r[7], time = time() - t0, trace_evals = missing, trace_best = r[6])
+end
+
+# local backends: fn(likelihood, prior, params, cfg, objective) -> (llh, log_post, params, converged, n_iters, trace, n_calls)
+
+# counts the likelihood calls of a local fit (every ForwardDiff pass counts as one call)
+struct CountedLikelihood{L}
+    l::L
+    n::Base.RefValue{Int}
+end
+DensityInterface.DensityKind(c::CountedLikelihood) = DensityInterface.DensityKind(c.l)   # BAT requires an `IsDensity` likelihood
+DensityInterface.logdensityof(c::CountedLikelihood, x) = (c.n[] += 1; DensityInterface.logdensityof(c.l, x))
+
+function _ad_backend(name::Symbol)
+    name == :auto && return nothing
+    name == :forward && return ADTypes.AutoForwardDiff()
+    name == :polyester && return ADTypes.AutoPolyesterForwardDiff()
+    error("unknown ad setting '$name' (auto, forward, polyester)")
+end
+
+function _local_optim(alg_name)
+    function (likelihood, prior, params, cfg, objective)
+        algorithm = make_algorithm(alg_name, cfg.step_size)
+        counted = CountedLikelihood(likelihood, Ref(0))
+        r = local_find_mle(counted, prior, params; fit_method = "optim", algorithm, iterations = cfg.iterations,
+                           g_tol = cfg.g_tol, f_tol = cfg.f_tol, x_tol = cfg.x_tol, return_trace = true, objective,
+                           ad_backend = _ad_backend(cfg.ad))
+        (r[1], r[2], r[3], r[4], r[5], r[6], counted.n[])
+    end
+end
+_local_newtrinos(likelihood, prior, params, cfg, objective) =
+    (r = local_find_mle(likelihood, prior, params; fit_method = "newtrinos", return_trace = true); (r[1], r[2], r[3], r[4], r[5], r[6], missing))
+_local_ext(likelihood, prior, params, cfg, objective) =
+    (r = local_find_mle(likelihood, prior, params; fit_method = "ext", iterations = cfg.iterations, g_tol = cfg.g_tol, return_trace = true);
+     (r[1], r[2], r[3], r[4], r[5], r[6], missing))
+
+# ---- registered optimizers ----
+const _LOCAL_DEFAULTS = (; iterations = 2000, g_tol = 1e-6, f_tol = 0.0, x_tol = 0.0, step_size = 1.0, ad = :auto)
+register_optimizer!("optim-lbfgs",             :local, _local_optim("lbfgs"),             _LOCAL_DEFAULTS)
+register_optimizer!("optim-gradientdescent",   :local, _local_optim("gradientdescent"),   _LOCAL_DEFAULTS)
+register_optimizer!("optim-conjugategradient", :local, _local_optim("conjugategradient"), _LOCAL_DEFAULTS)
+register_optimizer!("optim-neldermead",        :local, _local_optim("neldermead"),        _LOCAL_DEFAULTS)
+function _local_lbfgsb(likelihood, prior, params, cfg, objective)
+    counted = CountedLikelihood(likelihood, Ref(0))
+    r = local_find_mle(counted, prior, params; fit_method = "lbfgsb", iterations = cfg.iterations, g_tol = cfg.reltol, lbfgsb_m = cfg.m,
+                       return_trace = true, objective, ad_backend = _ad_backend(cfg.ad))
+    (r[1], r[2], r[3], r[4], r[5], r[6], counted.n[])
+end
+register_optimizer!("lbfgsb", :local, _local_lbfgsb, (; iterations = 1000, reltol = 1e-7, m = 10, ad = :auto))
+register_optimizer!("newtrinos", :local, _local_newtrinos, (;))
+register_optimizer!("ext",       :local, _local_ext,       (; iterations = 2000, g_tol = 1e-6))
+register_optimizer!("optim-pso", :global, _backend_optim_pso, (; particles = 20, iters = nothing))
+register_optimizer!("optim-sa",  :global, _backend_optim_sa,  (; iters = nothing))
+register_optimizer!("mh-pso", :global, _backend_mh_pso, (; N = 100, C1 = 2.0, C2 = 2.0, ω = 0.8))
+register_optimizer!("mh-de",  :global, _backend_mh_de,  (; N = 100, F = 0.7, CR = 0.5))
+register_optimizer!("mh-abc", :global, _backend_mh_abc, (; N = 50, Ne = 25, No = 25, limit = 10))
+register_optimizer!("bbo",      :global, _backend_bbo, (; method = :adaptive_de_rand_1_bin_radiuslimited, population = nothing))
+register_optimizer!("bbo-xnes",  :global, _backend_bbo, (; method = :xnes, population = nothing))
+register_optimizer!("bbo-dxnes", :global, _backend_bbo, (; method = :dxnes, population = nothing))
 
 """
     _nudge_into_bounds(prior, params; ε=1e-8)
@@ -426,6 +685,9 @@ Find the MLE using either:
   zero-lower-bound NSI parameters (`ε_eμ_abs`, etc.), which is exactly where these fits
   tend to sit. Routing through `OptimAlg`'s reparametrization avoids all of that, the same
   way `Newtrinos.find_mle` already does.
+- `fit_method == "lbfgsb"`: L-BFGS-B (`OptimizationLBFGSB`, through BAT's `OptimizationAlg`) in the same transformed space, like
+  `Newtrinos.find_mle` but tunable: `iterations` -> `maxiters`, `g_tol` -> `reltol` (projected-gradient tolerance), `lbfgsb_m` -> memory.
+  Returns the per-iteration `-log posterior` as trace when `return_trace=true`; `converged` is the solver's `Success` return code.
 - `fit_method == "newtrinos"`: the standard `Newtrinos.find_mle` unmodified (hardcoded
   LBFGS/maxiters=2000/f_abstol=1e-2), included here so it can be compared against the
   tunable path on the same roundtrips.
@@ -450,7 +712,7 @@ when `objective="likelihood"`, not the true MAP posterior -- callers comparing a
 `objective` settings should use `llh`, not `log_posterior`, for a like-for-like
 likelihood comparison.
 """
-function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm=nothing, iterations=nothing, g_tol=nothing, f_tol=nothing, x_tol=nothing, return_trace=false, objective="posterior", ad_backend=nothing)
+function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm=nothing, iterations=nothing, g_tol=nothing, f_tol=nothing, x_tol=nothing, return_trace=false, objective="posterior", ad_backend=nothing, lbfgsb_m=10)
     if fit_method == "newtrinos"
         llh_, lp_, res_ = Newtrinos.find_mle(likelihood, prior, params)  # no convergence flag returned: finite posterior counts as converged
         result = (llh_, lp_, res_, isfinite(lp_), missing)
@@ -460,13 +722,14 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
         return return_trace ? (result..., Float64[]) : result
     end
 
-    # fit_method == "optim"
+    # fit_method == "optim" or "lbfgsb"
+    fit_method in ("optim", "lbfgsb") || error("local_find_mle: unknown fit_method '$fit_method' (optim, lbfgsb, newtrinos, ext)")
     params = _nudge_into_bounds(prior, params)  # a start on a prior bound would make BAT's transformation non-finite
     target_prior = objective == "likelihood" ? flat_prior(prior) : prior
     posterior = PosteriorMeasure(likelihood, target_prior)
     n_free = count(!(d isa ValueShapes.ConstValueDist) && !(d isa Number) for d in values(prior))
 
-    @info "Running Optimization (optim, $(typeof(algorithm).name.name)) for point" n_free=n_free iterations=iterations objective=objective
+    @info "Running Optimization ($fit_method, $(fit_method == "lbfgsb" ? "L-BFGS-B" : typeof(algorithm).name.name)) for point" n_free=n_free iterations=iterations objective=objective
 
     try
         t0 = time()
@@ -479,17 +742,29 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
         @info "starting optimization"
         # BAT 5: the Optim backend sits inside TransformedMaxDensity (which also takes the start point); `store_trace` is an OptimAlg field
         # `bat_findmode` only returns the mode, so go through `evalmeasure` to also get the Optim result (convergence, iterations, trace)
-        em = BAT.evalmeasure(posterior, TransformedMaxDensity(optalg=OptimAlg(optalg=algorithm, maxiters=iterations, store_trace=return_trace,
-                                                kwargs=(g_tol=g_tol, f_reltol=f_tol, x_reltol=x_tol)), init=ExplicitInit([params])), context) # set bat context locally
-        res = (result = BAT.mode(em), info = em.evalinfo.result.info)
+        # fit_method "lbfgsb": L-BFGS-B (OptimizationLBFGSB, via BAT's OptimizationAlg) in the same transformed space, as Newtrinos.find_mle does but
+        # tunable: `iterations` -> maxiters, `g_tol` -> reltol (L-BFGS-B's projected-gradient tolerance), `lbfgsb_m` -> memory size.
+        # Its first step is scaled by the gradient norm, unlike LBFGS with a static first step. `store_trace` records the objective per iteration.
+        optalg_obj = fit_method == "lbfgsb" ?
+            OptimizationAlg(optalg=OptimizationLBFGSB.LBFGSB(m=lbfgsb_m), maxiters=iterations, reltol=Float64(g_tol), store_trace=return_trace) :
+            OptimAlg(optalg=algorithm, maxiters=iterations, store_trace=return_trace, kwargs=(g_tol=g_tol, f_reltol=f_tol, x_reltol=x_tol))
+        em = BAT.evalmeasure(posterior, TransformedMaxDensity(optalg=optalg_obj, init=ExplicitInit([params])), context) # set bat context locally
+        res = (result = BAT.mode(em), info = em.evalinfo.result.info, trace = fit_method == "lbfgsb" ? em.evalinfo.result.trace_trafo : nothing)
         @info "extracting fit results"
-        converged = Optim.converged(res.info)
         llh      = logdensityof(likelihood, res.result)
         log_post = logdensityof(posterior, res.result)
-        n_iters  = Optim.iterations(res.info)
-        @info "Optimization (optim) finished" converged=converged elapsed_s=round(time()-t0, digits=1) iterations=n_iters
+        if fit_method == "lbfgsb"
+            converged = Symbol(res.info.retcode) == :Success    # (MaxIters: ran into `iterations`)
+            n_iters   = res.info.stats.iterations
+            f_trace   = isnothing(res.trace) ? Float64[] : -collect(Float64, res.trace.logd)   # -log posterior per iteration, as Optim's f_trace
+        else
+            converged = Optim.converged(res.info)
+            n_iters   = Optim.iterations(res.info)
+            f_trace   = return_trace ? Optim.f_trace(res.info) : Float64[]
+        end
+        @info "Optimization ($fit_method) finished" converged=converged elapsed_s=round(time()-t0, digits=1) iterations=n_iters
         result = (llh, log_post, res.result, converged, n_iters)
-        return return_trace ? (result..., Optim.f_trace(res.info)) : result
+        return return_trace ? (result..., f_trace) : result
     catch e
 	(e isa ArgumentError || e isa AssertionError) || rethrow(e)
         @warn "local_find_mle caught $(typeof(e)), returning NaN" exception=(e, catch_backtrace())
@@ -497,76 +772,4 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
         result = (NaN, NaN, nan_params, false, missing)
         return return_trace ? (result..., Float64[]) : result
     end
-end
-
-"""
-    do_roundtrip(k, work, truth_seeds, data_mode, experiments, cps, seed_strategy,
-                 global_iters, start_rngs, fit_method, algorithm, iterations, g_tol, f_tol, x_tol;
-                 nseeds=1, pso_particles=10, trace_plots=false, objective="posterior")
-
-Run one truth-injection roundtrip: build the truth-injected likelihood, then run `nseeds`
-independent local-optimizer fits (each from its own starting point via
-`global_seed_search`) and keep whichever converged to the highest `log_posterior`
-(`NaN` treated as `-Inf`) — mirrors `Newtrinos.profile(...; nseeds=N)`'s multi-start
-pattern. `nseeds=1` (the default) reduces to a single fit, unchanged from before.
-
-Also computes `fit_quality` (see that function's docstring) comparing the injected truth
-against the winning fit's parameters, over the free parameters of this hypothesis.
-
-`trace_plots=true` additionally collects, for every seed `s in 1:nseeds` (not just the
-winner), a `(pso_trace, lbfgs_trace)` pair via `global_seed_search`/`local_find_mle`'s
-`return_trace`, for convergence-trace plotting. Default `false` skips trace collection
-entirely (no `store_trace` overhead) and returns an empty vector for that element.
-
-`objective` is passed straight through to `local_find_mle` (see its docstring): with
-`"likelihood"`, `log_post`/`best_log_post`'s seed-selection comparison is the flat-prior
-pseudo-posterior, which differs from true MAP posterior only by a constant, so picking
-the highest one across seeds still selects the highest-likelihood fit correctly.
-
-Returns `(j, i, truth_param, truth_likelihood, fit_result, posterior, A, per_param, all_seed_traces)`.
-"""
-function do_roundtrip(k, work, truth_seeds, data_mode, experiments, cps, seed_strategy,
-                       global_iters, start_rngs, fit_method, algorithm, iterations, g_tol, f_tol, x_tol;
-                       nseeds=1, pso_particles=10, trace_plots=false, objective="posterior")
-    j, i = work[k]
-    prior_dist = distprod(;cps[j]...)
-    truth_param = truth_seeds[k]
-
-    injected_data = data_mode == "toy" ?
-        Newtrinos.generate_toy_data(experiments, truth_param) :
-        Newtrinos.generate_asimov_data(experiments, truth_param)
-    println("generated data")
-    truth_likelihood = Newtrinos.generate_likelihood(experiments, injected_data)
-    println("generated likelihood")
-
-    best_result = nothing
-    best_log_post = -Inf
-    all_seed_traces = Tuple{Vector{Float64},Vector{Float64}}[]
-    for s in 1:nseeds
-        if trace_plots
-            start_param, pso_trace = global_seed_search(truth_likelihood, cps[j], truth_param, seed_strategy, global_iters, start_rngs[k]; n_particles=pso_particles, return_trace=true)
-        else
-            start_param = global_seed_search(truth_likelihood, cps[j], truth_param, seed_strategy, global_iters, start_rngs[k]; n_particles=pso_particles)
-            pso_trace = Float64[]
-        end
-        println("generated start seed $s/$nseeds")
-        println("now fitting:")
-        result = local_find_mle(truth_likelihood, prior_dist, start_param;
-            fit_method=fit_method, algorithm=algorithm, iterations=iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
-            return_trace=trace_plots, objective=objective)
-        if trace_plots
-            push!(all_seed_traces, (pso_trace, result[6]))
-            result = result[1:5]
-        end
-        log_post = isnan(result[2]) ? -Inf : result[2]
-        if log_post > best_log_post
-            best_result = result
-            best_log_post = log_post
-        end
-    end
-    fit_result = best_result
-    println("finished fitting, now calculating truth posterior")
-    posterior = PosteriorMeasure(truth_likelihood, prior_dist)
-    A, per_param = fit_quality(truth_param, fit_result[3], cps[j])
-    (j, i, truth_param, truth_likelihood, fit_result, posterior, A, per_param, all_seed_traces)
 end

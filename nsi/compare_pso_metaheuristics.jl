@@ -82,9 +82,9 @@ algorithm  = make_algorithm("lbfgs", REF_LBFGS_STEP_SIZE)
 println("Hypothesis '$HYPOTHESIS': scan_keys=$(Tuple(scan_keys)), n_truth=$N_TRUTH, " *
         "n_particles=$N_PARTICLES, global_iters=$GLOBAL_ITERS, total_fevals=$FEVALS")
 
-### OBJECTIVE (same posterior objective global_seed_search uses, built directly here so it
+### OBJECTIVE (same posterior objective generate_seed uses, built directly here so it
 ### can be handed to both Optim.optimize and Metaheuristics.optimize without going through
-### global_seed_search's own Optim-specific call) ###
+### generate_seed's own Optim-specific call) ###
 
 function make_objective(likelihood, b)
     function obj(x::AbstractVector)
@@ -135,10 +135,10 @@ Threads.@threads for t in 1:N_TRUTH
 
     algo_runs = Vector{AlgoRun}(undef, 4)
 
-    # 1) Optim.jl PSO -- reuse global_seed_search as-is, no reimplementation.
+    # 1) Optim.jl PSO -- reuse generate_seed as-is, no reimplementation.
     rng1 = Random.Xoshiro(SEED + 1_000_000 + t)
     t0 = time()
-    _, f_trace = global_seed_search(truth_likelihood, cp_hyp, p, "pso", GLOBAL_ITERS, rng1;
+    _, f_trace = generate_seed(truth_likelihood, cp_hyp, p, "pso", GLOBAL_ITERS, rng1;
                                      n_particles=N_PARTICLES, return_trace=true, objective="posterior")
     elapsed1 = time() - t0
     best_so_far1 = accumulate(min, f_trace)

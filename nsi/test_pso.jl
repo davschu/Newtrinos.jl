@@ -5,7 +5,7 @@
 # checks how well PSO ALONE (no LBFGS polish) recovers the injected truth.
 #
 # Phase 2's PSO search is seeded BLIND, at the nominal parameter values (not at the
-# injected truth) -- passing the truth itself as global_seed_search's seed-anchor would
+# injected truth) -- passing the truth itself as generate_seed's seed-anchor would
 # warm-start one particle exactly at the answer, trivially "recovering" it regardless of
 # PSO settings and defeating the point of testing PSO's own search ability in isolation.
 #
@@ -283,12 +283,12 @@ Threads.@threads for k in 1:n_tasks
         subrun_rng = Random.Xoshiro(args["seed"] + 1_000_000 + k * 1000 + m)
 
         t0 = time()
-        # Seeded BLIND at nominal params `p`, NOT at tp.truth_param -- global_seed_search
+        # Seeded BLIND at nominal params `p`, NOT at tp.truth_param -- generate_seed
         # uses its `params` argument as the free-dims x0 anchor for the PSO search
         # (extract_bounds), so passing the truth here would warm-start (part of) the
         # swarm exactly at the answer, trivially "recovering" it regardless of PSO
         # settings and making this diagnostic measure almost nothing (see file header).
-        fit_param, pso_trace = global_seed_search(tp.truth_likelihood, cp_hyp, p, "pso",
+        fit_param, pso_trace = generate_seed(tp.truth_likelihood, cp_hyp, p, "pso",
                                                    combo.global_iterations, subrun_rng;
                                                    n_particles=combo.n_particles, return_trace=true, objective="posterior")
         seed_elapsed = time() - t0

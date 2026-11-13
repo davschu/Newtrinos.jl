@@ -70,9 +70,12 @@
 #   is computed from llh (not log_post) in likelihood mode, since log_post there is only the
 #   flat-prior pseudo-posterior, not the true MAP posterior truth_log_post is computed from.
 #
-# --global-iterations/--pso-particles/--iterations/--step-size/--g-tol/--f-tol/--x-tol:
-#   tunable PSO seed-search and LBFGS polish settings (same flag names as
-#   optimizer_tests.jl); all recorded in the saved .jld2's "settings" block.
+# --global-iterations/--pso-particles/--iterations/--g-tol:
+#   tunable PSO seed-search and local-fit settings; all recorded in the saved .jld2's "settings" block.
+#   The local fits (smseed/mle seed fits, the main fit and the extra fits of --prior-effect/--chi2-mis-modeling)
+#   use L-BFGS-B (fit_method "lbfgsb" of local_find_mle): --iterations is its maxiters, --g-tol its tolerance.
+#   (Plain LBFGS with a static first step jumps onto the prior bounds from a start far from the optimum and
+#   then stops with a vanishing gradient, which broke blind starts such as --seed-strategy smseed.)
 #
 # --toydata: inject Poisson-fluctuated toy data (Newtrinos.generate_toy_data) instead of
 #   the default noiseless Asimov data. Also widens the plot to show all nuisance/physics
@@ -172,29 +175,14 @@ function parse_command_line()
         default = 20
 
         "--iterations"
-        help = "Max iterations for the local LBFGS optimizer (outer_iterations for Fminbox)"
+        help = "Max iterations of the local L-BFGS-B optimizer"
         arg_type = Int
         default = 300
 
-        "--step-size"
-        help = "Initial step size (alphaguess) for LBFGS"
-        arg_type = Float64
-        default = 1.0
-
         "--g-tol"
-        help = "Gradient-norm convergence tolerance"
+        help = "Convergence tolerance of the local L-BFGS-B optimizer (projected-gradient tolerance)"
         arg_type = Float64
-        default = 0.0
-
-        "--f-tol"
-        help = "Function-value relative convergence tolerance"
-        arg_type = Float64
-        default = 0.0
-
-        "--x-tol"
-        help = "Parameter-value relative convergence tolerance"
-        arg_type = Float64
-        default = 0.0
+        default = 1e-7
 
         "--nseeds"
         help = "Number of independent PSO-seed + LBFGS-polish attempts per grid point (each PSO search uses a fresh RNG draw so sub-runs explore differently); keeps the attempt with the highest log_post. Default 1 reproduces the single-attempt behavior exactly. Ignored (treated as 1) under --seed-strategy smseed, which has no per-attempt randomness to exploit."
@@ -232,10 +220,7 @@ objective = lowercase(args["objective"])
 global_iterations = args["global-iterations"]
 pso_particles = args["pso-particles"]
 lbfgs_iterations = args["iterations"]
-step_size = args["step-size"]
 g_tol = args["g-tol"]
-f_tol = args["f-tol"]
-x_tol = args["x-tol"]
 prior_effect_flag = args["prior-effect"]
 toydata_flag = args["toydata"]
 nseeds = args["nseeds"]
@@ -353,7 +338,6 @@ is_2d = length(scan_keys) == 2
 println("Truth grid built for hypothesis '$hypothesis_name': $(n_grid) points, scanning $(scan_keys)")
 
 prior_dist = distprod(;cp_hyp...)
-algorithm = make_algorithm("lbfgs", step_size)
 
 # `ExplicitInit` strictly validates the init point against every constant entry of
 # `cp_sm`'s prior (its conditioned oscillation/flux params + all 8 NSI params pinned to
@@ -384,8 +368,8 @@ cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
 # own already-broadcast copy -- confirmed this does NOT re-send ctx per call). When
 # `!use_distributed`, this is just a plain global in the single process, no different from
 # today's top-level variables.
-ctx = (; experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p, algorithm,
-       nseeds, seed_strategy, lbfgs_iterations, g_tol, f_tol, x_tol, objective,
+ctx = (; experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p,
+       nseeds, seed_strategy, lbfgs_iterations, g_tol, objective,
        global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
        fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_many, is_2d,
        fluctuate_nuisances_flag)
@@ -409,8 +393,8 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
 # @everywhere unconditionally (harmless/equivalent to a plain `function` when there are no
 # extra worker processes) so it works identically in both modes without a branch here.
 @everywhere function run_grid_point(k)
-    experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p, algorithm,
-        nseeds, seed_strategy, lbfgs_iterations, g_tol, f_tol, x_tol, objective,
+    experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p,
+        nseeds, seed_strategy, lbfgs_iterations, g_tol, objective,
         global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
         fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_many, is_2d,
         fluctuate_nuisances_flag = ctx
@@ -468,7 +452,7 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
             # NSI params still at 0 -- on as the seed for the main (unconstrained) fit.
             sm_init = merge(p, cp_sm_overrides_nt)
             sm_res = local_find_mle(truth_likelihood, distprod(;cp_sm...), sm_init;
-                fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+                fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
                 ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
             # The null-model fit leaves the tested parameters at their null values, which can sit exactly on
             # a prior bound (e.g. 0 for a magnitude), and other free parameters may land on a bound too.
@@ -485,17 +469,17 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
             # pattern as nsi_scan.jl's "mle" strategy).
             mle_start = rand(attempt_rng, prior_dist)
             mle_res = local_find_mle(truth_likelihood, prior_dist, mle_start;
-                fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+                fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
                 ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
             mle_res[3]
         else
-            global_seed_search(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, attempt_rng; n_particles=pso_particles, objective=objective)
+            generate_seed(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, attempt_rng; n_particles=pso_particles, objective=objective)
         end
         this_seed_elapsed = time() - ts0
 
         ts1 = time()
         res = local_find_mle(truth_likelihood, prior_dist, start_param;
-            fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+            fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
             ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
         this_lbfgs_elapsed = time() - ts1
 
@@ -560,7 +544,7 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
         # posterior maximum near truth, independent of what the main fit optimized.
         t3 = time()
         _, log_post_ref, _, converged_ref, _ = local_find_mle(truth_likelihood, prior_dist, truth_param;
-            fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+            fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
             ad_backend=ADTypes.AutoForwardDiff(), objective="posterior")
         prior_pull_elapsed = time() - t3
         Δχ²_prior_pull = 2 * (log_post_ref - truth_log_post)
@@ -589,7 +573,7 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
         # whichever attempt happened to run/finish last.
         profile_start = merge(best_start_param, NamedTuple{Tuple(scan_keys)}(Tuple(fixed_vals[k] for k in scan_keys)))
         _, log_post_fixed, _, converged_fixed, _ = local_find_mle(truth_likelihood, prior_fixed, profile_start;
-            fit_method="optim", algorithm=algorithm, iterations=lbfgs_iterations, g_tol=g_tol, f_tol=f_tol, x_tol=x_tol,
+            fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
             ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
         profile_elapsed = time() - t2
         Δχ²_mis_modeling = 2 * (log_post - log_post_fixed)
@@ -697,10 +681,8 @@ FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
         "global_iterations" => global_iterations,
         "pso_particles"     => pso_particles,
         "iterations"        => lbfgs_iterations,
-        "step_size"         => step_size,
+        "local_optimizer"   => "lbfgsb",
         "g_tol"             => g_tol,
-        "f_tol"             => f_tol,
-        "x_tol"             => x_tol,
         "hypothesis"        => hypothesis_name,
         "n_points"          => n_points,
         "fluctuate_nuisances" => fluctuate_nuisances_flag,
@@ -719,10 +701,8 @@ FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "settings_global_iterations"   => global_iterations,
     "settings_pso_particles"       => pso_particles,
     "settings_iterations"          => lbfgs_iterations,
-    "settings_step_size"           => step_size,
+    "settings_local_optimizer"     => "lbfgsb",
     "settings_g_tol"               => g_tol,
-    "settings_f_tol"               => f_tol,
-    "settings_x_tol"               => x_tol,
     "settings_prior_effect"        => prior_effect_flag,
     "settings_toydata"             => toydata_flag,
     "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
@@ -736,19 +716,16 @@ println("Saved results to $(joinpath(results_dir, "grid_roundtrip_$(output_tag).
 # Single combined figure: NSI panel(s) first, then (if --fluctuate-nuisances) nuisance +
 # physics panels, then a Δχ²_mod histogram. All panels share the same small-multiples
 # layout (row, 2*col axis / 2*col+1 colorbar), one shared "converged"/"not converged"
-# legend in column 1 spanning every row, Δχ²_mod colors the FIT points (converged only --
-# a non-converged fit's log_post may be unreliable, so those keep a fixed marker instead).
+# legend in column 1 spanning every row, Δχ²_mod colors the FIT points. Converged fits are drawn as
+# circles/diamonds, non-converged fits as crosses in the same color scale; only fits whose Δχ²_mod is
+# not finite (the fit itself failed) are drawn as grey crosses.
 
 conv_flags = [r.converged for r in results]
 Δχ²_all = [r.Δχ²_mod for r in results]
-# colorrange is only ever applied to CONVERGED points' colors (non-converged points always
-# render as fixed red X's, never colored by Δχ²_all -- see the per-panel drawing code
-# below) -- computing it from the full Δχ²_all (including non-converged points, whose
-# Δχ²_mod can be NaN when local_find_mle fails) previously let extrema return (NaN, NaN)
-# whenever ANY point failed to converge, even if every OTHER point converged fine. A NaN
-# colorrange silently corrupts every Colorbar's internal image and crashes CairoMakie's
-# PDF renderer (ArgumentError: start and stop must be finite) -- filtering to converged,
-# finite values avoids that regardless of how many points failed to converge.
+# colorrange is computed from the FINITE Δχ²_mod values of all points, converged or not (a failed
+# fit has Δχ²_mod = NaN when local_find_mle fails; those points are drawn grey). A NaN colorrange
+# silently corrupts every Colorbar's internal image and crashes CairoMakie's PDF renderer
+# (ArgumentError: start and stop must be finite), so only finite values enter it.
 #
 # Separately, a DEGENERATE (zero-width) range -- cmin == cmax, e.g. only 1 converged point,
 # or every converged point sharing the exact same Δχ²_mod -- is finite but still crashes
@@ -764,11 +741,15 @@ conv_flags = [r.converged for r in results]
 # `lo == hi` check above passed as "not degenerate" (confirmed: this exact pair of
 # near-but-not-equal Float64 Δχ²_mod values from a real run crashed CairoMakie's PDF
 # renderer with "Can't interpolate in a range where cmin == cmax" despite lo != hi here).
-Δχ²_converged_finite = filter(isfinite, Δχ²_all[conv_flags])
-colorrange = if isempty(Δχ²_converged_finite)
+fin_flags = isfinite.(Δχ²_all)
+sel_conv = conv_flags .& fin_flags        # converged, drawn as circles/diamonds
+sel_nonc = .!conv_flags .& fin_flags      # not converged, drawn as crosses in the same color scale
+sel_fail = .!fin_flags                    # fit failed (Δχ²_mod not finite), grey crosses
+Δχ²_finite = Δχ²_all[fin_flags]
+colorrange = if isempty(Δχ²_finite)
     (-1.0, 1.0)
 else
-    lo, hi = extrema(Δχ²_converged_finite)
+    lo, hi = extrema(Δχ²_finite)
     Float32(lo) == Float32(hi) ? (lo - max(abs(lo), 1.0) * 1e-3 - 1e-6, hi + max(abs(hi), 1.0) * 1e-3 + 1e-6) : (lo, hi)
 end
 
@@ -825,12 +806,12 @@ for (idx, spec) in enumerate(panel_specs)
             end
         end
 
-        local plt_conv = scatter!(ax, truth_vals[conv_flags], fit_vals[conv_flags];
-                             color=Δχ²_all[conv_flags], colormap=:viridis, colorrange=colorrange,
+        local plt_conv = scatter!(ax, truth_vals[sel_conv], fit_vals[sel_conv];
+                             color=Δχ²_all[sel_conv], colormap=:viridis, colorrange=colorrange,
                              markersize=8, label="converged")
-        if any(!, conv_flags)
-            scatter!(ax, truth_vals[.!conv_flags], fit_vals[.!conv_flags]; color=:red, marker=:xcross, markersize=10, label="not converged")
-        end
+        any(sel_nonc) && scatter!(ax, truth_vals[sel_nonc], fit_vals[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=:viridis,
+                                  colorrange=colorrange, marker=:xcross, markersize=10, label="not converged")
+        any(sel_fail) && scatter!(ax, truth_vals[sel_fail], fit_vals[sel_fail]; color=:gray, marker=:xcross, markersize=10, label="fit failed")
         ablines!(ax, 0, 1, color=:red, linestyle=:dash)
         Colorbar(fig[row, 2*col + 1], plt_conv, label=Δχ²_label, ticklabelsize=9, labelsize=10)
         if plt_conv_for_legend === nothing
@@ -847,12 +828,12 @@ for (idx, spec) in enumerate(panel_specs)
         local fit_phases   = [r.fit_param[phase_key] for r in results]
 
         scatter!(ax, truth_mags, truth_phases; color=:steelblue, marker=:circle, markersize=10, label="truth")
-        local plt_fit = scatter!(ax, fit_mags[conv_flags], fit_phases[conv_flags];
-                            color=Δχ²_all[conv_flags], colormap=:viridis, colorrange=colorrange,
+        local plt_fit = scatter!(ax, fit_mags[sel_conv], fit_phases[sel_conv];
+                            color=Δχ²_all[sel_conv], colormap=:viridis, colorrange=colorrange,
                             marker=:diamond, markersize=12, label="fit (converged)")
-        if any(!, conv_flags)
-            scatter!(ax, fit_mags[.!conv_flags], fit_phases[.!conv_flags]; color=:red, marker=:xcross, markersize=14, label="fit (not converged)")
-        end
+        any(sel_nonc) && scatter!(ax, fit_mags[sel_nonc], fit_phases[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=:viridis,
+                                  colorrange=colorrange, marker=:xcross, markersize=14, label="fit (not converged)")
+        any(sel_fail) && scatter!(ax, fit_mags[sel_fail], fit_phases[sel_fail]; color=:gray, marker=:xcross, markersize=14, label="fit failed")
         Colorbar(fig[row, 2*col + 1], plt_fit, label=Δχ²_label, ticklabelsize=9, labelsize=10)
 
     elseif spec.kind == :histogram
@@ -869,9 +850,10 @@ end
 
 legend_elems = [
     MarkerElement(color=:steelblue, marker=:circle, markersize=10),
-    MarkerElement(color=:red, marker=:xcross, markersize=10),
+    MarkerElement(color=:steelblue, marker=:xcross, markersize=10),
+    MarkerElement(color=:gray, marker=:xcross, markersize=10),
 ]
-Legend(fig[1:n_rows, 1], legend_elems, ["converged", "not converged"]; tellwidth=true, tellheight=false)
+Legend(fig[1:n_rows, 1], legend_elems, ["converged", "not converged", "fit failed (no Δχ²)"]; tellwidth=true, tellheight=false)
 
 title_suffix = fluctuate_nuisances_flag ? ", fluctuated nuisances" : ""
 sample_kind = is_many ? "Sobol sample, " : ""
