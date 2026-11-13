@@ -70,12 +70,14 @@
 #   is computed from llh (not log_post) in likelihood mode, since log_post there is only the
 #   flat-prior pseudo-posterior, not the true MAP posterior truth_log_post is computed from.
 #
-# --global-iterations/--pso-particles/--iterations/--g-tol:
-#   tunable PSO seed-search and local-fit settings; all recorded in the saved .jld2's "settings" block.
-#   The local fits (smseed/mle seed fits, the main fit and the extra fits of --prior-effect/--chi2-mis-modeling)
-#   use L-BFGS-B (fit_method "lbfgsb" of local_find_mle): --iterations is its maxiters, --g-tol its tolerance.
-#   (Plain LBFGS with a static first step jumps onto the prior bounds from a start far from the optimum and
-#   then stops with a vanishing gradient, which broke blind starts such as --seed-strategy smseed.)
+# --strategy: the fit at every grid point is a chain of stages (find_mle_advanced in optimizer_tests_common.jl), e.g.
+#   --strategy smseed lbfgsb | --strategy optim-pso:particles=20,iters=50 lbfgsb | --strategy random lbfgsb. Every stage starts from
+#   the result of the previous one; seed, alias and global stages (random, manual, smseed, mle, optim-pso, ...) are only allowed first.
+#   The stage settings (iterations, tolerances, particles, ...) are part of the stage spec and recorded in the saved .jld2's
+#   "settings" block. A strategy that is a single global search is not polished and has no convergence flag
+#   (`converged = missing`, drawn with its own marker). --start chooses the start point of the first stage (nominal or truth).
+#   Local fits should normally use lbfgsb (L-BFGS-B): plain optim-lbfgs jumps onto the prior bounds from a start far from the
+#   optimum and then stops with a vanishing gradient.
 #
 # --toydata: inject Poisson-fluctuated toy data (Newtrinos.generate_toy_data) instead of
 #   the default noiseless Asimov data. Also widens the plot to show all nuisance/physics
@@ -164,35 +166,21 @@ function parse_command_line()
         arg_type = String
         default = "posterior"
 
-        "--global-iterations"
-        help = "Iteration budget for the PSO global seed-search stage"
-        arg_type = Int
-        default = 50
+        "--strategy"
+        help = "How the fit at every grid point is done: a chain of stages, each starting from the result of the previous one, e.g. --strategy smseed lbfgsb  |  --strategy optim-pso:particles=20,iters=50 lbfgsb:iterations=300  |  --strategy random lbfgsb  |  --strategy mle lbfgsb  |  --strategy manual:ε_eμ_abs=0.1,δ_eμ=1.0 lbfgsb  |  --strategy optim-pso:particles=50,iters=100 (a single global search, not polished). Stage kinds: seed (random, manual), alias (smseed = local fit with the tested parameters pinned at their null values; mle = random + local fit), global (optim-pso, optim-sa, mh-pso, mh-de, mh-abc, bbo, bbo-xnes, bbo-dxnes; stop at `evals` objective evaluations) and local (lbfgsb, optim-lbfgs, ...). Seed, alias and global stages are only allowed as the FIRST stage. Settings of a stage are given as name:key=val,key=val (see optimizer_tests.jl --list-optimizers); the last local stage's settings are also used for the extra fits of --prior-effect/--chi2-mis-modeling."
+        arg_type = String
+        nargs = '+'
+        required = true
 
-        "--pso-particles"
-        help = "Swarm size (n_particles) for Optim.ParticleSwarm during the global seed-search stage"
-        arg_type = Int
-        default = 20
-
-        "--iterations"
-        help = "Max iterations of the local L-BFGS-B optimizer"
-        arg_type = Int
-        default = 300
-
-        "--g-tol"
-        help = "Convergence tolerance of the local L-BFGS-B optimizer (projected-gradient tolerance)"
-        arg_type = Float64
-        default = 1e-7
+        "--start"
+        help = "Start point handed to the first stage: nominal (the setup's nominal parameters, blind -- default) or truth (the injected truth, e.g. to anchor a PSO at the truth)"
+        arg_type = String
+        default = "nominal"
 
         "--nseeds"
-        help = "Number of independent PSO-seed + LBFGS-polish attempts per grid point (each PSO search uses a fresh RNG draw so sub-runs explore differently); keeps the attempt with the highest log_post. Default 1 reproduces the single-attempt behavior exactly. Ignored (treated as 1) under --seed-strategy smseed, which has no per-attempt randomness to exploit."
+        help = "Number of independent attempts of the whole --strategy per grid point (random stages and global searches use a fresh RNG draw per attempt, so the attempts explore differently); keeps the attempt with the highest log_post. Default 1 is a single attempt. A deterministic strategy (e.g. smseed lbfgsb) gives the same fit in every attempt."
         arg_type = Int
         default = 1
-
-        "--seed-strategy"
-        help = "How to build each grid point's starting point before the LBFGS polish: pso (default -- fresh bounded PSO search per point/attempt, anchored at the truth), random (plain random draw from the hypothesis's prior per attempt), mle (random draw + a full local MLE fit per attempt -- the fit result itself is the seed), or smseed (fit the nuisance/physics parameters once per grid point with every free NSI parameter of this hypothesis pinned to 0, then use that SM fit's result -- nuisances tuned, NSI params at 0 -- as the single seed)."
-        arg_type = String
-        default = "pso"
 
         "--workers"
         help = "Number of distributed worker processes (default: 1, no distributed -- grid points run via Threads.@threads in a single process, same as before). When >1, grid points are dispatched across worker processes via pmap, each worker internally running --threads threads across its own grid point's seed-attempts. Confirmed locally that a MODERATE number of threads per worker (e.g. 4) spread across more workers beats both a single many-threaded process (severe contention -- Julia's per-process stop-the-world GC stalls every thread together under heavy concurrent allocation) and very few many-threaded workers (reintroduces the same per-worker GC contention at smaller scale)."
@@ -217,14 +205,11 @@ hypothesis_name = args["hypothesis"]
 fluctuate_nuisances_flag = args["fluctuate-nuisances"]
 n_points = args["n-points"]
 objective = lowercase(args["objective"])
-global_iterations = args["global-iterations"]
-pso_particles = args["pso-particles"]
-lbfgs_iterations = args["iterations"]
-g_tol = args["g-tol"]
+strategy = args["strategy"]
+start_mode = lowercase(args["start"])
 prior_effect_flag = args["prior-effect"]
 toydata_flag = args["toydata"]
 nseeds = args["nseeds"]
-seed_strategy = lowercase(args["seed-strategy"])
 n_workers = args["workers"]
 n_threads = args["threads"]
 multi_node_flag = args["multi-node"]
@@ -237,14 +222,14 @@ args["chi2-recovery"] && args["chi2-mis-modeling"] &&
     error("--chi2-recovery and --chi2-mis-modeling are mutually exclusive -- pick one.")
 chi2_mode = args["chi2-mis-modeling"] ? "mis-modeling" : "recovery"  # recovery is default
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
-seed_strategy in ("pso", "random", "mle", "smseed") || error("--seed-strategy must be 'pso', 'random', 'mle', or 'smseed', got '$seed_strategy'")
+start_mode in ("nominal", "truth") || error("--start must be 'nominal' or 'truth', got '$start_mode'")
 
 data_mode_tag = toydata_flag ? "toydata" : "asimov"
 truth_mode_tag = fluctuate_nuisances_flag ? "fluctuated" : "nominal"
 objective_tag = objective == "likelihood" ? "likelihoodfit" : "posteriorfit"
 output_tag = isempty(args["suffix"]) ? "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)" : "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)_$(args["suffix"])"
 output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
-output_tag = seed_strategy == "pso" ? output_tag : output_tag * "_$(seed_strategy)seed"
+output_tag = output_tag * "_" * join((first(split(s, ':')) for s in strategy), "+")   # stage names of the strategy
 
 Δχ²_label = chi2_mode == "mis-modeling" ? "Δχ² (mis-mod)" : "Δχ² (recovery)"
 
@@ -339,23 +324,12 @@ println("Truth grid built for hypothesis '$hypothesis_name': $(n_grid) points, s
 
 prior_dist = distprod(;cp_hyp...)
 
-# `ExplicitInit` strictly validates the init point against every constant entry of
-# `cp_sm`'s prior (its conditioned oscillation/flux params + all 8 NSI params pinned to
-# 0) -- `p`/`truth_param` don't necessarily agree with those constants, so every key
-# `cp_sm` holds fixed must be forced to its exact conditioned value first, or
-# `bat_findmode` throws `ArgumentError("Cannot set constant value to a different
-# value")` (same issue `_fix_conditioned` solves in optimizer_tests_common.jl). Built
-# once here since `cp_sm` doesn't depend on the grid point.
-cp_sm_overrides = Dict{Symbol, Float64}()
-for k in keys(cp_sm)
-    d = cp_sm[k]
-    if d isa ValueShapes.ConstValueDist
-        cp_sm_overrides[k] = Float64(d.value)
-    elseif d isa Number
-        cp_sm_overrides[k] = Float64(d)
-    end
-end
-cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
+# The strategy is parsed and checked once here (before any expensive work); `final_local_spec` is the local fit that the
+# extra fits of --prior-effect/--chi2-mis-modeling use (the last local stage of the strategy, with ad = :forward as in the
+# main fits, since the grid points / attempts already run concurrently).
+normalize_strategy(strategy)
+local_defaults = (; ad = :forward)
+extra_spec = with_local_defaults(final_local_spec(strategy), local_defaults)
 
 # `run_grid_point` below needs every one of these on whichever process actually executes
 # it. A plain `@everywhere function run_grid_point(k) ... end` does NOT automatically see
@@ -368,9 +342,9 @@ cp_sm_overrides_nt = NamedTuple(cp_sm_overrides)
 # own already-broadcast copy -- confirmed this does NOT re-send ctx per call). When
 # `!use_distributed`, this is just a plain global in the single process, no different from
 # today's top-level variables.
-ctx = (; experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p,
-       nseeds, seed_strategy, lbfgs_iterations, g_tol, objective,
-       global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
+ctx = (; experiments, prior_dist, cp_hyp, cp_sm, p,
+       nseeds, strategy, start_mode, local_defaults, extra_spec, objective,
+       prior_effect_flag, chi2_mode, scan_keys,
        fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_many, is_2d,
        fluctuate_nuisances_flag)
 use_distributed && @everywhere ctx = $ctx
@@ -378,7 +352,7 @@ use_distributed && @everywhere ctx = $ctx
 ### ROUNDTRIP SCAN (PSO seed + LBFGS polish at every grid point, parallel) ###
 
 println("="^80)
-println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy == "smseed" ? "1" : "$nseeds") seed-attempt(s) each) on " *
+println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " ")), $nseeds attempt(s) each) on " *
         (use_distributed ? "$n_workers workers x $n_threads threads each" : "$(Threads.nthreads()) threads") *
         " (Δχ²_mod mode: $chi2_mode)...")
 
@@ -393,9 +367,9 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
 # @everywhere unconditionally (harmless/equivalent to a plain `function` when there are no
 # extra worker processes) so it works identically in both modes without a branch here.
 @everywhere function run_grid_point(k)
-    experiments, prior_dist, cp_hyp, cp_sm, cp_sm_overrides_nt, p,
-        nseeds, seed_strategy, lbfgs_iterations, g_tol, objective,
-        global_iterations, pso_particles, prior_effect_flag, chi2_mode, scan_keys,
+    experiments, prior_dist, cp_hyp, cp_sm, p,
+        nseeds, strategy, start_mode, local_defaults, extra_spec, objective,
+        prior_effect_flag, chi2_mode, scan_keys,
         fluctuated_names, truths, grid_coords, toydata_flag, n_grid, is_many, is_2d,
         fluctuate_nuisances_flag = ctx
     seed_rng = Random.Xoshiro(1000 + k)
@@ -421,102 +395,45 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
     truth_posterior = PosteriorMeasure(truth_likelihood, prior_dist)
     truth_log_post = logdensityof(truth_posterior, truth_param)
 
-    # Run `nseeds` independent seed + LBFGS-polish attempts, keeping whichever converges
-    # to the highest log_post (NaN treated as -Inf, matching do_roundtrip's own nseeds
-    # convention in optimizer_tests_common.jl). Attempts are independent of each other
-    # (each builds its own start_param and polishes it separately against the SAME
-    # read-only truth_likelihood/prior_dist for this grid point) so they run concurrently
-    # via Threads.@threads, one Julia thread per attempt -- this is the actual expensive
-    # work (PSO global search + LBFGS polish), unlike the outer loop over grid points k
-    # (now serial; see the per-k iteration this is nested in), so spending the thread pool
-    # here uses it where the cost actually is, including when n_grid is small.
+    # Run `nseeds` independent attempts of the strategy (find_mle_advanced), keeping whichever reaches
+    # the highest log_post (NaN treated as -Inf). Attempts are independent of each other (each runs the
+    # strategy from its own RNG against the SAME read-only truth_likelihood/prior for this grid point) so they run
+    # concurrently via Threads.@threads, one Julia thread per attempt -- this is the actual expensive work.
     #
-    # Each attempt s gets its own Random.Xoshiro(1000*k + s) RNG rather than sharing one
-    # seed_rng advanced sequentially across s (which would be inherently serial and would
-    # race under concurrent access) -- deterministic and reproducible per (k, s), though
-    # NOT bit-identical to the old sequential-draw scheme for nseeds>1 (each attempt no
-    # longer consumes from a shared stream). Under seed_strategy=="smseed" there's no
-    # per-attempt randomness -- every attempt seeds identically, so nseeds>1 only repeats
-    # the same fit (n_attempts is forced to 1 there to avoid the wasted repeats).
-    n_attempts = seed_strategy == "smseed" ? 1 : nseeds
-    attempt_results = Vector{Any}(undef, n_attempts)
-    attempt_starts = Vector{Any}(undef, n_attempts)
-    attempt_elapsed = Vector{NTuple{2,Float64}}(undef, n_attempts)
-    Threads.@threads for s in 1:n_attempts
-        attempt_rng = Random.Xoshiro(1000 * k + s)
-        ts0 = time()
-        start_param = if seed_strategy == "smseed"
-            # SM-first seeding: fit the nuisance/physics parameters with every free NSI
-            # parameter pinned to 0 (the SM point) against THIS grid point's own
-            # truth-injected likelihood, then hand that fit's result -- nuisances tuned,
-            # NSI params still at 0 -- on as the seed for the main (unconstrained) fit.
-            sm_init = merge(p, cp_sm_overrides_nt)
-            sm_res = local_find_mle(truth_likelihood, distprod(;cp_sm...), sm_init;
-                fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
-                ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
-            # The null-model fit leaves the tested parameters at their null values, which can sit exactly on
-            # a prior bound (e.g. 0 for a magnitude), and other free parameters may land on a bound too.
-            # local_find_mle moves start values off the bounds itself (_nudge_into_bounds), so the
-            # fit result can be handed on as the seed unchanged.
-            sm_res[3]
-        elseif seed_strategy == "random"
-            # Plain random draw from the (conditioned) hypothesis prior -- fixed/conditioned
-            # entries just resample their own constant.
-            rand(attempt_rng, prior_dist)
-        elseif seed_strategy == "mle"
-            # Random start + a full local MLE fit against THIS grid point's own
-            # truth-injected likelihood -- the "seed" is the fit result itself (same
-            # pattern as nsi_scan.jl's "mle" strategy).
-            mle_start = rand(attempt_rng, prior_dist)
-            mle_res = local_find_mle(truth_likelihood, prior_dist, mle_start;
-                fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
-                ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
-            mle_res[3]
-        else
-            generate_seed(truth_likelihood, cp_hyp, truth_param, "pso", global_iterations, attempt_rng; n_particles=pso_particles, objective=objective)
-        end
-        this_seed_elapsed = time() - ts0
-
-        ts1 = time()
-        res = local_find_mle(truth_likelihood, prior_dist, start_param;
-            fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
-            ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
-        this_lbfgs_elapsed = time() - ts1
-
-        attempt_results[s] = res
-        attempt_starts[s] = start_param
-        attempt_elapsed[s] = (this_seed_elapsed, this_lbfgs_elapsed)
+    # Each attempt s gets its own Random.Xoshiro(1000*k + s) RNG rather than sharing one seed_rng advanced
+    # sequentially across s (which would be inherently serial and would race under concurrent access) --
+    # deterministic and reproducible per (k, s). Deterministic strategies (e.g. smseed lbfgsb) give the same
+    # fit for every attempt, so nseeds > 1 only repeats it there.
+    start_param = start_mode == "truth" ? truth_param : p
+    attempt_results = Vector{Any}(undef, nseeds)
+    Threads.@threads for s in 1:nseeds
+        attempt_results[s] = find_mle_advanced(truth_likelihood, cp_hyp, start_param; strategy, nseeds = 1,
+                                               rng = Random.Xoshiro(1000 * k + s), objective, null_prior = cp_sm, local_defaults)
     end
 
-    # Reduce the n_attempts parallel results serially: keep whichever attempt converged to
-    # the highest log_post (NaN treated as -Inf, matching do_roundtrip's own nseeds
-    # convention in optimizer_tests_common.jl), along with THAT attempt's own start_param
-    # (needed below for --chi2-mis-modeling's profile_start -- previously this picked up
-    # whichever attempt happened to run last in the s-loop, not the one that actually won,
-    # a pre-existing mismatch whenever nseeds>1 that parallelizing the loop would otherwise
-    # turn from a silent bug into a nondeterministic one). If every attempt failed (log_post
-    # stays NaN for all of them, so this never updates past the initial -Inf), fall back to
-    # the same NaN-filled failure tuple local_find_mle itself returns on a caught exception,
-    # so this grid point is recorded as a non-convergent failure instead of crashing on a
-    # `nothing` destructure below.
-    best_result = nothing
-    best_start_param = nothing
+    # Reduce the attempts serially: keep the best by log_post, along with THAT attempt's own seed point (the point
+    # its last stage started from; needed below for --chi2-mis-modeling's profile_start). If every attempt failed
+    # (log_post stays NaN for all of them), fall back to a NaN-filled failure record, so this grid point is recorded
+    # as a non-convergent failure instead of crashing on a `nothing` destructure below.
+    best_rec = nothing
     best_log_post = -Inf
-    seed_elapsed = 0.0
-    lbfgs_elapsed = 0.0
-    for s in 1:n_attempts
-        res = attempt_results[s]
-        log_post_s = isnan(res[2]) ? -Inf : res[2]
+    for s in 1:nseeds
+        rec = attempt_results[s]
+        log_post_s = isnan(rec.log_post) ? -Inf : rec.log_post
         if log_post_s > best_log_post
-            best_result, best_log_post = res, log_post_s
-            best_start_param = attempt_starts[s]
-            seed_elapsed, lbfgs_elapsed = attempt_elapsed[s]
+            best_rec, best_log_post = rec, log_post_s
         end
     end
-    if best_result === nothing
+    if best_rec === nothing
         nan_params = NamedTuple{keys(prior_dist)}(ntuple(_ -> NaN, length(keys(prior_dist))))
         best_result = (NaN, NaN, nan_params, false, missing)
         best_start_param = nan_params
+        seed_elapsed, lbfgs_elapsed = 0.0, 0.0
+    else
+        best_result = (best_rec.llh, best_rec.log_post, best_rec.params, best_rec.converged, best_rec.n_iters)
+        best_start_param = best_rec.seed_params
+        seed_elapsed = sum((r.time for r in best_rec.stages[1:end-1]); init = 0.0)   # all stages but the last
+        lbfgs_elapsed = best_rec.stages[end].time                                      # the last stage
     end
     llh, log_post, fit_param, converged, n_iters = best_result
 
@@ -543,9 +460,7 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
         # so under --objective likelihood this reference fit still estimates the local
         # posterior maximum near truth, independent of what the main fit optimized.
         t3 = time()
-        _, log_post_ref, _, converged_ref, _ = local_find_mle(truth_likelihood, prior_dist, truth_param;
-            fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
-            ad_backend=ADTypes.AutoForwardDiff(), objective="posterior")
+        log_post_ref = run_optimizer(extra_spec, truth_likelihood, prior_dist, truth_param; objective="posterior").log_post
         prior_pull_elapsed = time() - t3
         Δχ²_prior_pull = 2 * (log_post_ref - truth_log_post)
         Δχ²_optimizer_residual = 2 * (log_post - log_post_ref)
@@ -572,9 +487,7 @@ println("Running $(n_grid) grid-point roundtrips ($(nseeds == 1 || seed_strategy
         # Uses best_start_param (the WINNING attempt's seed, tracked above), not just
         # whichever attempt happened to run/finish last.
         profile_start = merge(best_start_param, NamedTuple{Tuple(scan_keys)}(Tuple(fixed_vals[k] for k in scan_keys)))
-        _, log_post_fixed, _, converged_fixed, _ = local_find_mle(truth_likelihood, prior_fixed, profile_start;
-            fit_method="lbfgsb", iterations=lbfgs_iterations, g_tol=g_tol,
-            ad_backend=ADTypes.AutoForwardDiff(), objective=objective)
+        log_post_fixed = run_optimizer(extra_spec, truth_likelihood, prior_fixed, profile_start; objective=objective).log_post
         profile_elapsed = time() - t2
         Δχ²_mis_modeling = 2 * (log_post - log_post_fixed)
     end
@@ -626,12 +539,13 @@ else
     results_local
 end
 
-n_converged = count(r -> r.converged, results)
+n_converged = count(r -> r.converged === true, results)
+n_noflag = count(r -> ismissing(r.converged), results)   # fits without a convergence flag (global-only strategies)
 total_wall_s = sum(r.total_elapsed for r in results)
 mean_elapsed_s = total_wall_s / n_grid
 min_elapsed_s, max_elapsed_s = extrema(r.total_elapsed for r in results)
 println("="^80)
-println("Converged: $n_converged / $n_grid")
+println("Converged: $n_converged / $n_grid" * (n_noflag > 0 ? " ($n_noflag without a convergence flag)" : ""))
 println("Timing: total=$(round(total_wall_s,digits=1))s (summed per-point; wall clock is shorter under threading) " *
         "mean=$(round(mean_elapsed_s,digits=1))s min=$(round(min_elapsed_s,digits=1))s max=$(round(max_elapsed_s,digits=1))s")
 
@@ -674,15 +588,13 @@ FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
     "prior_pull_elapsed" => [r.prior_pull_elapsed for r in results],
     "total_elapsed"   => [r.total_elapsed for r in results],
     "n_converged"  => n_converged,
+    "n_no_convergence_flag" => n_noflag,
     "n_grid"       => n_grid,
     "fluctuate_nuisances" => fluctuate_nuisances_flag,
     "settings" => Dict(
         "objective"         => objective,
-        "global_iterations" => global_iterations,
-        "pso_particles"     => pso_particles,
-        "iterations"        => lbfgs_iterations,
-        "local_optimizer"   => "lbfgsb",
-        "g_tol"             => g_tol,
+        "strategy"          => strategy,
+        "start"             => start_mode,
         "hypothesis"        => hypothesis_name,
         "n_points"          => n_points,
         "fluctuate_nuisances" => fluctuate_nuisances_flag,
@@ -690,7 +602,6 @@ FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
         "prior_effect"      => prior_effect_flag,
         "toydata"           => toydata_flag,
         "nseeds"            => nseeds,
-        "seed_strategy"     => seed_strategy,
         "setup"             => S.name,
     ),
     # Same settings again, flattened to top-level scalar entries -- a nested Dict (like
@@ -698,16 +609,12 @@ FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
     # (same issue tested_param_diff had); flat top-level scalars display normally.
     "settings_objective"           => objective,
     "settings_n_points"            => n_points,
-    "settings_global_iterations"   => global_iterations,
-    "settings_pso_particles"       => pso_particles,
-    "settings_iterations"          => lbfgs_iterations,
-    "settings_local_optimizer"     => "lbfgsb",
-    "settings_g_tol"               => g_tol,
+    "settings_strategy"            => join(strategy, " "),
+    "settings_start"               => start_mode,
     "settings_prior_effect"        => prior_effect_flag,
     "settings_toydata"             => toydata_flag,
     "settings_fluctuate_nuisances" => fluctuate_nuisances_flag,
     "settings_nseeds"              => nseeds,
-    "settings_seed_strategy"       => seed_strategy,
     "settings_setup"               => S.name,
 ))
 println("Saved results to $(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"))")
@@ -717,10 +624,12 @@ println("Saved results to $(joinpath(results_dir, "grid_roundtrip_$(output_tag).
 # physics panels, then a Δχ²_mod histogram. All panels share the same small-multiples
 # layout (row, 2*col axis / 2*col+1 colorbar), one shared "converged"/"not converged"
 # legend in column 1 spanning every row, Δχ²_mod colors the FIT points. Converged fits are drawn as
-# circles/diamonds, non-converged fits as crosses in the same color scale; only fits whose Δχ²_mod is
+# circles/diamonds, non-converged fits as crosses and fits WITHOUT a convergence flag (`converged = missing`,
+# the result of a global-only strategy) as squares, all in the same color scale; only fits whose Δχ²_mod is
 # not finite (the fit itself failed) are drawn as grey crosses.
 
-conv_flags = [r.converged for r in results]
+conv_flags = [r.converged === true for r in results]
+noflag_flags = [ismissing(r.converged) for r in results]   # no convergence criterion (global-only strategy)
 Δχ²_all = [r.Δχ²_mod for r in results]
 # colorrange is computed from the FINITE Δχ²_mod values of all points, converged or not (a failed
 # fit has Δχ²_mod = NaN when local_find_mle fails; those points are drawn grey). A NaN colorrange
@@ -743,7 +652,8 @@ conv_flags = [r.converged for r in results]
 # renderer with "Can't interpolate in a range where cmin == cmax" despite lo != hi here).
 fin_flags = isfinite.(Δχ²_all)
 sel_conv = conv_flags .& fin_flags        # converged, drawn as circles/diamonds
-sel_nonc = .!conv_flags .& fin_flags      # not converged, drawn as crosses in the same color scale
+sel_nonc = (.!conv_flags .& .!noflag_flags) .& fin_flags   # not converged, drawn as crosses in the same color scale
+sel_noflag = noflag_flags .& fin_flags    # no convergence flag, drawn as squares in the same color scale
 sel_fail = .!fin_flags                    # fit failed (Δχ²_mod not finite), grey crosses
 Δχ²_finite = Δχ²_all[fin_flags]
 colorrange = if isempty(Δχ²_finite)
@@ -811,6 +721,8 @@ for (idx, spec) in enumerate(panel_specs)
                              markersize=8, label="converged")
         any(sel_nonc) && scatter!(ax, truth_vals[sel_nonc], fit_vals[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=:viridis,
                                   colorrange=colorrange, marker=:xcross, markersize=10, label="not converged")
+        any(sel_noflag) && scatter!(ax, truth_vals[sel_noflag], fit_vals[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=:viridis,
+                                    colorrange=colorrange, marker=:rect, markersize=8, label="no convergence flag")
         any(sel_fail) && scatter!(ax, truth_vals[sel_fail], fit_vals[sel_fail]; color=:gray, marker=:xcross, markersize=10, label="fit failed")
         ablines!(ax, 0, 1, color=:red, linestyle=:dash)
         Colorbar(fig[row, 2*col + 1], plt_conv, label=Δχ²_label, ticklabelsize=9, labelsize=10)
@@ -833,13 +745,15 @@ for (idx, spec) in enumerate(panel_specs)
                             marker=:diamond, markersize=12, label="fit (converged)")
         any(sel_nonc) && scatter!(ax, fit_mags[sel_nonc], fit_phases[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=:viridis,
                                   colorrange=colorrange, marker=:xcross, markersize=14, label="fit (not converged)")
+        any(sel_noflag) && scatter!(ax, fit_mags[sel_noflag], fit_phases[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=:viridis,
+                                    colorrange=colorrange, marker=:rect, markersize=11, label="fit (no convergence flag)")
         any(sel_fail) && scatter!(ax, fit_mags[sel_fail], fit_phases[sel_fail]; color=:gray, marker=:xcross, markersize=14, label="fit failed")
         Colorbar(fig[row, 2*col + 1], plt_fit, label=Δχ²_label, ticklabelsize=9, labelsize=10)
 
     elseif spec.kind == :histogram
         local ax_hist = Axis(fig[row, 2*col], xlabel=Δχ²_label, ylabel="count",
-                        title="$(Δχ²_label) distribution (converged only)")
-        local Δχ²_converged = filter(isfinite, Δχ²_all[conv_flags])
+                        title="$(Δχ²_label) distribution (converged or no flag)")
+        local Δχ²_converged = filter(isfinite, Δχ²_all[conv_flags .| noflag_flags])
         if !isempty(Δχ²_converged)
             hist!(ax_hist, Δχ²_converged; bins=20, color=(:steelblue, 0.7), strokewidth=1, strokecolor=:black)
             vlines!(ax_hist, [mean(Δχ²_converged)]; color=:red, linestyle=:dash, label="mean")
@@ -851,9 +765,10 @@ end
 legend_elems = [
     MarkerElement(color=:steelblue, marker=:circle, markersize=10),
     MarkerElement(color=:steelblue, marker=:xcross, markersize=10),
+    MarkerElement(color=:steelblue, marker=:rect, markersize=9),
     MarkerElement(color=:gray, marker=:xcross, markersize=10),
 ]
-Legend(fig[1:n_rows, 1], legend_elems, ["converged", "not converged", "fit failed (no Δχ²)"]; tellwidth=true, tellheight=false)
+Legend(fig[1:n_rows, 1], legend_elems, ["converged", "not converged", "no convergence flag", "fit failed (no Δχ²)"]; tellwidth=true, tellheight=false)
 
 title_suffix = fluctuate_nuisances_flag ? ", fluctuated nuisances" : ""
 sample_kind = is_many ? "Sobol sample, " : ""

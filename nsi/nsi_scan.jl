@@ -60,13 +60,14 @@ function parse_command_line()
         arg_type = Int
         default = 25
 
-        "--seed-strategy"
-        help = "seed for the optimizer - available: random, mle, pso, smseed"
+        "--strategy"
+        help = "How the fit at every grid point is done: a chain of stages, each starting from the result of the previous one, e.g. --strategy random lbfgsb  |  --strategy smseed lbfgsb  |  --strategy mle lbfgsb  |  --strategy optim-pso:particles=50,iters=30 lbfgsb:iterations=2000  |  --strategy manual:ε_eμ_abs=0.1 lbfgsb. Stage kinds: seed (random, manual), alias (smseed = local fit with the tested parameters pinned at their null values; mle = random + local fit), global (optim-pso, optim-sa, mh-pso, mh-de, mh-abc, bbo, bbo-xnes, bbo-dxnes; stop at `evals` objective evaluations) and local (lbfgsb, optim-lbfgs, ...). Seed, alias and global stages are only allowed as the FIRST stage. A seed or alias first stage does not depend on the grid point and is computed ONCE per scan (the seed's scanned parameters are overwritten with each grid point's values); a global first stage is run at every grid point. Settings of a stage: name:key=val,key=val (see optimizer_tests.jl --list-optimizers)."
         arg_type = String
-        default = "random"
+        nargs = '+'
+        required = true
 
         "--nseeds"
-        help = "Number of independent local-optimizer starts+fits per gridpoint; keeps the best point"
+        help = "Number of independent attempts of the strategy per gridpoint (for a seed first stage: number of different seeds); keeps the best point"
         arg_type = Int
         default = 1
 
@@ -74,26 +75,6 @@ function parse_command_line()
         help = "RNG seed for seed-point generation"
         arg_type = Int
         default = 1234
-
-        "--global-iterations"
-        help = "Iteration budget for the PSO global seed-search stage (only used with --seed-strategy pso)"
-        arg_type = Int
-        default = 30
-
-        "--pso-particles"
-        help = "Swarm size (n_particles) for Optim.ParticleSwarm during the global seed-search stage (only used with --seed-strategy pso)"
-        arg_type = Int
-        default = 50
-
-        "--iterations"
-        help = "Max iterations of the local L-BFGS-B optimizer"
-        arg_type = Int
-        default = 2000
-
-        "--g-tol"
-        help = "Convergence tolerance of the local L-BFGS-B optimizer (projected-gradient tolerance)"
-        arg_type = Float64
-        default = 1e-7
 
         "--workers"
         help = "Number of distributed workers (default: 1, no distributed)"
@@ -122,10 +103,8 @@ multi_node_flag = args["multi-node"]
 hypothesis_name = args["hypothesis"]
 objective = args["objective"]
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
-global_iterations = args["global-iterations"]
-pso_particles = args["pso-particles"]
-lbfgs_iterations = args["iterations"]
-g_tol = args["g-tol"]
+strategy = args["strategy"]
+strategy_tag = join((first(split(s, ':')) for s in strategy), "+")   # stage names, for the output file name
 
 use_distributed = n_workers > 1
 multi_node_flag && !use_distributed &&
@@ -203,7 +182,7 @@ p = S.params
 priors = S.priors
 hyp = hypothesis_info(S, hypothesis_name)
 cp_hyp = hyp.prior       # prior of the hypothesis under test
-cp_sm = hyp.null_prior   # the same prior with the tested parameters at their null values (used by --seed-strategy smseed)
+cp_sm = hyp.null_prior   # the same prior with the tested parameters at their null values (used by the smseed stage of --strategy)
 results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "scan") : args["results-dir"]
 mkpath(results_dir)
 
@@ -211,83 +190,35 @@ mkpath(results_dir)
 #ToDo: implement saving of results to file
 
 
-##### seed strategy #####
+##### strategy and seeds #####
 
 nseeds = args["nseeds"]
-seed_strategy = args["seed-strategy"]
 rng = Random.Xoshiro(args["seed"])
-prior_dist = distprod(;cp_hyp...)
+normalize_strategy(strategy)   # checks the stage names/settings/order before any expensive work
 
+# A seed or alias FIRST stage (random, manual, smseed, mle) does not depend on the grid point: it is computed once here
+# (nseeds seeds; smseed is deterministic, so one fit is shared) and every grid point starts its remaining stages from
+# the seed with the scanned parameters overwritten by the point's own values (bat_findmode's ExplicitInit strictly
+# validates the start against the prior's constants). A GLOBAL first stage (optim-pso, mh-de, ...) is run at every
+# grid point instead, anchored at that point's fixed scan values -- a seed computed now would search independently of
+# the point it is used for. With nseeds attempts per point, the best fit (by log_post) is kept.
+first_kind = OPTIMIZERS[parse_optimizer_spec(strategy[1]).name].kind
+hoisted = first_kind in (:seed, :alias)
+rest_strategy = strategy[2:end]
+hoisted && isempty(rest_strategy) && error("--strategy: '$(strategy[1])' only creates a seed; add a fitting stage after it, e.g. --strategy $(strategy[1]) lbfgsb")
+
+# seed_params is also referenced (in a dead branch) inside the pmap closure below, so it must have every slot defined
+# for Distributed's serialization (hashing a Vector{Any} with undefined slots throws UndefRefError) -- hence the fill.
 seed_params = Vector{Any}(undef, nseeds)
-if seed_strategy == "random" # Plain random draw from the (conditioned) prior -- fixed/conditioned entries just resample their own constant
+fill!(seed_params, NamedTuple())
+if hoisted
     for s in 1:nseeds
-        seed_params[s] = rand(rng, prior_dist)
-    end
-elseif seed_strategy == "pso"
-    # Short bounded PSO global search per seed (generate_seed, from
-    # optimizer_tests_common.jl) -- unlike "random"/"mle" above, PSO seeds are NOT built
-    # here: a seed built now, anchored at the nominal params `p`, would search for a good
-    # point completely independent of which grid point it's later used for (the scanned
-    # key is only overwritten AFTER the PSO search already ran, via `merge(seed_params[s],
-    # fixed_here)` in the profile task below), so the PSO search itself never actually
-    # explores near its target grid point. Instead, the profile task below runs a fresh
-    # PSO search per grid point, anchored at that point's own fixed scan-key value(s) --
-    # see its loop body for details.
-    #
-    # seed_params itself is never read for "pso" (see above), but it's still referenced --
-    # in a dead branch -- inside the profile task's `pmap(...) do i ... end` closure (the
-    # `else` arm of `start_param = if seed_strategy == "pso" ... else
-    # merge(seed_params[s], fixed_here) end`). Julia captures closures based on what the
-    # code mentions, not what actually runs, so under --workers>1
-    # Distributed.ClusterSerializer still has to serialize/hash `seed_params` as part of
-    # shipping that closure to workers -- and hashing a Vector{Any} with undefined
-    # (never-assigned) slots throws UndefRefError. Filling every slot with a throwaway
-    # value (never read) avoids that without changing "pso"'s actual behavior.
-    fill!(seed_params, NamedTuple())
-elseif seed_strategy == "mle" # Random start + a full local MLE fit per seed -- the "seed" is the fit result itself.
-    # Uses local_find_mle (not Newtrinos.find_mle, which is always MAP/posterior and has no
-    # objective knob) so this respects --objective the same way the "pso" branch already
-    # does -- generate_seed's own docstring warns that mixing a posterior-biased seed
-    # with a likelihood-only local polish (or vice versa) is exactly the wrong thing to do.
-    for s in 1:nseeds
-        start_param = rand(rng, prior_dist)
-        res = local_find_mle(likelihood, prior_dist, start_param;
-                              fit_method="lbfgsb", iterations=lbfgs_iterations,
-                              g_tol=g_tol, objective=objective)
-        seed_params[s] = res[3]
-    end
-elseif seed_strategy == "smseed"
-    # Null-model seeding: fit the nuisance/physics parameters with the tested parameters of this
-    # hypothesis pinned at their null values (e.g. the SM point), then hand that fit's result --
-    # nuisances tuned, tested parameters still sitting at their null values -- on as the seed. The idea
-    # is that the systematics land at a reasonable point from the null fit alone, so the subsequent fit
-    # mostly has to tune the tested parameters themselves rather than re-discovering good nuisance
-    # values from scratch. The SM fit doesn't depend on `s`, so it only needs to run once; it's
-    # reused for every one of the `nseeds` seeds (matching "mle"/"random"'s per-seed slot
-    # convention, just with identical contents across seeds here).
-    # `ExplicitInit` strictly validates the init point against every constant entry of
-    # `cp_sm`'s prior (its conditioned parameters + the tested parameters pinned at their null values)
-    # -- `p` itself (Newtrinos.get_params's raw nominal values) doesn't necessarily agree
-    # with those constants, so every key `cp_sm` holds fixed must be forced to its exact
-    # conditioned value first, or `bat_findmode` throws `ArgumentError("Cannot set
-    # constant value to a different value")` (same issue `_fix_conditioned` solves in
-    # optimizer_tests_common.jl).
-    sm_overrides = Dict{Symbol, Float64}()
-    for k in keys(cp_sm)
-        d = cp_sm[k]
-        if d isa ValueShapes.ConstValueDist
-            sm_overrides[k] = Float64(d.value)
-        elseif d isa Number
-            sm_overrides[k] = Float64(d)
+        seed_params[s] = if parse_optimizer_spec(strategy[1]).name == "smseed" && s > 1
+            seed_params[1]   # the null-model fit does not depend on s
+        else
+            find_mle_advanced(likelihood, cp_hyp, p; strategy = [strategy[1]], rng, objective, null_prior = cp_sm).params
         end
     end
-    sm_init = merge(p, NamedTuple(sm_overrides))
-    sm_res = local_find_mle(likelihood, distprod(;cp_sm...), sm_init;
-                          fit_method="lbfgsb", iterations=lbfgs_iterations,
-                          g_tol=g_tol, objective=objective)
-    fill!(seed_params, sm_res[3])
-else
-    error("Unknown --seed-strategy '$seed_strategy'. Available options: random, mle, pso, smseed")
 end
 
 
@@ -331,52 +262,27 @@ println("Grid built for hypothesis '$hypothesis_name': $n_grid points, scanning 
 ##### run scan/profile #####
 
 if lowercase(args["task"]) == "profile"
-    # Run the local optimizer at every grid point, trying each of the `nseeds` candidate
-    # seeds and keeping whichever converges to the highest log_posterior. Uses
-    # local_find_mle (optimizer_tests_common.jl, fit_method="lbfgsb") directly instead of
-    # Newtrinos.profile/multistart_profile: their own nseeds mechanism ignores
-    # --seed-strategy, and they're built on find_mle_ext, which never reports an
-    # iteration count. Same per-point body inlined in both branches below (no helper
-    # function) -- bat_findmode's ExplicitInit strictly validates the init point against
-    # the prior's constants, so the seed's scanned key(s) must be overwritten to match
-    # this grid point's fixed value first, or it throws ArgumentError.
-    #
-    # Under seed_strategy=="pso", each of the `nseeds` seeds is a FRESH PSO search
-    # anchored at THIS grid point's own fixed scan-key value(s) (merge(p, fixed_here)),
-    # run right here rather than read from the pre-built `seed_params` (see the ##### seed
-    # strategy ##### block above) -- this is what makes each PSO search actually explore
-    # near its target grid point instead of the unconditioned nominal point. Each grid
-    # point gets its own RNG stream (seed_rng, seeded from args["seed"] + this point's
-    # linear index) rather than reusing the single top-level `rng`: under
-    # Threads.@threads, mutating one shared RNG object from multiple threads concurrently
-    # is unsafe, and per-point streams also keep results reproducible independent of
-    # pmap/thread scheduling order. generate_seed consumes seed_rng progressively
-    # across the `for s in 1:nseeds` loop, so within one grid point each of the `nseeds`
-    # PSO sub-runs still draws a different random start, matching the "several
-    # independent PSO runs, keep the best" pattern used elsewhere (e.g. roundtrips.jl).
-    # Under seed_strategy=="random"/"mle", seeds are unaffected and come from the
-    # pre-built seed_params exactly as before.
+    # Run the strategy at every grid point (find_mle_advanced), keeping the best of `nseeds` attempts by log_posterior.
+    # Uses the optimizer registry (optimizer_tests_common.jl) directly instead of Newtrinos.profile/multistart_profile:
+    # their own nseeds mechanism has no strategy and they are built on find_mle_ext, which never reports an iteration
+    # count. For a global first stage (see above) each point gets its own RNG stream (seed_rng, seeded from args["seed"]
+    # + this point's linear index) rather than reusing the single top-level `rng`: under Threads.@threads, mutating one
+    # shared RNG object from multiple threads concurrently is unsafe, and per-point streams also keep results
+    # reproducible independent of pmap/thread scheduling order.
 
     if use_distributed
         opt_results = @showprogress pmap(eachindex(scanpoints)) do i
             fixed_here = NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i])))
             seed_rng = Random.Xoshiro(args["seed"] + i)
-            best, best_log_post = nothing, -Inf
             t0 = time()
-            for s in 1:nseeds
-                start_param = if seed_strategy == "pso"
-                    generate_seed(likelihood, scanpoints[i], merge(p, fixed_here), "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
-                else
-                    merge(seed_params[s], fixed_here)
-                end
-                res = local_find_mle(likelihood, scanpoints[i], start_param;
-                                      fit_method="lbfgsb", iterations=lbfgs_iterations,
-                                      g_tol=g_tol, objective=objective)
-                log_post = isnan(res[2]) ? -Inf : res[2]
-                if best === nothing || log_post > best_log_post
-                    best, best_log_post = res, log_post
-                end
+            rec = if hoisted
+                find_mle_advanced(likelihood, scanpoints[i], p; strategy = rest_strategy, starts = [merge(seed_params[s], fixed_here) for s in 1:nseeds],
+                                  rng = seed_rng, objective = objective)
+            else
+                find_mle_advanced(likelihood, scanpoints[i], merge(p, fixed_here); strategy = strategy, nseeds = nseeds,
+                                  rng = seed_rng, objective = objective)
             end
+            best = (rec.llh, rec.log_post, rec.params, rec.converged, rec.n_iters)
             (best..., time() - t0)
         end
     else
@@ -384,22 +290,15 @@ if lowercase(args["task"]) == "profile"
         @showprogress Threads.@threads for i in eachindex(scanpoints)
             fixed_here = NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i])))
             seed_rng = Random.Xoshiro(args["seed"] + i)
-            best, best_log_post = nothing, -Inf
             t0 = time()
-            for s in 1:nseeds
-                start_param = if seed_strategy == "pso"
-                    generate_seed(likelihood, scanpoints[i], merge(p, fixed_here), "pso", global_iterations, seed_rng; n_particles=pso_particles, objective=objective)
-                else
-                    merge(seed_params[s], fixed_here)
-                end
-                res = local_find_mle(likelihood, scanpoints[i], start_param;
-                                      fit_method="lbfgsb", iterations=lbfgs_iterations,
-                                      g_tol=g_tol, objective=objective)
-                log_post = isnan(res[2]) ? -Inf : res[2]
-                if best === nothing || log_post > best_log_post
-                    best, best_log_post = res, log_post
-                end
+            rec = if hoisted
+                find_mle_advanced(likelihood, scanpoints[i], p; strategy = rest_strategy, starts = [merge(seed_params[s], fixed_here) for s in 1:nseeds],
+                                  rng = seed_rng, objective = objective)
+            else
+                find_mle_advanced(likelihood, scanpoints[i], merge(p, fixed_here); strategy = strategy, nseeds = nseeds,
+                                  rng = seed_rng, objective = objective)
             end
+            best = (rec.llh, rec.log_post, rec.params, rec.converged, rec.n_iters)
             opt_results[i] = (best..., time() - t0)
         end
     end
@@ -416,11 +315,11 @@ if lowercase(args["task"]) == "profile"
         "lbfgs_time"    => [r[6] for r in opt_results],
         "n_grid"        => n_grid,
         "nseeds"        => nseeds,
-        "seed_strategy" => seed_strategy,
+        "strategy"      => strategy,
         "objective"     => objective,
         "setup"         => S.name,
     )
-    FileIO.save(joinpath(results_dir, name * "_profile_$(hypothesis_name)_$(grid_points)points_$(seed_strategy)seed$(nseeds)" * ".jld2"), result) 
+    FileIO.save(joinpath(results_dir, name * "_profile_$(hypothesis_name)_$(grid_points)points_$(strategy_tag)_nseeds$(nseeds)" * ".jld2"), result) 
 
 elseif lowercase(args["task"]) == "scan"
     # No optimization -- straight likelihood evaluation with every non-scanned parameter

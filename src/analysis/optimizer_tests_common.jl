@@ -307,7 +307,7 @@ end
 
 # ---- optimizer registry ----------------------------------------------------------------------------
 # One table of named optimizers. A spec string "name:key=val,key=val" (see `parse_optimizer_spec`) selects an
-# entry and overrides some of its defaults. Two kinds:
+# entry and overrides some of its defaults. Kinds (`:seed` and `:alias` are the strategy stages defined below):
 #   :global  gradient-free search in the box [lo, hi] of the free parameters, backend
 #            `fn(counter, b, cfg, budget, rng) -> (; converged, n_iters, native)`; run by `global_find_mle`.
 #   :local   gradient-based fit through `local_find_mle`, run by `run_optimizer`.
@@ -318,13 +318,13 @@ const OPTIMIZERS = Dict{String, NamedTuple}()
 """
     register_optimizer!(name, kind, fn, defaults)
 
-Add (or replace) an entry of the optimizer registry. `kind` is `:global` or `:local`; `defaults` is the NamedTuple
+Add (or replace) an entry of the optimizer registry. `kind` is `:global`, `:local`, `:seed` or `:alias` (see the strategy section); `defaults` is the NamedTuple
 of settings the entry understands (a spec may override only these keys, the type of a default decides how a
 command-line value is parsed; a default of `nothing` means "unset, parse as number or string").
 """
-function register_optimizer!(name::AbstractString, kind::Symbol, fn, defaults::NamedTuple)
-    kind in (:global, :local) || error("register_optimizer!: kind must be :global or :local, got $kind")
-    OPTIMIZERS[String(name)] = (; kind, fn, defaults)
+function register_optimizer!(name::AbstractString, kind::Symbol, fn, defaults::NamedTuple; open_keys::Bool = false)
+    kind in (:global, :local, :seed, :alias) || error("register_optimizer!: kind must be :global, :local, :seed or :alias, got $kind")
+    OPTIMIZERS[String(name)] = (; kind, fn, defaults, open_keys)   # open_keys: any setting key is allowed (manual seed: parameter names)
     nothing
 end
 
@@ -351,23 +351,25 @@ specs of the same optimizer in tables and plots).
 function parse_optimizer_spec(str::AbstractString)
     name, rest = occursin(':', str) ? String.(split(str, ':'; limit = 2)) : (String(str), "")
     haskey(OPTIMIZERS, name) || error("unknown optimizer '$name'. Registered: $(join(sort(collect(keys(OPTIMIZERS))), ", "))")
-    defaults = OPTIMIZERS[name].defaults
+    entry = OPTIMIZERS[name]
+    defaults = entry.defaults
     kv = Pair{Symbol, Any}[]
     for item in split(rest, ','; keepempty = false)
         occursin('=', item) || error("optimizer spec '$str': expected key=value, got '$item'")
         k, v = split(item, '='; limit = 2)
         sym = Symbol(strip(k))
-        sym in keys(defaults) || error("optimizer '$name' has no setting '$sym'. Valid settings: $(join(keys(defaults), ", "))")
-        push!(kv, sym => _parse_setting(defaults[sym], v))
+        entry.open_keys || sym in keys(defaults) || error("optimizer '$name' has no setting '$sym'. Valid settings: $(join(keys(defaults), ", "))")
+        push!(kv, sym => _parse_setting(sym in keys(defaults) ? defaults[sym] : nothing, v))
     end
     (; name, label = String(str), settings = NamedTuple(kv))
 end
 
-function _merge_settings(name, defaults, settings)
+function _merge_settings(name, entry, settings)
+    entry.open_keys && return merge(entry.defaults, settings)
     for k in keys(settings)
-        k in keys(defaults) || error("optimizer '$name' has no setting '$k'. Valid settings: $(join(keys(defaults), ", "))")
+        k in keys(entry.defaults) || error("optimizer '$name' has no setting '$k'. Valid settings: $(join(keys(entry.defaults), ", "))")
     end
-    merge(defaults, settings)
+    merge(entry.defaults, settings)
 end
 
 # ---- shared objective and evaluation counter ----
@@ -460,7 +462,8 @@ function _mh_run(counter, b, budget, alg_fn, rng)
 end
 _backend_mh_pso(counter, b, cfg, budget, rng) = _mh_run(counter, b, budget, o -> Metaheuristics.PSO(N = cfg.N, C1 = cfg.C1, C2 = cfg.C2, ω = cfg.ω, options = o), rng)
 _backend_mh_de(counter, b, cfg, budget, rng)  = _mh_run(counter, b, budget, o -> Metaheuristics.DE(N = cfg.N, F = cfg.F, CR = cfg.CR, options = o), rng)
-_backend_mh_abc(counter, b, cfg, budget, rng) = _mh_run(counter, b, budget, o -> Metaheuristics.ABC(N = cfg.N, Ne = cfg.Ne, No = cfg.No, limit = cfg.limit, options = o), rng)
+_backend_mh_abc(counter, b, cfg, budget, rng) = _mh_run(counter, b, budget, o -> Metaheuristics.ABC(N = cfg.N, Ne = something(cfg.Ne, (cfg.N + 1) ÷ 2), No = something(cfg.No, (cfg.N + 1) ÷ 2),
+                                                                                                         limit = cfg.limit, options = o), rng)   # Ne/No default to (N+1)÷2 like the library
 
 function _backend_bbo(counter, b, cfg, budget, rng)
     isnothing(budget) && error("BlackBoxOptim optimizers need a budget (function evaluations)")
@@ -493,7 +496,8 @@ function global_find_mle(likelihood, prior, params, name::AbstractString; budget
     haskey(OPTIMIZERS, name) || error("unknown optimizer '$name'. Registered: $(join(sort(collect(keys(OPTIMIZERS))), ", "))")
     entry = OPTIMIZERS[name]
     entry.kind == :global || error("optimizer '$name' is a local optimizer; use `run_optimizer`/`local_find_mle`")
-    cfg = _merge_settings(name, entry.defaults, settings)
+    cfg = _merge_settings(name, entry, settings)
+    isnothing(get(cfg, :evals, nothing)) || (budget = cfg.evals)   # `evals` (a setting of every global optimizer) overrides the default budget
     obj, b = make_objective(likelihood, prior, params; objective)
     all(isfinite, b.lo_vec) && all(isfinite, b.hi_vec) ||
         error("global optimizer '$name' needs finite bounds for every free parameter")
@@ -517,44 +521,6 @@ function global_find_mle(likelihood, prior, params, name::AbstractString; budget
     return_trace ? (result..., (; evals = counter.evals, best = counter.bests, native = info.native)) : result
 end
 
-"""
-    generate_seed(likelihood, prior, params, strategy, global_iters, rng; n_particles=10, return_trace=false, objective="posterior")
-
-Start point for the local optimizer. `strategy == "random"`: a fresh random draw from the priors
-(`randomize_free_params`). `"pso"` / `"sa"`: a short bounded global search (`optim-pso` with `n_particles` and
-`global_iters` generations, resp. `optim-sa`) via `global_find_mle`; its best point (free entries; fixed entries at their
-fixed values) is returned as a `params` NamedTuple. Any other registered `:global` optimizer name works too, with a
-budget of `global_iters * n_particles` evaluations.
-
-`objective` ("posterior" or "likelihood") selects the target of the global search; pass the same `objective` to the
-subsequent `local_find_mle`, otherwise a posterior-biased seed is handed to a likelihood-only polish.
-
-`return_trace=true` additionally returns the best objective value so far per generation (Optim's own trace) for
-`"pso"`/`"sa"`, or per evaluation for the other optimizers.
-"""
-function generate_seed(likelihood, prior, params, strategy, global_iters, rng; n_particles = 10, return_trace = false, objective = "posterior")
-    if strategy == "random"
-        seeded = randomize_free_params(rng, params, prior)
-        return return_trace ? (seeded, Float64[]) : seeded
-    end
-    res = if strategy == "pso"
-        global_find_mle(likelihood, prior, params, "optim-pso"; settings = (; particles = n_particles, iters = global_iters),
-                        rng, objective, return_trace = true)
-    elseif strategy == "sa"
-        global_find_mle(likelihood, prior, params, "optim-sa"; settings = (; iters = global_iters),
-                        rng, objective, return_trace = true)
-    else
-        global_find_mle(likelihood, prior, params, strategy; budget = global_iters * n_particles,
-                        rng, objective, return_trace = true)
-    end
-    seeded = res[3]
-    if !return_trace
-        return seeded
-    end
-    tr = res[6]
-    (seeded, strategy in ("pso", "sa") ? tr.native : tr.best)
-end
-
 # ---- run any registered optimizer on one problem ----
 
 """
@@ -572,7 +538,8 @@ optimizers per iteration, with `trace_evals = missing`). `prior` is a NamedTuple
 function run_optimizer(spec, likelihood, prior, params; budget = nothing, rng = Random.default_rng(), objective = "posterior")
     spec isa AbstractString && (spec = parse_optimizer_spec(spec))
     entry = OPTIMIZERS[spec.name]
-    cfg = _merge_settings(spec.name, entry.defaults, spec.settings)
+    entry.kind in (:global, :local) || error("run_optimizer: '$(spec.name)' is a $(entry.kind) stage, not an optimizer; use `find_mle_advanced`")
+    cfg = _merge_settings(spec.name, entry, spec.settings)
     t0 = time()
     if entry.kind == :global
         r = global_find_mle(likelihood, prior, params, spec.name; budget, settings = spec.settings, rng, objective, return_trace = true)
@@ -631,17 +598,170 @@ function _local_lbfgsb(likelihood, prior, params, cfg, objective)
                        return_trace = true, objective, ad_backend = _ad_backend(cfg.ad))
     (r[1], r[2], r[3], r[4], r[5], r[6], counted.n[])
 end
-register_optimizer!("lbfgsb", :local, _local_lbfgsb, (; iterations = 1000, reltol = 1e-7, m = 10, ad = :auto))
+const _LBFGSB_DEFAULTS = (; iterations = 1000, reltol = 1e-7, m = 10, ad = :auto)
+register_optimizer!("lbfgsb", :local, _local_lbfgsb, _LBFGSB_DEFAULTS)
 register_optimizer!("newtrinos", :local, _local_newtrinos, (;))
 register_optimizer!("ext",       :local, _local_ext,       (; iterations = 2000, g_tol = 1e-6))
-register_optimizer!("optim-pso", :global, _backend_optim_pso, (; particles = 20, iters = nothing))
-register_optimizer!("optim-sa",  :global, _backend_optim_sa,  (; iters = nothing))
-register_optimizer!("mh-pso", :global, _backend_mh_pso, (; N = 100, C1 = 2.0, C2 = 2.0, ω = 0.8))
-register_optimizer!("mh-de",  :global, _backend_mh_de,  (; N = 100, F = 0.7, CR = 0.5))
-register_optimizer!("mh-abc", :global, _backend_mh_abc, (; N = 50, Ne = 25, No = 25, limit = 10))
-register_optimizer!("bbo",      :global, _backend_bbo, (; method = :adaptive_de_rand_1_bin_radiuslimited, population = nothing))
-register_optimizer!("bbo-xnes",  :global, _backend_bbo, (; method = :xnes, population = nothing))
-register_optimizer!("bbo-dxnes", :global, _backend_bbo, (; method = :dxnes, population = nothing))
+register_optimizer!("optim-pso", :global, _backend_optim_pso, (; particles = 20, iters = nothing, evals = nothing))
+register_optimizer!("optim-sa",  :global, _backend_optim_sa,  (; iters = nothing, evals = nothing))
+register_optimizer!("mh-pso", :global, _backend_mh_pso, (; N = 100, C1 = 2.0, C2 = 2.0, ω = 0.8, evals = nothing))
+register_optimizer!("mh-de",  :global, _backend_mh_de,  (; N = 100, F = 0.7, CR = 0.5, evals = nothing))
+register_optimizer!("mh-abc", :global, _backend_mh_abc, (; N = 50, Ne = nothing, No = nothing, limit = 10, evals = nothing))
+register_optimizer!("bbo",      :global, _backend_bbo, (; method = :adaptive_de_rand_1_bin_radiuslimited, population = nothing, evals = nothing))
+register_optimizer!("bbo-xnes",  :global, _backend_bbo, (; method = :xnes, population = nothing, evals = nothing))
+register_optimizer!("bbo-dxnes", :global, _backend_bbo, (; method = :dxnes, population = nothing, evals = nothing))
+
+# ---- strategies: chains of stages -----------------------------------------------------------------------
+# A strategy is an ordered list of stages (spec strings "name:key=val,..."); every stage starts from the result of the
+# previous one and the last stage's fit is the result. Stage kinds (see `OPTIMIZERS`):
+#   seed    `random` (a draw from the prior), `manual` (a given start: parameter=value pairs; unlisted parameters keep their value)
+#   alias   `smseed` (local fit with the tested parameters pinned at their null values, `null_prior`),
+#           `mle` (`random`, then a local fit); they take the settings of `lbfgsb`
+#   global  gradient-free searches (optim-pso, mh-*, bbo*, ...); stop at `evals` objective evaluations
+#   local   gradient-based fits (lbfgsb, optim-lbfgs, ...)
+# Seed, alias and global stages may only be the FIRST stage; every later stage must be local.
+
+_seed_random(cfg, prior, params, rng) = rand(rng, prior isa NamedTuple ? distprod(; prior...) : prior)
+
+function _seed_manual(cfg, prior, params, rng)
+    for k in keys(cfg)
+        k in keys(params) || error("manual stage: unknown parameter '$k'. Parameters: $(join(keys(params), ", "))")
+    end
+    merged = merge(params, NamedTuple{keys(cfg)}(Float64.(values(cfg))))
+    prior isa NamedTuple ? _fix_conditioned(merged, prior) : merged   # pinned parameters keep their pinned value
+end
+
+# alias expansion: spec -> vector of stages (name, label, settings, null)
+_expand_smseed(sp) = [(; name = "lbfgsb", label = sp.label, settings = sp.settings, null = true)]
+_expand_mle(sp)    = [(; name = "random", label = sp.label * " [random]", settings = (;), null = false),
+                      (; name = "lbfgsb", label = sp.label * " [fit]", settings = sp.settings, null = false)]
+
+register_optimizer!("random", :seed, _seed_random, (;))
+register_optimizer!("manual", :seed, _seed_manual, (;); open_keys = true)
+register_optimizer!("smseed", :alias, _expand_smseed, _LBFGSB_DEFAULTS)
+register_optimizer!("mle",    :alias, _expand_mle,    _LBFGSB_DEFAULTS)
+
+"""
+    normalize_strategy(strategy) -> Vector{NamedTuple}
+
+Parse a strategy (a vector of spec strings and/or parsed stage NamedTuples `(; name, label, settings)`), expand the
+aliases `smseed`/`mle` into their stages and check the order: seed, alias and global stages only as the first stage,
+all later stages local. Returns stages `(; name, label, settings, null)`; `null = true` marks a local fit with the
+null prior (`smseed`).
+"""
+function normalize_strategy(strategy)
+    isempty(strategy) && error("strategy: needs at least one stage")
+    specs = [s isa AbstractString ? parse_optimizer_spec(s) : s for s in strategy]
+    stages = NamedTuple[]
+    for (i, sp) in enumerate(specs)
+        haskey(OPTIMIZERS, sp.name) || error("unknown optimizer '$(sp.name)'. Registered: $(join(sort(collect(keys(OPTIMIZERS))), ", "))")
+        kind = OPTIMIZERS[sp.name].kind
+        if i > 1 && kind != :local
+            error("strategy: '$(sp.label)' is $(kind == :alias ? "an alias" : "a $kind") stage and may only be the first stage; every later stage must be a local optimizer " *
+                  "(a global search or a seed ignores the previous result)")
+        end
+        if kind == :alias
+            append!(stages, OPTIMIZERS[sp.name].fn(sp))
+        else
+            push!(stages, (; name = sp.name, label = sp.label, settings = sp.settings, null = false))
+        end
+    end
+    stages
+end
+
+"""Stage spec of a manual seed for the Julia API: `manual_stage((; a = 1.0, b = 2.0))` = the CLI stage `manual:a=1.0,b=2.0`."""
+manual_stage(params::NamedTuple) = (; name = "manual", label = "manual", settings = params)
+
+"""
+    with_local_defaults(spec, defaults) -> spec
+
+Spec of a local optimizer with `defaults` (a NamedTuple, e.g. `(; ad = :forward)`) filled in for the settings it knows and the spec does not
+set itself. Other kinds of optimizer are returned unchanged.
+"""
+function with_local_defaults(spec, defaults)
+    entry = OPTIMIZERS[spec.name]
+    entry.kind == :local || return spec
+    (; spec..., settings = merge(NamedTuple(k => v for (k, v) in pairs(defaults) if k in keys(entry.defaults)), spec.settings))
+end
+
+"""
+    final_local_spec(strategy) -> spec
+
+The local fit that an extra fit should use (e.g. the reference fits of `roundtrips.jl`): the last stage of `strategy` if it is a local
+optimizer on the hypothesis prior, otherwise a default `lbfgsb`.
+"""
+function final_local_spec(strategy)
+    last = normalize_strategy(strategy)[end]
+    OPTIMIZERS[last.name].kind == :local && !last.null ? (; name = last.name, label = last.label, settings = last.settings) : parse_optimizer_spec("lbfgsb")
+end
+
+function _stage_record(label, params; llh = NaN, log_post = NaN)
+    (; label, llh, log_post, params, converged = missing, n_iters = missing, n_calls = 0, time = 0.0, trace_evals = Int[], trace_best = Float64[])
+end
+
+function _run_strategy(likelihood, prior, start, stages, strategy_label; rng, objective, null_prior, budget, local_defaults)
+    cur = start
+    records = NamedTuple[]
+    seed_params = start
+    for (i, st) in enumerate(stages)
+        entry = OPTIMIZERS[st.name]
+        i == length(stages) && (seed_params = cur)
+        if entry.kind == :seed
+            t0 = time()
+            cfg = _merge_settings(st.name, entry, st.settings)
+            cur = entry.fn(cfg, prior, cur, rng)
+            push!(records, merge(_stage_record(st.label, cur), (; time = time() - t0)))
+        else
+            stage_prior = prior
+            start_here = cur
+            if st.null
+                isnothing(null_prior) && error("strategy: stage '$(st.label)' needs a null prior (`null_prior` = the hypothesis' prior with the tested parameters at their null values)")
+                stage_prior = null_prior
+                start_here = _fix_conditioned(cur, null_prior)   # the null prior holds the tested parameters at their null values
+            end
+            rec = run_optimizer(with_local_defaults((; name = st.name, label = st.label, settings = st.settings), local_defaults), likelihood, stage_prior, start_here; budget, rng, objective)
+            push!(records, rec)
+            cur = rec.params
+        end
+        if !all(isfinite, (Float64(v) for v in values(cur)))   # a failed stage: do not feed NaN to the next one
+            break
+        end
+    end
+    last = records[end]
+    merge(last, (; time = sum(r.time for r in records), seed_params, stages = records, strategy = strategy_label))
+end
+
+"""
+    find_mle_advanced(likelihood, prior, params; strategy, nseeds=1, starts=nothing, rng, objective="posterior",
+                      null_prior=nothing, budget=nothing, local_defaults=(;)) -> NamedTuple
+
+Run a strategy (see `normalize_strategy`: a chain of stages such as `["smseed", "lbfgsb"]` or
+`["optim-pso:particles=20,iters=50", "lbfgsb:iterations=300"]`) from the start point `params` and return the record of
+the last stage (the fields of `run_optimizer`) extended by `seed_params` (the point the last stage started from),
+`stages` (the records of all stages) and `strategy` (the stage labels); `time` is the total time of all stages.
+
+With `nseeds > 1` the whole strategy is repeated (random stages and global searches draw from `rng` progressively) and the
+best fit by `log_post` is kept (`NaN` counts as -Inf); with `starts` (a vector of start points) there is one attempt per start
+instead. `null_prior` is needed by `smseed`; `budget` is the default number of evaluations of global stages without `evals`;
+`local_defaults` overrides the defaults of the local stages' settings (only keys the stage knows), e.g. `(; ad = :forward)`.
+A stage that returns non-finite parameters ends the chain (the record then holds NaN).
+"""
+function find_mle_advanced(likelihood, prior, params; strategy, nseeds = 1, starts = nothing, rng = Random.default_rng(),
+                           objective = "posterior", null_prior = nothing, budget = nothing, local_defaults = (;))
+    stages = normalize_strategy(strategy)
+    strategy_label = join((s isa AbstractString ? s : s.label for s in strategy), " ")
+    n_attempts = isnothing(starts) ? nseeds : length(starts)
+    best, best_score = nothing, -Inf
+    for s in 1:n_attempts
+        start = isnothing(starts) ? params : starts[s]
+        rec = _run_strategy(likelihood, prior, start, stages, strategy_label; rng, objective, null_prior, budget, local_defaults)
+        score = isnan(rec.log_post) ? -Inf : rec.log_post
+        if best === nothing || score > best_score
+            best, best_score = rec, score
+        end
+    end
+    best
+end
 
 """
     _nudge_into_bounds(prior, params; ε=1e-8)

@@ -73,7 +73,7 @@ function parse_command_line()
         default = ""
 
         "--budget"
-        help = "Maximum number of objective evaluations per run, for the global optimizers (local optimizers are limited by their own `iterations`; global ones may stop earlier through their own settings, e.g. optim-pso:iters=...)"
+        help = "Default maximum number of objective evaluations per run of a global optimizer that gives no `evals` of its own (e.g. mh-de:evals=3000 overrides it); local optimizers are limited by their own `iterations`"
         arg_type = Int
         default = 2000
 

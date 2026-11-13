@@ -28,7 +28,7 @@
 # From these two the scripts derive everything else:
 #   * tested parameters       = keys(null); they are the injected/scanned truth values
 #   * null model              = condition(prior, null, params), i.e. the same prior with X switched off
-#                               (used e.g. as the seed of `--seed-strategy smseed`)
+#                               (used e.g. by the `smseed` stage of `--strategy`)
 #   * scan type               = number of tested parameters: 1 -> 1D grid, 2 -> 2D grid, more -> Sobol sample
 #   * nuisance/other parameters = all remaining FREE parameters of `prior`; they are fitted in every roundtrip
 #                               and are the ones redrawn from their priors by `--fluctuate-nuisances`

@@ -1,3 +1,8 @@
+# ARCHIVED (reference only). Setup-driven version of this script, replaced by src/analysis/optimizer_tests.jl
+# (compare optimizers on the same problems: --optimizers SPEC...). It still calls `generate_seed`, which was removed
+# when strategies (find_mle_advanced) were introduced, so it no longer runs against the current helpers; the exact scripts
+# that ran are available via the git tag `nsi-3y-scripts` and the frozen copy in this folder.
+#
 # Isolated head-to-head comparison of Optim.jl's PSO (the global-seed-search algorithm
 # currently used in nsi_scan.jl/test_pso.jl) against Metaheuristics.jl's PSO, DE, and ABC,
 # on the SAME objective, bounds, and truth points, under an EQUAL total function-evaluation
@@ -27,7 +32,7 @@
 # Output (in the results dir): compare_<hypothesis>_<n>points.{jld2,pdf}
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.activate(joinpath(@__DIR__, "..", ".."))
 
 using Distributions
 using DensityInterface
@@ -44,7 +49,7 @@ using Statistics
 import Optim
 import Metaheuristics
 
-include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
+include(joinpath(@__DIR__, "..", "..", "src", "analysis", "optimizer_tests_common.jl"))
 
 ### SETTINGS ###
 
@@ -53,7 +58,7 @@ const N_PARTICLES  = 100     # population size, shared across all 4 algorithms
 const GLOBAL_ITERS = 100     # Optim PSO generation budget -- defines the shared eval budget
 const FEVALS       = N_PARTICLES * GLOBAL_ITERS
 const SEED         = 1234
-const SETUP_FILE   = length(ARGS) >= 1 ? ARGS[1] : joinpath(@__DIR__, "setups", "nsi_deepcore_3y.jl")
+const SETUP_FILE   = length(ARGS) >= 1 ? ARGS[1] : joinpath(@__DIR__, "..", "setups", "nsi_deepcore_3y.jl")
 const HYPOTHESIS   = length(ARGS) >= 2 ? ARGS[2] : "eμ"
 
 # LBFGS settings for the truth-seeded reference fit (mirrors test_pso.jl's REF_LBFGS_*).

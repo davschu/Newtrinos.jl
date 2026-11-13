@@ -1,3 +1,8 @@
+# ARCHIVED (reference only). Setup-driven version of this script, replaced by src/analysis/optimizer_tests.jl
+# (compare optimizers on the same problems: --optimizers SPEC...). It still calls `generate_seed`, which was removed
+# when strategies (find_mle_advanced) were introduced, so it no longer runs against the current helpers; the exact scripts
+# that ran are available via the git tag `nsi-3y-scripts` and the frozen copy in this folder.
+#
 # PSO settings performance test: injects several random known-truth (optionally
 # nuisance-fluctuated) Asimov data realizations for a chosen hypothesis of a setup file
 # (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl), then runs
@@ -58,7 +63,7 @@
 #   pso_test_<hypothesis>_<fluctuated|nominal>_<n>points[_subruns<N>][_<suffix>].{jld2,pdf}
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.activate(joinpath(@__DIR__, "..", ".."))
 
 using Distributions
 using DensityInterface
@@ -76,7 +81,7 @@ using CairoMakie
 using Statistics
 import Optim
 
-include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
+include(joinpath(@__DIR__, "..", "..", "src", "analysis", "optimizer_tests_common.jl"))
 
 # LBFGS settings for the Phase-1 truth-seeded reference fit -- the ONLY LBFGS call in this
 # script, so these are hardcoded rather than CLI flags (the PSO-settings sweep in Phase 2
@@ -95,7 +100,7 @@ function parse_command_line()
         "--setup"
         help = "Setup file defining the physics, experiments, priors and hypotheses (it defines setup(; ftype) -- see nsi/setups/nsi_deepcore_3y.jl for the format)"
         arg_type = String
-        default = joinpath(@__DIR__, "setups", "nsi_deepcore_3y.jl")
+        default = joinpath(@__DIR__, "..", "setups", "nsi_deepcore_3y.jl")
 
         "--hypothesis"
         help = "Name of the hypothesis (from the setup file) to test"
