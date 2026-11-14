@@ -305,13 +305,9 @@ function truth_grid(prior, nominal_params, tested_names; n_points=25)
     end
 end
 
-# ---- optimizer registry ----------------------------------------------------------------------------
-# One table of named optimizers. A spec string "name:key=val,key=val" (see `parse_optimizer_spec`) selects an
-# entry and overrides some of its defaults. Kinds (`:seed` and `:alias` are the strategy stages defined below):
-#   :global  gradient-free search in the box [lo, hi] of the free parameters, backend
-#            `fn(counter, b, cfg, budget, rng) -> (; converged, n_iters, native)`; run by `global_find_mle`.
-#   :local   gradient-based fit through `local_find_mle`, run by `run_optimizer`.
-# To add an optimizer write a backend function and call `register_optimizer!` (end of this section).
+# One table of named optimizers; a spec "name:key=val,key=val" (`parse_optimizer_spec`) selects an entry and overrides defaults. Kinds: :global (gradient-free
+# search in the prior box, `fn(counter, b, cfg, budget, rng)`, run by `global_find_mle`), :local (through `local_find_mle`), and the stages :seed/:alias below.
+# To add an optimizer: write a backend and call `register_optimizer!` (end of this section).
 
 const OPTIMIZERS = Dict{String, NamedTuple}()
 
@@ -611,16 +607,8 @@ register_optimizer!("bbo",      :global, _backend_bbo, (; method = :adaptive_de_
 register_optimizer!("bbo-xnes",  :global, _backend_bbo, (; method = :xnes, population = nothing, evals = nothing))
 register_optimizer!("bbo-dxnes", :global, _backend_bbo, (; method = :dxnes, population = nothing, evals = nothing))
 
-# ---- strategies: chains of stages -----------------------------------------------------------------------
-# A strategy is an ordered list of stages (spec strings "name:key=val,..."); every stage starts from the result of the
-# previous one and the last stage's fit is the result. Stage kinds (see `OPTIMIZERS`):
-#   seed    `random` (a draw from the prior), `manual` (a given start: parameter=value pairs; unlisted parameters keep their value)
-#   alias   `smseed` (local fit with the tested parameters pinned at their null values, `null_prior`),
-#           `mle` (`random`, then a local fit); they take the settings of `lbfgsb`
-#   global  gradient-free searches (optim-pso, mh-*, bbo*, ...); stop at `evals` objective evaluations
-#   local   gradient-based fits (lbfgsb, optim-lbfgs, ...)
-# Seed, alias and global stages may only be the FIRST stage; every later stage must be local.
-
+# A strategy is an ordered list of stages (spec strings); every stage starts from the result of the previous one. Kinds: seed (`random`, `manual`),
+# alias (`smseed`, `mle`; `lbfgsb` settings), global, local. Seed, alias and global stages may only be FIRST (see docs/src/README_optimizer_tests.md).
 _seed_random(cfg, prior, params, rng) = rand(rng, prior isa NamedTuple ? distprod(; prior...) : prior)
 
 function _seed_manual(cfg, prior, params, rng)
@@ -829,7 +817,9 @@ function find_mle_advanced(likelihood, prior, params; strategy, nseeds = 1, star
     end
     merge(best, (; n_attempts, total_time = sum(a.time for a in attempts),
                  total_calls = any(a -> a.total_calls === missing, attempts) ? missing : sum(a.total_calls for a in attempts),
-                 trace_x = xs, trace_y = _running_best(ys), trace_stage = stg, trace_span = off))
+                 trace_x = xs, trace_y = _running_best(ys), trace_stage = stg, trace_span = off,
+                 # the same trace attempt by attempt, each from its own start (x from 0, best objective so far within the attempt)
+                 attempt_traces = [(; x = a.trace_x, y = _running_best(a.trace_y), stage = a.trace_stage) for a in attempts]))
 end
 
 """
@@ -917,6 +907,10 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
     target_prior = objective == "likelihood" ? flat_prior(prior) : prior
     posterior = PosteriorMeasure(likelihood, target_prior)
     n_free = count(!(d isa ValueShapes.ConstValueDist) && !(d isa Number) for d in values(prior))
+    if n_free == 0   # nothing to fit (e.g. every free parameter is a scanned one): L-BFGS-B would crash on zero dimensions
+        result = (logdensityof(likelihood, params), logdensityof(posterior, params), params, true, 0)
+        return return_trace ? (result..., Float64[]) : result
+    end
 
     @info "Running Optimization ($fit_method, $(fit_method == "lbfgsb" ? "L-BFGS-B" : typeof(algorithm).name.name)) for point" n_free=n_free iterations=iterations objective=objective
 
@@ -929,11 +923,8 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
 	ad = ad_backend === nothing ? Newtrinos.select_ad(n_free) : ad_backend # for choosing ad backend when calling local_find_mle
 	context = BATContext(ad = ad) # for setting the bat context locally inside bat_findmode and not globally 
         @info "starting optimization"
-        # BAT 5: the Optim backend sits inside TransformedMaxDensity (which also takes the start point); `store_trace` is an OptimAlg field
-        # `bat_findmode` only returns the mode, so go through `evalmeasure` to also get the Optim result (convergence, iterations, trace)
-        # fit_method "lbfgsb": L-BFGS-B (OptimizationLBFGSB, via BAT's OptimizationAlg) in the same transformed space, as Newtrinos.find_mle does but
-        # tunable: `iterations` -> maxiters, `g_tol` -> reltol (L-BFGS-B's projected-gradient tolerance), `lbfgsb_m` -> memory size.
-        # Its first step is scaled by the gradient norm, unlike LBFGS with a static first step. `store_trace` records the objective per iteration.
+        # `bat_findmode` only returns the mode: go through `evalmeasure` to also get the Optim/Optimization result (convergence, iterations, trace).
+        # "lbfgsb" = L-BFGS-B (OptimizationLBFGSB via BAT's OptimizationAlg, tunable: `iterations`, `g_tol` -> reltol, `lbfgsb_m`), same transformed space as Newtrinos.find_mle.
         optalg_obj = fit_method == "lbfgsb" ?
             OptimizationAlg(optalg=OptimizationLBFGSB.LBFGSB(m=lbfgsb_m), maxiters=iterations, reltol=Float64(g_tol), store_trace=return_trace) :
             OptimAlg(optalg=algorithm, maxiters=iterations, store_trace=return_trace, kwargs=(g_tol=g_tol, f_reltol=f_tol, x_reltol=x_tol))
@@ -963,11 +954,8 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
     end
 end
 
-# ---- profile scans with strategies ------------------------------------------------------------------------
-# `profile_advanced` is `Newtrinos.profile` with a strategy (find_mle_advanced) for the fit at every grid point, warm starting
-# and a `NewtrinosResult` that carries the optimizer run data in its `meta`. The pieces (`_profile_plan`, `_profile_point_fit`,
-# `_profile_result`) are also used directly by nsi/nsi_scan.jl (worker-global likelihood inside `pmap`, Sobol points).
-# (Like find_mle_advanced, to be moved into analysis_tools.jl together with the optimizer engine.)
+# `profile_advanced` = `Newtrinos.profile` with a strategy for the fit at every grid point, warm starting and a `NewtrinosResult` with the optimizer
+# run data in `meta`; its pieces (`_profile_plan`, `_profile_point_fit`, `_profile_result`) are also used directly by nsi/nsi_scan.jl.
 
 import ProgressMeter
 

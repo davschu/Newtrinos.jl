@@ -1,28 +1,7 @@
-# Compares optimizer STRATEGIES on the same problems. For each of several injected truth points of one hypothesis of a setup
-# file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl) every strategy given in --strategies (a chain of stages, e.g.
-# "optim-pso lbfgsb @3" = PSO then L-BFGS-B, best of 3 attempts; a single optimizer is a one-stage strategy) is run
-# (--nrepeats times, each with its own random seed) with the same objective, bounds and start point, and
-# compared with
-#   * the log-posterior of the injected truth (a successful optimizer ends at or above it), and
-#   * a truth-seeded reference fit (--reference, by default a long LBFGS fit started at the truth).
-# Timing, number of objective evaluations, per-parameter errors and the convergence trace (best objective value so far
-# against evaluations) are recorded for every run.
-#
-# Stages are named entries of the registry in optimizer_tests_common.jl (`OPTIMIZERS`); a spec is "name" or
-# "name:key=val,key=val", e.g.
-#   --strategies lbfgsb "optim-pso:particles=50" mh-de "mh-de:N=30,F=0.5 lbfgsb" "smseed lbfgsb" "mle lbfgsb" "mh-de lbfgsb @3"
-# (@N: N attempts, the best is kept; time and calls count ALL attempts; --nseeds sets the default for strategies without @N)
-# (run with --list-optimizers to see the names and their settings). Every run is one task; with --workers N the tasks
-# are distributed over N single-threaded worker processes, so timings are comparable.
-#
-# Start point of every optimizer: the setup's nominal parameters (blind, NOT the truth). Gradient-free global methods
-# search the box of the free parameters' prior bounds and start from nothing (optim-pso / optim-sa from that start).
-#
-# Output (in --results-dir, default results/<setup name>/optimizer_tests):
-#   <name>_<hypothesis>_summary.txt      table per optimizer spec
-#   <name>_<hypothesis>_results.jld2     every run (parameters, scores, calls, time, trace), truths, reference fits
-#   <name>_<hypothesis>_traces.pdf       best objective value so far vs evaluations, one panel per truth
-#   <name>_<hypothesis>_summary.pdf      distance to the reference per optimizer, and time vs distance
+# Compares optimizer STRATEGIES (chains of stages, e.g. "optim-pso lbfgsb @3") on injected truths of one hypothesis of a setup file:
+# accuracy against the injected truth and a truth-seeded reference fit, cost (evaluations, time), convergence traces.
+# Usage: julia src/analysis/optimizer_tests.jl --setup <file> --strategies lbfgsb "mh-de lbfgsb" ... [--workers N]  (--list-optimizers, --help)
+# Options, output files and plots: docs/src/README_optimizer_tests.md and the docs page "Optimization tests".
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, "..", ".."))
@@ -340,7 +319,8 @@ push!(summary_lines, "below truth = run ended with a score lower than the inject
 push!(summary_lines, "reached = excess <= $tol")
 push!(summary_lines, "param err = |fit - truth| / prior width, median over runs")
 push!(summary_lines, "")
-header = rpad("strategy", 44) * rpad("runs", 6) * rpad("med excess", 12) * rpad("max excess", 12) * rpad("reached", 9) *
+label_width = max(44, maximum(length, labels) + 2)   # the strategy column is as wide as the longest label
+header = rpad("strategy", label_width) * rpad("runs", 6) * rpad("med excess", 12) * rpad("max excess", 12) * rpad("reached", 9) *
          rpad("below truth", 12) * rpad("med calls", 11) * rpad("med time/s", 11) * rpad("failed", 7) * "param err (" * join(plotted_params, ", ") * ")"
 push!(summary_lines, header)
 spec_summaries = Dict{String, Any}()
@@ -354,7 +334,7 @@ for (s, sp) in enumerate(specs)
     spec_summaries[sp.label] = (; n = length(rs), median_excess = med(ex), max_excess = isempty(fin(ex)) ? NaN : maximum(fin(ex)), reached, below_truth = below,
                                 median_calls = med([Float64(coalesce(r.n_calls, NaN)) for r in rs]), median_time = med([r.time for r in rs]), failed = nfail, param_err = perr)
     sm = spec_summaries[sp.label]
-    push!(summary_lines, rpad(sp.label, 44) * rpad(string(sm.n), 6) * rpad(string(round(sm.median_excess, sigdigits = 3)), 12) *
+    push!(summary_lines, rpad(sp.label, label_width) * rpad(string(sm.n), 6) * rpad(string(round(sm.median_excess, sigdigits = 3)), 12) *
         rpad(string(round(sm.max_excess, sigdigits = 3)), 12) * rpad("$(reached)/$(sm.n)", 9) * rpad(string(below), 12) *
         rpad(string(round(sm.median_calls, digits = 0)), 11) * rpad(string(round(sm.median_time, digits = 1)), 11) * rpad(string(nfail), 7) *
         join(round.(perr, sigdigits = 2), "  "))
@@ -384,10 +364,13 @@ ysym(y) = sign(y) * (abs(y) <= noise_band ? abs(y) / noise_band : 1 + log10(abs(
 # stage and from attempt to attempt). Global stages record every evaluation; local fits record per iteration (in BAT's transformed
 # space, shifted to end at the stage's final objective value), spread evenly over the stage's likelihood calls (over its
 # iteration count for `newtrinos`, which does not count calls).
+# Returned per record: one (x, Δχ²_ref, stage) per attempt, every attempt drawn from its own start (same colour in the plot).
 function trace_xy(r)
     ref_obj = -ref_by_truth[r.i].score
-    ok = isfinite.(r.trace_y)
-    r.trace_x[ok], 2 .* (r.trace_y[ok] .- ref_obj), r.trace_stage[ok]
+    map(r.attempt_traces) do t
+        ok = isfinite.(t.y)
+        (t.x[ok], 2 .* (t.y[ok] .- ref_obj), t.stage[ok])
+    end
 end
 
 # One line per run of a stage of the strategy (the line style changes with the stage); a segment starts at the last point of the previous
@@ -424,25 +407,26 @@ end
 
 ncols = min(n_truths, 3)
 nrows = cld(n_truths, ncols)
-trace_data = [trace_xy(r) for r in records]   # (x, Δχ²_ref, stage) per record
-all_y = reduce(vcat, (d[2] for d in trace_data); init = Float64[])
-all_x = reduce(vcat, (d[1] for d in trace_data); init = Float64[])
+trace_data = [trace_xy(r) for r in records]   # per record: (x, Δχ²_ref, stage) per attempt
+flat_traces = reduce(vcat, trace_data; init = Tuple{Vector{Float64}, Vector{Float64}, Vector{Int}}[])
+all_y = reduce(vcat, (d[2] for d in flat_traces); init = Float64[])
+all_x = reduce(vcat, (d[1] for d in flat_traces); init = Float64[])
 yticks_sym = symlog_ticks(isempty(all_y) ? 0.0 : minimum(all_y), isempty(all_y) ? 1.0 : maximum(all_y))
 xlo, xhi = isempty(all_x) ? (1.0, 10.0) : (max(minimum(all_x), 1.0), max(maximum(all_x), 10.0))
 xticks_log = log_ticks(xlo, xhi)
 xspan = [log10(xlo), log10(xhi)]
-max_stage = maximum((isempty(d[3]) ? 1 : maximum(d[3]) for d in trace_data); init = 1)
-fig = Figure(size = (550 * ncols, 420 * nrows + 110))
+fig = Figure(size = (550 * ncols, 420 * nrows + 40 + 22 * cld(n_specs, clamp(floor(Int, 550 * ncols / (6.5 * maximum(length, labels; init = 10) + 50)), 1, n_specs))))
 for i in 1:n_truths
     ax = Axis(fig[(i - 1) ÷ ncols + 1, (i - 1) % ncols + 1], xlabel = "objective evaluations", ylabel = Δ_label, title = "truth $i",
               xticks = xticks_log, yticks = yticks_sym)
     hspan!(ax, -1, 1; color = (:grey, 0.3))                                                                      # |Δχ²| <= noise_band: only optimizer noise left in here
     for (ri, r) in enumerate(records)
         r.i == i || continue
-        x, y, st = trace_data[ri]
-        isempty(x) && continue
-        for (k, xs, ys) in stage_segments(log10.(x), ysym.(y), st)
-            lines!(ax, xs, ys; color = speccolor(r.s), linestyle = stagestyle(k))
+        for (x, y, st) in trace_data[ri]   # one trace per attempt, all in the colour of the strategy
+            isempty(x) && continue
+            for (k, xs, ys) in stage_segments(log10.(max.(x, 1.0)), ysym.(y), st)
+                lines!(ax, xs, ys; color = speccolor(r.s), linestyle = stagestyle(k))
+            end
         end
     end
     lines!(ax, xspan, [0.0, 0.0]; color = :black, linestyle = :dash)                                             # the reference fit
@@ -451,7 +435,8 @@ for i in 1:n_truths
 end
 # legend: only the strategies (colours)
 leg_elems = Any[LineElement(color = speccolor(s)) for s in 1:n_specs]
-Legend(fig[nrows + 1, 1:ncols], leg_elems, String[labels...], orientation = :horizontal, nbanks = cld(n_specs, 4), tellwidth = false)
+leg_cols = clamp(floor(Int, 550 * ncols / (6.5 * maximum(length, labels; init = 10) + 50)), 1, n_specs)   # as many columns as fit the figure width
+Legend(fig[nrows + 1, 1:ncols], leg_elems, String[labels...], orientation = :horizontal, nbanks = cld(n_specs, leg_cols), tellwidth = false)
 save(out_prefix * "_traces_$(run_date).pdf", fig)
 
 excesses = [2 * excess_ref(r) for r in records]   # Δχ²_ref of every run

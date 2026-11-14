@@ -27,6 +27,12 @@ makedocs(
             "Configure an experiment" => "tutorials/configure_experiment.md",
             "Analyse data" => "tutorials/analyse_data.md",
             "Analysis CLI Reference" => "tutorials/cli.md",
+            "Optimization tests" => [
+                "Overview" => "tutorials/optimization_tests.md",
+                "Creating a setup file" => "tutorials/optimization_tests/setup_file.md",
+                "Roundtrips" => "tutorials/optimization_tests/roundtrips.md",
+                "Optimizer tests" => "tutorials/optimization_tests/optimizer_tests.md",
+            ],
             "Automatic Differentiation" => "tutorials/autodiff.md"
         ], 
         "Examples" => [ 

@@ -1,3 +1,7 @@
+# Profile (or plain likelihood scan) of one hypothesis of a setup file, fitted with a strategy at every grid point.
+# Usage: julia nsi/nsi_scan.jl --setup <file> --name <n> --task profile --hypothesis <name> --objective posterior --strategy random lbfgsb [--workers N]
+# Saves a Newtrinos.NewtrinosResult (key "result"). Options and output: nsi/README.md.
+
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 
@@ -115,14 +119,7 @@ ftype = Float64
 map_func = nothing
 
 if use_distributed
-    # --multi-node switches from plain addprocs(n_workers) (all workers on THIS single
-    # machine -- correct for cm4_tiny) to SlurmClusterManager.jl's SlurmManager(), which
-    # launches workers across every node SLURM allocated to this job (e.g. cm4_std's
-    # multi-node jobs). SlurmManager() takes NO worker-count argument -- it reads
-    # ENV["SLURM_NTASKS"] itself (requires an active SLURM allocation). Worker count is
-    # therefore fixed by the SBATCH script's own --ntasks, NOT by --workers directly --
-    # --workers is only used as an explicit consistency check here, so a mismatched
-    # SBATCH script (--ntasks != --workers) fails loudly before spawning anything.
+    # --multi-node: SlurmManager() reads SLURM_NTASKS itself, so --workers is only a consistency check (a mismatch fails before spawning).
     if multi_node_flag
         slurm_ntasks_str = get(ENV, "SLURM_NTASKS", nothing)
         slurm_ntasks_str === nothing &&
@@ -242,11 +239,8 @@ result_meta = Dict{String, Any}("hypothesis" => hypothesis_name, "setup" => S.na
 sobol || (result_meta["vars_to_scan"] = vars_to_scan)
 
 if lowercase(args["task"]) == "profile"
-    # The strategy is run at every grid point (find_mle_advanced via profile_advanced's pieces in optimizer_tests_common.jl): the best of
-    # `nseeds` attempts by log_posterior is kept. A seed or alias first stage (random, smseed, mle, ...) is computed ONCE here (plan) and
-    # shared by all points; a global first stage runs at every point. Each point has its own RNG stream (seed + point index), so results do
-    # not depend on thread/pmap scheduling. The pieces are used directly instead of profile_advanced so that the likelihood stays a
-    # worker-global inside pmap (a closure in a library function would ship the whole likelihood to every worker).
+    # Seed/alias first stages are computed ONCE (plan), a global first stage runs per point; every point has its own RNG (seed + index), so results do not
+    # depend on scheduling. The pieces are used instead of profile_advanced so that `likelihood` stays a worker-global inside pmap (a closure would ship it).
     plan = _profile_plan(likelihood, cp_hyp, p, scanpoints, mesh_flat, scan_keys; strategy, nseeds, seed = args["seed"], objective, null_prior = cp_sm)
     t_start = time()
     if use_distributed

@@ -161,6 +161,18 @@ const OPTIMUM_LLH = -0.1
         # the stage of every trace point: a chain has both stages, in order; a single stage only stage 1
         @test length(three.trace_stage) == length(three.trace_x) && issorted(three.trace_stage[1:length(one.trace_stage)])
         @test Set(three.trace_stage) == Set([1, 2]) && all(==(1), g.trace_stage)
+        # the same trace attempt by attempt: every attempt starts from its own beginning
+        @test length(three.attempt_traces) == 3 && length(one.attempt_traces) == 1
+        @test all(t -> issorted(t.x) && issorted(t.y; rev = true) && length(t.x) == length(t.y) == length(t.stage), three.attempt_traces)
+        @test sum(t -> length(t.x), three.attempt_traces) == length(three.trace_x)
+        @test all(t -> t.x[1] <= 1 + 1e-9 || t.x[1] < 5, three.attempt_traces)
+    end
+
+    @testset "nothing to fit (no free parameter)" begin
+        all_fixed = (a = 0.3, b = -0.2, c = 1.0, d = 1.0)
+        r = find_mle_advanced(ToyLikelihood(), all_fixed, all_fixed; strategy = ["lbfgsb"], rng = Random.Xoshiro(1))   # L-BFGS-B would crash on zero dimensions
+        @test r.llh ≈ OPTIMUM_LLH atol = 1e-12
+        @test r.converged === true
     end
 
     @testset "profile_advanced" begin

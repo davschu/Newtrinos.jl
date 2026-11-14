@@ -1,101 +1,7 @@
-# Generic roundtrip scan. Physics, experiments, priors and the hypotheses to test come from a setup
-# file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl; see there for how a hypothesis is specified); this
-# script contains no model-specific code. --hypothesis selects one of the setup's hypotheses.
-#
-# Thesis-style roundtrip scan: replicates the dissertation's "recovering injected NSI
-# hypotheses" test (section 7.6.2, nuisances/theta23/deltam31 pinned at nominal) and,
-# with --fluctuate-nuisances, its "recovering fluctuated nuisance parameters" test
-# (section 7.6.3, nuisances + theta23/deltam31 redrawn from their own priors per grid
-# point). All truth-vs-fit panels (NSI scan panel(s), nuisance/physics panels, and the
-# Δχ²_mod histogram) are combined into ONE figure/ONE output file per run -- no separate
-# "_nuisances.pdf" file.
-#
-# Per-hypothesis panel(s), by the number of tested parameters of the hypothesis (keys of its `null`):
-#   - 1 tested parameter: one truth-vs-fit diagonal panel.
-#   - 2 tested parameters (e.g. a magnitude+phase pair): THREE panels -- the plane of the two
-#     parameters with truth and fit as separate point sets (matching the dissertation's Fig.
-#     7.14b layout), plus two diagonal truth-vs-fit panels (one per parameter), same visual
-#     language as the nuisance panels.
-#   - more than 2 (Sobol sample): one truth-vs-fit diagonal panel per tested parameter.
-#
-# The GRID controls only how truths are injected (via truth_grid, optimizer_tests_common.jl)
-# -- it does NOT restrict the fit. Every fit is still free to vary every non-fixed
-# parameter in the hypothesis's prior (all physics params + all nuisances), exactly
-# like any other roundtrip; only the injected truth is simplified to isolate the scan to
-# the NSI parameter(s) being tested (plus, under --fluctuate-nuisances, the nuisances and
-# θ₂₃/Δm²₃₁).
-#
-# --setup: setup file defining physics, experiments, priors and hypotheses (required).
-# --hypothesis: name of one of the setup's hypotheses.
-# --results-dir: output folder (default results/<setup name>/roundtrip, relative to the working directory).
-#
-# Δχ²_mod statistic -- pick ONE via mutually-exclusive flags (--chi2-recovery is default):
-#   --chi2-recovery: Δχ²_recovery = 2*(log_post_fit - log_post_truth), i.e. how far the
-#     PSO+LBFGS pipeline's best-fit point is (in -2logL units) from the injected truth
-#     point. A pipeline/optimizer diagnostic -- "did the fit find the truth" -- NOT a
-#     hypothesis-test statistic, and not χ²-distributed with a small fixed dof (its
-#     effective dof tracks however many directions are practically constrained by the
-#     data at that point).
-#   --chi2-mis-modeling: Δχ²_mis-mod = χ²(NSI param(s) fixed at truth, refit) -
-#     χ²(NSI param(s) free, best fit) -- the dissertation's actual profile-likelihood
-#     Δχ²_mod (section 7.2.1 family): under Wilks' theorem, asymptotically χ²-distributed
-#     with dof = number of NSI params fixed (1 for standalone real params, 2 for
-#     magnitude+phase pairs). Requires a SECOND LBFGS fit per grid point (NSI param(s)
-#     fixed at the injected truth value, everything else re-optimized), roughly doubling
-#     per-point cost -- only run when you actually want this statistic.
-#
-# --prior-effect: additionally decomposes Δχ²_recovery into two pieces, storing both
-#   alongside the chosen Δχ²_mod/Δχ²_recovery/Δχ²_mis_modeling statistic(s) (no effect on
-#   plots). Under --objective posterior, the injected truth is only guaranteed to maximize
-#   the LIKELIHOOD (Asimov data is generated to peak exactly there) -- it is generally NOT
-#   the posterior maximum, since the prior can pull the true MAP away from truth (e.g.
-#   under --fluctuate-nuisances, nuisances drawn away from their prior mode). This means a
-#   positive Δχ²_recovery under --objective posterior conflates two different effects:
-#   expected prior pull, and genuine optimizer underperformance. --prior-effect separates
-#   them by running one extra CHEAP local-only fit per grid point, seeded exactly at
-#   truth_param (no PSO search -- truth_param already sits near the likelihood optimum, so
-#   this should converge fast) with objective="posterior" (prior pull is a posterior-only
-#   phenomenon; irrelevant under objective="likelihood", so this reference fit always
-#   targets posterior regardless of --objective), giving a cheap estimate log_post_ref of
-#   the true local posterior maximum near truth:
-#     Δχ²_prior_pull        = 2*(log_post_ref - truth_log_post)   -- expected, not a bug
-#     Δχ²_optimizer_residual = 2*(log_post      - log_post_ref)    -- should be ≈0 (or
-#       negative) for a well-converged main PSO+LBFGS fit; meaningfully negative means the
-#       main pipeline underperformed a simple local fit started right at the truth.
-#   Both NaN when --prior-effect is not set.
-#
-# --objective posterior|likelihood: what the local fit maximizes (default posterior, i.e.
-#   MAP). likelihood fits against the raw likelihood via a flat prior over the same bounds
-#   (i.e. MLE) -- see local_find_mle's docstring in optimizer_tests_common.jl. Δχ²_recovery
-#   is computed from llh (not log_post) in likelihood mode, since log_post there is only the
-#   flat-prior pseudo-posterior, not the true MAP posterior truth_log_post is computed from.
-#
-# --strategy: the fit at every grid point is a chain of stages (find_mle_advanced in optimizer_tests_common.jl), e.g.
-#   --strategy smseed lbfgsb | --strategy optim-pso:particles=20,iters=50 lbfgsb | --strategy random lbfgsb. Every stage starts from
-#   the result of the previous one; seed, alias and global stages (random, manual, smseed, mle, optim-pso, ...) are only allowed first.
-#   The stage settings (iterations, tolerances, particles, ...) are part of the stage spec and recorded in the saved .jld2's
-#   "settings" block. A strategy that is a single global search is not polished and has no convergence flag
-#   (`converged = missing`, drawn with its own marker). --start chooses the start point of the first stage (nominal or truth).
-#   Local fits should normally use lbfgsb (L-BFGS-B): plain optim-lbfgs jumps onto the prior bounds from a start far from the
-#   optimum and then stops with a vanishing gradient.
-#
-# --toydata: inject Poisson-fluctuated toy data (Newtrinos.generate_toy_data) instead of
-#   the default noiseless Asimov data. Also widens the plot to show all nuisance/physics
-#   panels (same as --fluctuate-nuisances), since with toy data every free parameter's
-#   fit is worth inspecting, not just the scanned NSI param(s).
-#
-# All grid points are independent (same likelihood-generation machinery, different
-# truth) -- runs via Threads.@threads, same index-owned-output pattern as
-# test_global_seed.jl. Launch with multiple threads to parallelize, e.g.:
-#
-# Usage: julia --threads=8 src/analysis/roundtrips.jl --setup nsi/setups/nsi_deepcore_3y.jl --hypothesis ττ_μμ
-#
-# Output directory: --results-dir (created if missing).
-# Output filenames: grid_roundtrip_<asimov|toydata>_<fluctuated|nominal>_<hypothesis>_<posteriorfit|likelihoodfit>[_<suffix>].{pdf,jld2}
-# -- "asimov"/"toydata" reflects whether --toydata was set, "fluctuated"/"nominal" reflects
-# whether --fluctuate-nuisances was set, "posteriorfit"/"likelihoodfit" reflects --objective;
-# --suffix is freeform run-tagging (e.g. "run1").
-# Results (.jld2) are saved BEFORE plotting, so they survive even if plotting fails.
+# Roundtrip scan: inject truths (grid / Sobol sample of the tested parameters of a hypothesis of a setup file), refit with a strategy,
+# and plot truth vs fit (Δχ²_recovery or Δχ²_mis-mod). All panels go into ONE figure; the results .jld2 is saved before plotting.
+# Usage: julia src/analysis/roundtrips.jl --setup <file> --hypothesis <name> --strategy random lbfgsb [--workers N]  (--help)
+# Options, statistics, output files: docs/src/README_optimizer_tests.md and the docs page "Optimization tests".
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, "..", ".."))
@@ -125,7 +31,7 @@ function parse_command_line()
         "--hypothesis"
         help = "Name of the hypothesis (from the setup file) to scan. A hypothesis with more than 2 tested parameters uses Sobol quasi-random sampling instead of a factorial grid -- use a larger --n-points, e.g. 100-200"
         arg_type = String
-        default = "ττ_μμ"
+        default = ""
 
         "--results-dir"
         help = "Output folder for the saved results and plots (default: results/<setup name>/roundtrip, relative to the working directory)"
@@ -150,7 +56,7 @@ function parse_command_line()
         action = :store_true
 
         "--prior-effect"
-        help = "Additionally compute and save Δχ²_prior_pull and Δχ²_optimizer_residual per grid point (decomposes Δχ²_recovery into expected prior-pull vs. genuine optimizer underperformance -- see header comment). Adds one cheap local-only reference fit per grid point, seeded at the truth. Does not affect plots."
+        help = "Additionally compute and save Δχ²_prior_pull and Δχ²_optimizer_residual per grid point (decomposes Δχ²_recovery into expected prior-pull vs. genuine optimizer underperformance -- see docs/src/README_optimizer_tests.md). Adds one cheap local-only reference fit per grid point, seeded at the truth. Does not affect plots."
         action = :store_true
 
         "--toydata"
@@ -225,39 +131,12 @@ chi2_mode = args["chi2-mis-modeling"] ? "mis-modeling" : "recovery"  # recovery 
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
 start_mode in ("nominal", "truth") || error("--start must be 'nominal' or 'truth', got '$start_mode'")
 
-data_mode_tag = toydata_flag ? "toydata" : "asimov"
-truth_mode_tag = fluctuate_nuisances_flag ? "fluctuated" : "nominal"
-objective_tag = objective == "likelihood" ? "likelihoodfit" : "posteriorfit"
-output_tag = isempty(args["suffix"]) ? "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)" : "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)_$(args["suffix"])"
-output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
-output_tag = output_tag * "_" * join((first(split(s, ':')) for s in strategy), "+")   # stage names of the strategy
-output_tag = output_tag * "_" * Dates.format(Dates.today(), "ddmmyyyy")             # execution date ends every file name
-
 Δχ²_label = rich("Δχ", superscript("2"), subscript(chi2_mode == "mis-modeling" ? "mis-mod" : "recovery"))
 
 ### DISTRIBUTED WORKERS (optional) ###
-# Spawn worker processes BEFORE loading any package they'll need, then load those
-# packages via @everywhere so both the driver and every worker have them. Each worker
-# gets its own --threads=n_threads (passed through addprocs' exeflags), so grid points
-# dispatched to it (via pmap below) can still run their own seed-attempts concurrently
-# via Threads.@threads internally -- this hybrid shape (a moderate number of separate
-# processes, each multi-threaded) was confirmed locally to avoid the severe contention
-# that a single process with MANY threads hits under heavy concurrent PSO/LBFGS
-# allocation (Julia's current GC is stop-the-world PER PROCESS -- every thread in that
-# process stalls together on every GC pause; splitting into a few processes confines
-# each pause to that process's own threads only).
-#
-# --multi-node switches from plain addprocs(n_workers) (all workers on THIS single
-# machine -- correct for cm4_tiny) to SlurmClusterManager.jl's SlurmManager(), which
-# launches workers across every node SLURM actually allocated to this job (e.g.
-# cm4_std's multi-node jobs) via `srun ... --worker` internally. SlurmManager() takes
-# NO worker-count argument -- it reads ENV["SLURM_NTASKS"] itself (requires an active
-# SLURM allocation; SLURM_JOB_ID/SLURM_JOBID and SLURM_NTASKS must be set, or its own
-# constructor errors). Worker count is therefore fixed by the SBATCH script's own
-# --ntasks, NOT by --workers directly here -- --workers is only used as an explicit
-# consistency check below, so a mismatched SBATCH script (--ntasks != --workers) fails
-# loudly before spawning anything, rather than silently running with the wrong worker
-# count.
+# Workers are spawned BEFORE loading packages, which are then loaded with @everywhere. Each worker gets --threads=n_threads: a few multi-threaded
+# processes avoid the contention of one process with many threads (Julia's GC stops all threads of a process).
+# --multi-node: SlurmManager() reads SLURM_NTASKS itself, so --workers is only checked against it (fails before spawning on a mismatch).
 if use_distributed
     if multi_node_flag
         slurm_ntasks_str = get(ENV, "SLURM_NTASKS", nothing)
@@ -288,14 +167,7 @@ end
     using ValueShapes
 end
 
-# `@reset` (Accessors' macro, used below for prior overrides) must be expanded in a
-# SEPARATE top-level @everywhere block from `using Accessors` -- Julia errors with
-# "UndefVarError: @reset not defined ... binding may be too new" if both are evaluated
-# together as one atomic block (world age hasn't advanced yet to see the macro). In
-# practice `@reset` itself is only ever called on the DRIVER (the priors/`cp_*`
-# construction below never runs on a worker), but `using Accessors` still needs to be
-# loaded everywhere `optimizer_tests_common.jl`'s own code might reference it internally,
-# so keep this split defensively rather than relying on that happening to be true today.
+# @reset must be expanded in a separate @everywhere block from `using Accessors` (world age).
 @everywhere begin
     using Accessors
     include(joinpath(@__DIR__, "optimizer_tests_common.jl"))
@@ -305,7 +177,16 @@ end
 
 include(abspath(args["setup"]))
 S = finalize_setup(setup(; ftype = Float64))
+hypothesis_name = isempty(hypothesis_name) ? first(keys(S.hypotheses)) : hypothesis_name   # default: the first hypothesis of the setup
 hyp = hypothesis_info(S, hypothesis_name)
+
+data_mode_tag = toydata_flag ? "toydata" : "asimov"
+truth_mode_tag = fluctuate_nuisances_flag ? "fluctuated" : "nominal"
+objective_tag = objective == "likelihood" ? "likelihoodfit" : "posteriorfit"
+output_tag = isempty(args["suffix"]) ? "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)" : "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)_$(args["suffix"])"
+output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
+output_tag = output_tag * "_" * join((first(split(s, ':')) for s in strategy), "+")   # stage names of the strategy
+output_tag = output_tag * "_" * Dates.format(Dates.today(), "ddmmyyyy")             # execution date ends every file name
 
 experiments = S.experiments
 p = S.params
@@ -333,17 +214,8 @@ normalize_strategy(strategy)
 local_defaults = (; ad = :forward)
 extra_spec = with_local_defaults(final_local_spec(strategy), local_defaults)
 
-# `run_grid_point` below needs every one of these on whichever process actually executes
-# it. A plain `@everywhere function run_grid_point(k) ... end` does NOT automatically see
-# driver-side free variables the way a pmap do-block closure would -- confirmed directly:
-# referencing an un-broadcast driver variable from inside an @everywhere function throws
-# UndefVarError on the worker. Bundling everything into one NamedTuple and broadcasting it
-# ONCE (rather than ~25 individual `@everywhere x = $x` statements, or re-serializing
-# large objects like `experiments` on every one of the n_grid calls) is the simplest fix;
-# `run_grid_point` below references the global `ctx` directly (resolved to each worker's
-# own already-broadcast copy -- confirmed this does NOT re-send ctx per call). When
-# `!use_distributed`, this is just a plain global in the single process, no different from
-# today's top-level variables.
+# `run_grid_point` needs these on whichever process runs it: a plain @everywhere function does not see driver-side variables, so they are
+# bundled into one NamedTuple `ctx` and broadcast once (not re-sent per call).
 ctx = (; experiments, prior_dist, cp_hyp, cp_sm, p,
        nseeds, strategy, start_mode, local_defaults, extra_spec, objective,
        prior_effect_flag, chi2_mode, scan_keys,
@@ -358,16 +230,8 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
         (use_distributed ? "$n_workers workers x $n_threads threads each" : "$(Threads.nthreads()) threads") *
         " (Δχ²_mod mode: $chi2_mode)...")
 
-# One grid point's full roundtrip: build its truth-injected likelihood, run n_attempts
-# independent PSO-seed + LBFGS-polish attempts CONCURRENTLY via the inner Threads.@threads
-# (one Julia thread per attempt -- this is the actual expensive work), reduce to the best
-# attempt, then (optionally) the --prior-effect and --chi2-mis-modeling extra fits.
-# Called either from pmap (--workers > 1, dispatched across worker processes, each with
-# its own --threads threads so this inner Threads.@threads still has something to use) or
-# from a plain Threads.@threads loop over k (--workers 1, today's single-process
-# behavior) -- identical body either way; only who calls it differs below. Defined via
-# @everywhere unconditionally (harmless/equivalent to a plain `function` when there are no
-# extra worker processes) so it works identically in both modes without a branch here.
+# One grid point's roundtrip: truth-injected likelihood, `nseeds` attempts of the strategy, best attempt, then the optional
+# --prior-effect and --chi2-mis-modeling fits. Called from pmap (--workers > 1) or a Threads.@threads loop; defined with @everywhere in both cases.
 @everywhere function run_grid_point(k)
     experiments, prior_dist, cp_hyp, cp_sm, p,
         nseeds, strategy, start_mode, local_defaults, extra_spec, objective,
@@ -379,17 +243,7 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
         fluctuate_nuisances(seed_rng, truths[k], cp_hyp, fluctuated_names) : truths[k]
 
     t0 = time()
-    # Newtrinos.generate_toy_data takes no RNG argument -- it always draws via plain
-    # rand(dist_obj) against Julia's global/task-local RNG, so its Poisson fluctuation is
-    # NOT reproducible from seed_rng on its own. Seed the global RNG with an explicit
-    # integer (derived from this grid point's own seed, 1000+k, same value seed_rng was
-    # built from) immediately before the call, so the toy-data draw becomes deterministic
-    # and tied to this grid point. NOTE: Random.seed!(rng::AbstractRNG) (no seed value) is
-    # NOT reproducible -- it re-randomizes rng from system entropy (confirmed against
-    # Random.seed!'s own docstring example: `rand(Random.seed!(rng), Bool) # not
-    # reproducible`) -- only the explicit-integer form `Random.seed!(::Integer)` seeds
-    # deterministically, which is why this reseeds the GLOBAL rng by integer rather than
-    # trying to copy seed_rng's state into it.
+    # generate_toy_data draws from the global RNG: seed it with an integer (Random.seed!(rng) without a value is not reproducible).
     toydata_flag && Random.seed!(1000 + k)
     injected_data = toydata_flag ?
         Newtrinos.generate_toy_data(experiments, truth_param) : Newtrinos.generate_asimov_data(experiments, truth_param)
@@ -397,15 +251,8 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
     truth_posterior = PosteriorMeasure(truth_likelihood, prior_dist)
     truth_log_post = logdensityof(truth_posterior, truth_param)
 
-    # Run `nseeds` independent attempts of the strategy (find_mle_advanced), keeping whichever reaches
-    # the highest log_post (NaN treated as -Inf). Attempts are independent of each other (each runs the
-    # strategy from its own RNG against the SAME read-only truth_likelihood/prior for this grid point) so they run
-    # concurrently via Threads.@threads, one Julia thread per attempt -- this is the actual expensive work.
-    #
-    # Each attempt s gets its own Random.Xoshiro(1000*k + s) RNG rather than sharing one seed_rng advanced
-    # sequentially across s (which would be inherently serial and would race under concurrent access) --
-    # deterministic and reproducible per (k, s). Deterministic strategies (e.g. smseed lbfgsb) give the same
-    # fit for every attempt, so nseeds > 1 only repeats it there.
+    # `nseeds` independent attempts of the strategy, concurrently (Threads.@threads); the best by log_post is kept (NaN counts as -Inf).
+    # Attempt s has its own RNG Xoshiro(1000k + s): reproducible per (k, s), no shared RNG state between threads.
     start_param = start_mode == "truth" ? truth_param : p
     attempt_results = Vector{Any}(undef, nseeds)
     Threads.@threads for s in 1:nseeds
@@ -413,10 +260,8 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
                                                rng = Random.Xoshiro(1000 * k + s), objective, null_prior = cp_sm, local_defaults)
     end
 
-    # Reduce the attempts serially: keep the best by log_post, along with THAT attempt's own seed point (the point
-    # its last stage started from; needed below for --chi2-mis-modeling's profile_start). If every attempt failed
-    # (log_post stays NaN for all of them), fall back to a NaN-filled failure record, so this grid point is recorded
-    # as a non-convergent failure instead of crashing on a `nothing` destructure below.
+    # Keep the best attempt by log_post and its own seed point (needed for --chi2-mis-modeling's profile_start); if every attempt failed,
+    # fall back to a NaN failure record so that this grid point is recorded as non-convergent.
     best_rec = nothing
     best_log_post = -Inf
     for s in 1:nseeds
@@ -439,11 +284,7 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
     end
     llh, log_post, fit_param, converged, n_iters = best_result
 
-    # χ²_recovery: pipeline-recovery diagnostic (see header comment). Always computed
-    # (cheap, already have both values / one extra logdensityof call). Branches on
-    # `objective` since with objective="likelihood" the fit target is the flat-prior
-    # pseudo-posterior (≈ llh + const), not the true MAP posterior -- log_post/truth_log_post
-    # would compare like-for-unlike in that mode (see local_find_mle's docstring).
+    # Δχ²_recovery: always computed; with objective="likelihood" the fit target is a flat-prior pseudo-posterior, so llh is compared instead.
     Δχ²_recovery = if objective == "likelihood"
         truth_llh = logdensityof(truth_likelihood, truth_param)
         2 * (llh - truth_llh)
@@ -455,12 +296,8 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
     Δχ²_prior_pull = NaN
     Δχ²_optimizer_residual = NaN
     if prior_effect_flag
-        # Cheap local-only reference fit seeded exactly at truth_param (no PSO search --
-        # truth_param already sits near the likelihood optimum by construction, so this
-        # should converge fast from a good starting point). Always targets objective=
-        # "posterior": prior pull is a posterior-only phenomenon (see header comment),
-        # so under --objective likelihood this reference fit still estimates the local
-        # posterior maximum near truth, independent of what the main fit optimized.
+        # Cheap local fit started at the truth, always with objective="posterior" (prior pull is a posterior-only effect): estimates the local
+        # posterior maximum near the truth, whatever the main fit optimized.
         t3 = time()
         log_post_ref = run_optimizer(extra_spec, truth_likelihood, prior_dist, truth_param; objective="posterior").log_post
         prior_pull_elapsed = time() - t3
@@ -479,15 +316,8 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
         fixed_vals = Dict(k => Float64(truth_param[k]) for k in scan_keys)
         cp_fixed = Newtrinos.condition(cp_hyp, fixed_vals, truth_param)
         prior_fixed = distprod(;cp_fixed...)
-        # best_start_param's scan-key value(s) come from the free/unconstrained PSO seed
-        # search and generally do NOT equal truth_param's -- but prior_fixed now holds
-        # scan_keys constant at the truth value, and bat_findmode's ExplicitInit strictly
-        # validates the init point against the prior's constants (same failure mode
-        # documented on controlled_truth/_fix_conditioned in optimizer_tests_common.jl).
-        # Overwrite the scan key(s) in the seed to match before fitting, or this throws
-        # ArgumentError (silently caught by local_find_mle, returning NaN log_post).
-        # Uses best_start_param (the WINNING attempt's seed, tracked above), not just
-        # whichever attempt happened to run/finish last.
+        # The seed's scan key(s) differ from truth_param's, but bat_findmode's ExplicitInit rejects a start that differs from the prior's
+        # constants (see controlled_truth): overwrite them with the truth values (using the WINNING attempt's seed).
         profile_start = merge(best_start_param, NamedTuple{Tuple(scan_keys)}(Tuple(fixed_vals[k] for k in scan_keys)))
         log_post_fixed = run_optimizer(extra_spec, truth_likelihood, prior_fixed, profile_start; objective=objective).log_post
         profile_elapsed = time() - t2
@@ -524,13 +354,8 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
     return result
 end
 
-# --workers > 1: dispatch grid points across worker processes via pmap (dynamic
-# load-balancing -- handles the significant per-point cost variance seen throughout
-# testing better than Threads.@threads's static partition). Each worker still internally
-# parallelizes that point's own n_attempts seed-attempts via the inner Threads.@threads
-# inside run_grid_point, using the --threads threads it was spawned with.
-# --workers 1 (default): today's exact single-process behavior, Threads.@threads over k,
-# with results[k] assigned directly (no pmap/serialization involved).
+# --workers > 1: grid points over the workers with pmap (dynamic load balancing; the per-point cost varies a lot), each worker threads over
+# the attempts of its point. --workers 1: Threads.@threads over the grid points.
 results = if use_distributed
     pmap(run_grid_point, 1:n_grid)
 else
@@ -622,36 +447,14 @@ FileIO.save(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"), Dict(
 println("Saved results to $(joinpath(results_dir, "grid_roundtrip_$(output_tag).jld2"))")
 
 ### PLOT ###
-# Single combined figure: NSI panel(s) first, then (if --fluctuate-nuisances) nuisance +
-# physics panels, then a Δχ²_mod histogram. All panels share the same small-multiples
-# layout (row, 2*col axis / 2*col+1 colorbar), one shared "converged"/"not converged"
-# legend in column 1 spanning every row, Δχ²_mod colors the FIT points. Converged fits are drawn as
-# circles/diamonds, non-converged fits as crosses and fits WITHOUT a convergence flag (`converged = missing`,
-# the result of a global-only strategy) as squares, all in the same color scale; only fits whose Δχ²_mod is
-# not finite (the fit itself failed) are drawn as grey crosses.
+# One combined figure: tested-parameter panel(s), then (with --fluctuate-nuisances) nuisance/physics panels, then the Δχ²_mod histogram. Marker:
+# circle/diamond = converged, cross = not converged, square = no convergence flag (global-only strategy); failed fits (not finite) are not drawn.
 
 conv_flags = [r.converged === true for r in results]
 noflag_flags = [ismissing(r.converged) for r in results]   # no convergence criterion (global-only strategy)
 Δχ²_all = [r.Δχ²_mod for r in results]
-# colorrange is computed from the FINITE Δχ²_mod values of all points, converged or not (a failed
-# fit has Δχ²_mod = NaN when local_find_mle fails; those points are drawn grey). A NaN colorrange
-# silently corrupts every Colorbar's internal image and crashes CairoMakie's PDF renderer
-# (ArgumentError: start and stop must be finite), so only finite values enter it.
-#
-# Separately, a DEGENERATE (zero-width) range -- cmin == cmax, e.g. only 1 converged point,
-# or every converged point sharing the exact same Δχ²_mod -- is finite but still crashes
-# CairoMakie's colormap interpolation ("Can't interpolate in a range where cmin == cmax").
-# Widen a degenerate range by a small symmetric epsilon so the colorbar always has a valid
-# (nonzero) span; falls back to the same (-1.0, 1.0) default when there's nothing to plot.
-#
-# The degeneracy check itself must be done in Float32, not Float64: CairoMakie casts
-# colorrange (and the plotted colors) down to Float32 internally before rendering, so two
-# Float64 values that are merely CLOSE (not bit-equal) -- e.g. 0.0028239744427... vs.
-# 0.0028239744568..., differing only ~1e-11 apart -- can still round to the exact same
-# Float32 value and silently reproduce the degenerate-range crash even though the Float64
-# `lo == hi` check above passed as "not degenerate" (confirmed: this exact pair of
-# near-but-not-equal Float64 Δχ²_mod values from a real run crashed CairoMakie's PDF
-# renderer with "Can't interpolate in a range where cmin == cmax" despite lo != hi here).
+# colorrange from the FINITE Δχ²_mod values only, widened if degenerate (checked in Float32, as CairoMakie casts down to Float32): a NaN or
+# zero-width range crashes CairoMakie's PDF renderer (see "Implementation notes" in docs/src/README_optimizer_tests.md).
 fin_flags = isfinite.(Δχ²_all)
 sel_conv = conv_flags .& fin_flags        # converged, drawn as circles/diamonds
 sel_nonc = (.!conv_flags .& .!noflag_flags) .& fin_flags   # not converged, drawn as crosses in the same color scale
@@ -665,11 +468,8 @@ else
     Float32(lo) == Float32(hi) ? (lo - max(abs(lo), 1.0) * 1e-3 - 1e-6, hi + max(abs(hi), 1.0) * 1e-3 + 1e-6) : (lo, hi)
 end
 
-# Build the ordered list of NSI panel specs first (hypothesis-dependent), then append
-# nuisance/physics panels (only if fluctuated or toydata), then the histogram panel.
-# Each spec is a NamedTuple describing how to draw one panel; `kind` dispatches the draw
-# logic below. `plane` panels (2D mag/phase) are handled specially since they overlay
-# truth+fit as two point sets rather than a truth-vs-fit diagonal.
+# Panel specs: first the tested-parameter panels, then nuisance/physics panels (only if fluctuated or toydata), then the histogram; `plane` panels
+# (2D) overlay truth and fit as two point sets.
 show_all_params = fluctuate_nuisances_flag || toydata_flag # show all parameter plots also for toydata runs
 panel_specs = NamedTuple[]
 
@@ -680,8 +480,8 @@ if is_many
 elseif is_2d
     mag_key, phase_key = scan_keys
     push!(panel_specs, (kind=:plane, mag_key=mag_key, phase_key=phase_key))
-    push!(panel_specs, (kind=:diagonal, key=mag_key, xlabel="truth $(mag_key)", ylabel="fit $(mag_key)", title="$(mag_key) (magnitude)"))
-    push!(panel_specs, (kind=:diagonal, key=phase_key, xlabel="truth $(phase_key)", ylabel="fit $(phase_key)", title="$(phase_key) (phase)"))
+    push!(panel_specs, (kind=:diagonal, key=mag_key, xlabel="truth $(mag_key)", ylabel="fit $(mag_key)", title="$(mag_key)"))
+    push!(panel_specs, (kind=:diagonal, key=phase_key, xlabel="truth $(phase_key)", ylabel="fit $(phase_key)", title="$(phase_key)"))
 else
     k1 = scan_keys[1]
     push!(panel_specs, (kind=:diagonal, key=k1, xlabel="truth $(k1)", ylabel="fit $(k1)", title="$(k1)"))
@@ -740,8 +540,8 @@ for (idx, spec) in enumerate(panel_specs)
 
     elseif spec.kind == :plane
         local mag_key, phase_key = spec.mag_key, spec.phase_key
-        local ax = Axis(fig[row, 2*col], xlabel="$(mag_key) (magnitude)", ylabel="$(phase_key) (phase)",
-                         title="Truth vs fit (mag/phase plane)")
+        local ax = Axis(fig[row, 2*col], xlabel="$(mag_key)", ylabel="$(phase_key)",
+                         title="Truth vs fit ($(mag_key) - $(phase_key) plane)")
         local truth_mags   = [r.truth_param[mag_key] for r in results]
         local truth_phases = [r.truth_param[phase_key] for r in results]
         local fit_mags     = [r.fit_param[mag_key] for r in results]

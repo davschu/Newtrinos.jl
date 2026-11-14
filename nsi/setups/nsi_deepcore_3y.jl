@@ -1,51 +1,8 @@
 # Analysis setup: NSI (Standard parametrization) with the DeepCore 3-year high-statistics sample B.
-#
-# A setup file describes the PROBLEM (physics, data, priors, hypotheses) and nothing about HOW it is solved:
-# optimizer settings (PSO, LBFGS, seeds, ...) stay command-line arguments of the scripts. Scripts take
-# `--setup <this file>`, `include` it and call `setup(; ftype)`. To analyse something else (another dataset,
-# another physics model, e.g. the CP phase) write a new file with the same `setup` function; the scripts
-# themselves do not change.
-#
-# `setup` returns a NamedTuple with
-#   name          short label of the setup; used for the results folder and stored in every saved result
-#   experiments   NamedTuple of configured experiments (all built from the same `physics`)
-#   params        start values of all parameters (Newtrinos.get_params(experiments))
-#   priors        priors of all parameters (before any hypothesis is applied)
-#   hypotheses    OrderedDict  name => (; prior, null)   -- see below
-#
-# ---------------------------------------------------------------------------------------------------------
-# HOW TO SPECIFY A HYPOTHESIS
-#
-# A hypothesis is one question of the form "is the effect X present, and can the fit recover it?".
-# It consists of two things:
-#
-#   prior   the prior in which the parameters of X are FREE and every parameter that does not belong to the
-#           analysis is fixed. Build it from `priors` with `Newtrinos.condition(priors, Dict(:name => value, ...), params)`:
-#           every parameter listed there becomes a constant, every other parameter keeps its prior.
-#   null    a NamedTuple with the TESTED parameters (the parameters of X) and their values when X is absent,
-#           e.g. (ε_eμ_abs = 0.0, δ_eμ = 0.0) for "no eμ non-standard interaction".
-#
-# From these two the scripts derive everything else:
-#   * tested parameters       = keys(null); they are the injected/scanned truth values
-#   * null model              = condition(prior, null, params), i.e. the same prior with X switched off
-#                               (used e.g. by the `smseed` stage of `--strategy`)
-#   * scan type               = number of tested parameters: 1 -> 1D grid, 2 -> 2D grid, more -> Sobol sample
-#   * nuisance/other parameters = all remaining FREE parameters of `prior`; they are fitted in every roundtrip
-#                               and are the ones redrawn from their priors by `--fluctuate-nuisances`
-# The order of the names in `null` is the order of the scan axes (for a 2D hypothesis: first name = x axis).
-#
-# Example for a different analysis, the CP phase (one tested parameter, scanned in 1D):
-#     hypotheses = Dict("δCP" => (; prior = priors_with_δCP_free, null = (δCP = 0.0,)))
-#
-# ---------------------------------------------------------------------------------------------------------
-# HOW TO FIX NUISANCE PARAMETERS OR CHANGE THEIR PRIORS
-#
-#   * fix a parameter (it then stays at that value in every fit and truth):
-#         priors = Newtrinos.condition(priors, Dict(:atm_flux_updown_sigma => 0.0), params)
-#   * change a prior (the parameter stays free):
-#         @reset priors.deepcore_lifetime = Uniform(ftype(0), ftype(3.8))
-#   Do this on `priors` BEFORE building the hypotheses: every hypothesis is derived from `priors`.
-# ---------------------------------------------------------------------------------------------------------
+# `setup(; ftype)` returns (; name, experiments, params, priors, hypotheses); hypothesis = (; prior, null): `prior` has the tested
+# parameters free and everything else of no interest fixed (Newtrinos.condition), `null` gives the tested parameters' no-effect values.
+# Setup-file format, how to fix nuisance parameters or change priors: docs/src/README_optimizer_tests.md and the docs page "Optimization tests".
+# Fix or change priors on `priors` BEFORE building the hypotheses: every hypothesis is derived from `priors`.
 
 using Distributions
 using DataStructures
