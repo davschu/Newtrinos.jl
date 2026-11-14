@@ -57,6 +57,57 @@ Rules and remarks:
 * `julia src/analysis/optimizer_tests.jl --list-optimizers` prints the registry with all settings.
 * Own optimizers can be added with `register_optimizer!(name, kind, fn, defaults)` in `optimizer_tests_common.jl`.
 
+## Helper functions
+
+All helpers live in `src/analysis/optimizer_tests_common.jl`, which the scripts `include` (on the workers too). Functions starting with `_` are internal.
+The ones you may call yourself, grouped by purpose:
+
+**Setup and hypotheses**
+
+| function | purpose |
+|---|---|
+| `finalize_setup(S)` | checks the setup returned by `setup()` (fields, every hypothesis, tested parameters free) and returns it |
+| `hypothesis_info(S, name)` | everything derived from a hypothesis: prior, null values, tested parameters, null prior, nuisance parameters |
+
+**Injected truths**
+
+| function | purpose |
+|---|---|
+| `truth_grid(prior, params, tested; n_points)` | truths over the tested parameters: 1D grid, 2D grid or Sobol sample, depending on how many are tested |
+| `controlled_truth(rng, params, prior, tested)` | one random truth: only the tested parameters are drawn from the prior, the rest stays nominal; fixed parameters are forced to their fixed value |
+| `fluctuate_nuisances(rng, truth, prior, names)` | redraws the nuisance parameters of a truth from their priors (`--fluctuate-nuisances`) |
+| `randomize_free_params(rng, params, prior)` | draws all free parameters from the prior and leaves fixed ones alone; also works for parameters fixed by `Newtrinos.condition` |
+
+**Priors and objective**
+
+| function | purpose |
+|---|---|
+| `extract_bounds(prior, params)` | splits a prior into fixed and free parameters and returns the bounds and start vector of the free ones |
+| `flat_prior(prior)` | replaces every free prior by a uniform one over its range (for the `likelihood` objective) |
+| `make_objective(likelihood, prior, params; objective)` | the function to minimize: negative log posterior or log likelihood over the free parameters |
+| `CountingObjective(f, budget)` | wraps an objective, counts evaluations, stops at the budget and records the best value so far (the traces) |
+
+**Optimizers and strategies**
+
+| function | purpose |
+|---|---|
+| `register_optimizer!(name, kind, fn, defaults)` | adds an optimizer to the registry `OPTIMIZERS` |
+| `parse_optimizer_spec("name:key=val")` | splits a stage into name and settings (typed from the defaults) |
+| `parse_strategy_arg("stage stage @N")` | turns one command-line strategy argument into stages and number of attempts |
+| `normalize_strategy(strategy)` | checks a strategy (stage order, known names) and expands aliases such as `smseed` and `mle` |
+| `run_optimizer(spec, likelihood, prior, params; budget, rng)` | runs one registered optimizer (a single stage) |
+| `global_find_mle(...)` / `local_find_mle(...)` | the runners behind global and local stages; `local_find_mle` evaluates the point if no parameter is free |
+| `find_mle_advanced(likelihood, prior, params; strategy, nseeds, ...)` | the main fit: runs a whole strategy (all attempts) and returns the best result with total calls, time and traces |
+
+**Profiles**
+
+| function | purpose |
+|---|---|
+| `profile_advanced(likelihood, priors, vars, params; strategy, ...)` | `Newtrinos.profile` with a strategy at every grid point; returns a `NewtrinosResult` |
+| `_profile_plan`, `_profile_point_fit`, `_profile_result` | its three steps (plan the points, fit one point, assemble the result); `nsi/nsi_scan.jl` calls them directly to run the points with `pmap` |
+
+For which script calls which function, see `docs/src/README_optimizer_tests.md`.
+
 ## Using the engine from Julia
 
 The same engine can be used outside the scripts:
