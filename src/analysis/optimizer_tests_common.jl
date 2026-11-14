@@ -669,6 +669,25 @@ function normalize_strategy(strategy)
     stages
 end
 
+"""
+    parse_strategy_arg(str; nseeds=1) -> (; stages, nseeds, label)
+
+A strategy from one command-line argument: stage specs separated by spaces, optionally followed by `@N` = N independent attempts of
+this strategy (the best is kept), e.g. `"optim-pso:particles=20 lbfgsb @3"`. Without `@N` the given default `nseeds` applies.
+The stages are checked with `normalize_strategy`.
+"""
+function parse_strategy_arg(str; nseeds = 1)
+    toks = split(strip(str))
+    if !isempty(toks) && (m = match(r"^@(\d+)$", toks[end])) !== nothing
+        nseeds = parse(Int, m.captures[1])
+        pop!(toks)
+    end
+    nseeds >= 1 || error("strategy '$str': the number of attempts must be at least 1")
+    stages = String.(toks)
+    normalize_strategy(stages)   # validates names, settings and order
+    (; stages, nseeds, label = join(stages, " ") * (nseeds > 1 ? " @$nseeds" : ""))
+end
+
 """Stage spec of a manual seed for the Julia API: `manual_stage((; a = 1.0, b = 2.0))` = the CLI stage `manual:a=1.0,b=2.0`."""
 manual_stage(params::NamedTuple) = (; name = "manual", label = "manual", settings = params)
 
@@ -728,8 +747,44 @@ function _run_strategy(likelihood, prior, start, stages, strategy_label; rng, ob
         end
     end
     last = records[end]
-    merge(last, (; time = sum(r.time for r in records), seed_params, stages = records, strategy = strategy_label))
+    xs, ys, stg, span = _strategy_trace(records, objective)
+    total_calls = any(r -> r.n_calls === missing, records) ? missing : sum(r.n_calls for r in records)
+    merge(last, (; time = sum(r.time for r in records), seed_params, stages = records, strategy = strategy_label,
+                 trace_x = xs, trace_y = ys, trace_stage = stg, trace_span = span, total_calls))
 end
+
+# Trace of one stage as (evaluations, objective value so far). Global stages record the best objective value per evaluation;
+# local fits record per iteration (in BAT's transformed space), shifted here to end at the stage's final objective value, with the
+# iterations spread evenly over the stage's likelihood calls (over the iteration count if the calls were not counted).
+function _stage_trace(rec, objective)
+    score = objective == "likelihood" ? rec.llh : rec.log_post
+    if rec.trace_evals === missing
+        tr = collect(Float64, rec.trace_best)
+        (isempty(tr) || !isfinite(score)) && return Float64[], Float64[]
+        tr = tr .- tr[end] .- score
+        n = length(tr)
+        calls = rec.n_calls === missing ? n : rec.n_calls
+        return (n == 1 ? [Float64(calls)] : [1 + (calls - 1) * (j - 1) / (n - 1) for j in 1:n]), tr
+    end
+    Float64.(rec.trace_evals), Float64.(rec.trace_best)
+end
+
+_stage_span(rec) = rec.n_calls === missing ? Float64(length(rec.trace_best)) : Float64(rec.n_calls)
+
+# the stages' traces one after the other (each stage's evaluation counter continues where the previous one ended) as the best
+# objective value so far; also returns the total number of evaluations
+function _strategy_trace(records, objective)
+    xs, ys, stg, off = Float64[], Float64[], Int[], 0.0
+    for (k, r) in enumerate(records)
+        x, y = _stage_trace(r, objective)
+        append!(xs, x .+ off)
+        append!(ys, y)
+        append!(stg, fill(k, length(x)))   # which stage of the strategy each trace point belongs to
+        off += _stage_span(r)
+    end
+    xs, _running_best(ys), stg, off
+end
+_running_best(ys) = accumulate(min, replace(ys, NaN => Inf))
 
 """
     find_mle_advanced(likelihood, prior, params; strategy, nseeds=1, starts=nothing, rng, objective="posterior",
@@ -742,7 +797,9 @@ the last stage (the fields of `run_optimizer`) extended by `seed_params` (the po
 
 With `nseeds > 1` the whole strategy is repeated (random stages and global searches draw from `rng` progressively) and the
 best fit by `log_post` is kept (`NaN` counts as -Inf); with `starts` (a vector of start points) there is one attempt per start
-instead. `null_prior` is needed by `smseed`; `budget` is the default number of evaluations of global stages without `evals`;
+instead. The record also has `n_attempts`, `total_time` and `total_calls` (summed over ALL attempts and stages; `missing` if a local stage
+did not count its calls; `time` stays that of the kept attempt) and the combined trace `trace_x` (evaluations) / `trace_y` (best
+objective value so far, `-score`) through all stages and attempts, with `trace_stage` (the stage index of every trace point). `null_prior` is needed by `smseed`; `budget` is the default number of evaluations of global stages without `evals`;
 `local_defaults` overrides the defaults of the local stages' settings (only keys the stage knows), e.g. `(; ad = :forward)`.
 A stage that returns non-finite parameters ends the chain (the record then holds NaN).
 """
@@ -752,15 +809,27 @@ function find_mle_advanced(likelihood, prior, params; strategy, nseeds = 1, star
     strategy_label = join((s isa AbstractString ? s : s.label for s in strategy), " ")
     n_attempts = isnothing(starts) ? nseeds : length(starts)
     best, best_score = nothing, -Inf
+    attempts = NamedTuple[]
     for s in 1:n_attempts
         start = isnothing(starts) ? params : starts[s]
         rec = _run_strategy(likelihood, prior, start, stages, strategy_label; rng, objective, null_prior, budget, local_defaults)
+        push!(attempts, rec)
         score = isnan(rec.log_post) ? -Inf : rec.log_post
         if best === nothing || score > best_score
             best, best_score = rec, score
         end
     end
-    best
+    # the cost of the strategy is that of ALL attempts; the trace runs through the attempts one after the other
+    xs, ys, stg, off = Float64[], Float64[], Int[], 0.0
+    for a in attempts
+        append!(xs, a.trace_x .+ off)
+        append!(ys, a.trace_y)
+        append!(stg, a.trace_stage)
+        off += a.trace_span
+    end
+    merge(best, (; n_attempts, total_time = sum(a.time for a in attempts),
+                 total_calls = any(a -> a.total_calls === missing, attempts) ? missing : sum(a.total_calls for a in attempts),
+                 trace_x = xs, trace_y = _running_best(ys), trace_stage = stg, trace_span = off))
 end
 
 """
@@ -892,4 +961,224 @@ function local_find_mle(likelihood, prior, params; fit_method="optim", algorithm
         result = (NaN, NaN, nan_params, false, missing)
         return return_trace ? (result..., Float64[]) : result
     end
+end
+
+# ---- profile scans with strategies ------------------------------------------------------------------------
+# `profile_advanced` is `Newtrinos.profile` with a strategy (find_mle_advanced) for the fit at every grid point, warm starting
+# and a `NewtrinosResult` that carries the optimizer run data in its `meta`. The pieces (`_profile_plan`, `_profile_point_fit`,
+# `_profile_result`) are also used directly by nsi/nsi_scan.jl (worker-global likelihood inside `pmap`, Sobol points).
+# (Like find_mle_advanced, to be moved into analysis_tools.jl together with the optimizer engine.)
+
+import ProgressMeter
+
+_spec_of(s) = s isa AbstractString ? parse_optimizer_spec(s) : s
+
+"""The stages that run at a warm-started grid point by default: the strategy's local stages (a seed, alias or global first stage
+would ignore the warm start), `lbfgsb` if there are none."""
+function _default_warm_strategy(strategy)
+    strategy = collect(strategy)
+    OPTIMIZERS[_spec_of(strategy[1]).name].kind == :local && return strategy
+    rest = strategy[2:end]
+    isempty(rest) ? ["lbfgsb"] : rest
+end
+
+"""
+    _profile_plan(likelihood, priors, params, scanpoints, mesh_flat, scan_keys; strategy, nseeds=1, seed=1234, objective="posterior",
+                  null_prior=nothing, budget=nothing, local_defaults=(;), starts=[(;)], warm_strategy=nothing) -> NamedTuple
+
+Everything a profile scan needs besides the likelihood: checks the strategy and, for a seed or alias FIRST stage (`random`, `manual`,
+`smseed`, `mle`), computes the seeds ONCE (they do not depend on the grid point; `nseeds` seeds from `Xoshiro(seed)`, `smseed` is
+deterministic so one fit is shared) from the hypothesis prior `priors` and the start `params`. A global first stage is run at
+every grid point instead. `scanpoints` are the per-point priors (scanned parameters fixed), `mesh_flat` the scanned values of every
+point and `scan_keys` their names.
+"""
+function _profile_plan(likelihood, priors, params, scanpoints, mesh_flat, scan_keys; strategy, nseeds = 1, seed = 1234, objective = "posterior",
+                       null_prior = nothing, budget = nothing, local_defaults = (;), starts = [(;)], warm_strategy = nothing)
+    strategy = collect(strategy)
+    normalize_strategy(strategy)   # checks the stage names, settings and order before any expensive work
+    nseeds >= 1 || error("nseeds must be at least 1")
+    objective in ("posterior", "likelihood") || error("objective must be 'posterior' or 'likelihood', got '$objective'")
+    first_spec = _spec_of(strategy[1])
+    hoisted = OPTIMIZERS[first_spec.name].kind in (:seed, :alias)
+    rest_strategy = strategy[2:end]
+    hoisted && isempty(rest_strategy) && error("strategy: '$(first_spec.label)' only creates a seed; add a fitting stage after it, e.g. [\"$(first_spec.label)\", \"lbfgsb\"]")
+    warm = isnothing(warm_strategy) ? _default_warm_strategy(strategy) : collect(warm_strategy)
+    all(s -> OPTIMIZERS[_spec_of(s).name].kind == :local, warm) || error("warm_strategy: every stage must be a local optimizer (a seed or global stage would ignore the warm start)")
+    # every slot is defined (the plan is shipped to distributed workers; undefined slots cannot be serialized)
+    seed_params = Vector{Any}(undef, nseeds)
+    fill!(seed_params, NamedTuple())
+    if hoisted
+        rng = Random.Xoshiro(seed)
+        for s in 1:nseeds
+            seed_params[s] = if first_spec.name == "smseed" && s > 1
+                seed_params[1]
+            else
+                find_mle_advanced(likelihood, priors, params; strategy = [strategy[1]], rng, objective, null_prior, budget, local_defaults).params
+            end
+        end
+    end
+    (; scanpoints, mesh_flat, scan_keys = collect(Symbol.(scan_keys)), params, priors, strategy, rest_strategy, hoisted, seed_params, nseeds, seed,
+       objective, null_prior, budget, local_defaults, starts = collect(starts), warm_strategy = warm, shape = size(scanpoints))
+end
+
+"""
+    _profile_point_fit(likelihood, plan, i; warm=nothing) -> record of find_mle_advanced
+
+The fit at grid point `i`. Without `warm` the whole strategy is run (a hoisted seed, if any, replaces the first stage), the best of
+`nseeds` attempts by `log_post` is kept; each point has its own RNG stream `Xoshiro(plan.seed + i)`, so results do not depend on
+the scheduling order. With `warm` (the fitted parameters of a neighbouring point or an interpolated seed) only
+`plan.warm_strategy` is run, started from `warm` with the scanned parameters set to this point's values.
+"""
+function _profile_point_fit(likelihood, plan, i; warm = nothing)
+    sp = plan.scanpoints[i]
+    fixed = NamedTuple{Tuple(plan.scan_keys)}(Tuple(Float64.(plan.mesh_flat[i])))
+    rng = Random.Xoshiro(plan.seed + i)
+    kw = (; rng, objective = plan.objective, null_prior = plan.null_prior, budget = plan.budget, local_defaults = plan.local_defaults)
+    if warm !== nothing
+        start = _fix_conditioned(merge(warm, fixed), sp)
+        return find_mle_advanced(likelihood, sp, start; strategy = plan.warm_strategy, kw...)
+    end
+    # start-value overrides of multi-start fits (start values of the point's scanned parameters do not matter: dropped)
+    free(st) = NamedTuple(k => v for (k, v) in pairs(st) if !(sp[k] isa ValueShapes.ConstValueDist))
+    overrides = unique(free.(plan.starts))
+    explicit = length(overrides) > 1 || !isempty(first(overrides))
+    if plan.hoisted
+        starts = [merge(plan.seed_params[s], o, fixed) for s in 1:plan.nseeds for o in overrides]
+        find_mle_advanced(likelihood, sp, plan.params; strategy = plan.rest_strategy, starts, kw...)
+    elseif explicit
+        starts = [merge(plan.params, o, fixed) for _ in 1:plan.nseeds for o in overrides]
+        find_mle_advanced(likelihood, sp, plan.params; strategy = plan.strategy, starts, kw...)
+    else
+        find_mle_advanced(likelihood, sp, merge(plan.params, fixed); strategy = plan.strategy, nseeds = plan.nseeds, kw...)
+    end
+end
+
+# the optimizer run data of all points, as arrays shaped like the grid (stored in `meta["optimizer_runs"]`)
+function _optimizer_runs(recs, shape)
+    arr(f) = reshape([f(r) for r in recs], shape)
+    Dict{String, Any}(
+        "converged"    => arr(r -> r.converged),
+        "n_iterations" => arr(r -> r.n_iters),
+        "time"         => arr(r -> r.total_time),     # all stages and attempts
+        "n_calls"      => arr(r -> r.total_calls),
+        "n_attempts"   => arr(r -> r.n_attempts),
+        "strategy"     => arr(r -> r.strategy),
+        "stages"       => arr(r -> [(; label = s.label, llh = s.llh, log_post = s.log_post, converged = s.converged, n_iters = s.n_iters, n_calls = s.n_calls, time = s.time)
+                                    for s in r.stages]),
+        "trace_x"      => arr(r -> r.trace_x),         # objective evaluations, best objective so far (-score), stage index
+        "trace_y"      => arr(r -> r.trace_y),
+        "trace_stage"  => arr(r -> r.trace_stage),
+    )
+end
+
+"""
+    _profile_result(plan, recs, exec_time; axes, meta=Dict()) -> NewtrinosResult
+
+Assemble the records of all grid points (`recs`, in the order of `plan.scanpoints`) like `Newtrinos.profile` does (one array per
+parameter plus `llh` and `log_posterior`) and attach the settings and the optimizer run data (`meta["optimizer_runs"]`).
+"""
+function _profile_result(plan, recs, exec_time; axes, meta = Dict())
+    values = Newtrinos.assemble_profile_results([(r.llh, r.log_post, r.params) for r in recs], plan.shape)
+    m = Dict{String, Any}("task" => "profile", "priors" => plan.priors, "params" => plan.params, "exec_time" => exec_time,
+                          "strategy" => plan.strategy, "nseeds" => plan.nseeds, "objective" => plan.objective, "seed" => plan.seed,
+                          "starts" => plan.starts, "optimizer_runs" => _optimizer_runs(recs, plan.shape))
+    merge!(m, meta)
+    Newtrinos.add_meta!(m)
+    NewtrinosResult(axes = axes, values = values, meta = m)
+end
+
+# start values of every grid point interpolated from earlier profile results (see `make_seed_interpolants`)
+function _warm_params_from_results(vars_to_scan, mesh_flat, params, seed_result, seed_results)
+    n_axes = length(keys(vars_to_scan))
+    coords(i) = Tuple(Float64(mesh_flat[i][d]) for d in 1:n_axes)
+    if !isnothing(seed_result)
+        itps = Newtrinos.make_seed_interpolants(seed_result)
+        ks = collect(keys(itps))
+        @info "Using per-point seeds from smoothed result ($(length(ks)) params interpolated)"
+        return [merge(params, NamedTuple{Tuple(ks)}(Tuple(itps[k](coords(i)...) for k in ks))) for i in eachindex(mesh_flat)]
+    elseif !isnothing(seed_results)
+        itps = Newtrinos.make_merged_seed_interpolants(seed_results, keys(vars_to_scan))
+        ks = collect(keys(itps))
+        @info "Using merged per-point seeds from $(length(seed_results)) files ($(length(ks)) params interpolated)"
+        return [merge(params, NamedTuple{Tuple(ks)}(Tuple(itps[k](coords(i)...) for k in ks))) for i in eachindex(mesh_flat)]
+    end
+    nothing
+end
+
+"""
+    profile_advanced(likelihood, priors, vars_to_scan, params; strategy, null_prior=nothing, nseeds=1, starts=[(;)],
+                     seed_result=nothing, seed_results=nothing, sequential=false, start_from=nothing, warm_strategy=nothing,
+                     map_func=nothing, objective="posterior", seed=1234, budget=nothing, local_defaults=nothing) -> NewtrinosResult
+
+Profile likelihood scan like `Newtrinos.profile` (grid from `vars_to_scan`, all other free parameters optimized at every point), but
+the fit at each point is `find_mle_advanced` with `strategy` (a vector of stage specs, e.g. `["smseed", "lbfgsb"]` or
+`["optim-pso:particles=20,iters=30", "lbfgsb"]`). The returned `NewtrinosResult` has the usual `axes`/`values` and the settings plus
+the optimizer run data of every point in `meta` (`meta["optimizer_runs"]`: converged, iterations, time and calls of all stages and
+attempts, the stage records and the combined trace, as arrays shaped like the grid).
+
+- `strategy`, `nseeds`, `null_prior` (needed by `smseed`), `budget`, `objective`, `seed`: as in `find_mle_advanced` / `_profile_plan`. A seed or alias
+  first stage (`random`, `smseed`, `mle`, ...) is computed once for the whole scan; a global first stage is run at every point.
+- `starts`: start-value overrides, e.g. `[(δCP = π/4,), (δCP = 3π/4,)]`: one attempt per override, the best fit is kept.
+- Warm starting: `sequential=true` fits the points in BFS order from `start_from` (a NamedTuple of axis values; default the central
+  point), each point started from its already fitted neighbour; `seed_result`/`seed_results` (a `NewtrinosResult` or several of earlier
+  profiles) start every point from interpolated best-fit parameters. Warm-started points run only `warm_strategy` (default: the
+  strategy's local stages, since a seed or global stage would ignore the warm start); the root point of a sequential scan without
+  seed results runs the full strategy.
+- `map_func`: custom map for parallelism (e.g. `pmap`); default `Threads.@threads`. `local_defaults` fills settings of the local stages
+  (default `(; ad = :forward)` when threaded). Sequential scans run in this process.
+"""
+function profile_advanced(likelihood, priors, vars_to_scan, params; strategy, null_prior = nothing, nseeds = 1, starts = [(;)],
+                          seed_result = nothing, seed_results = nothing, sequential = false, start_from = nothing, warm_strategy = nothing,
+                          map_func = nothing, objective = "posterior", seed = 1234, budget = nothing, local_defaults = nothing)
+    t1 = time()
+    if all([isa(priors[var], Number) for var in setdiff(keys(priors), keys(vars_to_scan))])
+        return Newtrinos.scan(likelihood, priors, vars_to_scan, params)
+    end
+    axis_values, scanpoints = Newtrinos.generate_scanpoints(vars_to_scan, priors)
+    mesh_flat = vec(Newtrinos._generate_grid(vars_to_scan, priors)[3])   # grid points in the order of `scanpoints`
+    threaded = isnothing(map_func) && Threads.nthreads() > 1
+    ld = isnothing(local_defaults) ? (threaded ? (; ad = :forward) : (;)) : local_defaults
+    plan = _profile_plan(likelihood, priors, params, scanpoints, mesh_flat, collect(keys(vars_to_scan)); strategy, nseeds, seed, objective,
+                         null_prior, budget, local_defaults = ld, starts, warm_strategy)
+    warm_params = _warm_params_from_results(vars_to_scan, mesh_flat, params, seed_result, seed_results)
+    recs = Vector{Any}(undef, length(scanpoints))
+
+    if sequential
+        isnothing(map_func) || @warn "sequential=true ignores map_func; running in this process"
+        grid_shape = size(scanpoints)
+        center = div(prod(grid_shape), 2) + 1
+        if !isnothing(start_from)
+            ks = collect(keys(vars_to_scan))
+            idx = [argmin(abs.(axis_values[findfirst(==(k), ks)] .- Float64(start_from[k]))) for k in ks]
+            center = LinearIndices(grid_shape)[CartesianIndex(Tuple(idx))]
+            @info "Sequential profile: starting from grid indices $idx (nearest to start_from)"
+        else
+            @info "Sequential profile: starting from the central grid point (linear index $center)"
+        end
+        order, parent = Newtrinos._sequential_order(grid_shape, center)
+        prog = ProgressMeter.Progress(length(order))
+        for i in order
+            w = if parent[i] > 0
+                pp = recs[parent[i]].params
+                all(v -> isfinite(Float64(v)), Tuple(pp)) ? pp : nothing   # a failed neighbour is no start
+            else
+                isnothing(warm_params) ? nothing : warm_params[i]
+            end
+            recs[i] = _profile_point_fit(likelihood, plan, i; warm = w)
+            ProgressMeter.next!(prog)
+        end
+    else
+        work(i) = _profile_point_fit(likelihood, plan, i; warm = isnothing(warm_params) ? nothing : warm_params[i])
+        if isnothing(map_func)
+            prog = ProgressMeter.Progress(length(scanpoints))
+            Threads.@threads for i in eachindex(scanpoints)
+                recs[i] = work(i)
+                ProgressMeter.next!(prog)
+            end
+        else
+            recs .= collect(map_func(work, collect(eachindex(scanpoints))))
+        end
+    end
+    meta = Dict{String, Any}("vars_to_scan" => vars_to_scan, "sequential" => sequential, "warm_strategy" => plan.warm_strategy)
+    _profile_result(plan, recs, time() - t1; axes = NamedTuple{Tuple(keys(vars_to_scan))}(axis_values), meta)
 end

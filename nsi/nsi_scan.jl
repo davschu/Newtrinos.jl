@@ -17,6 +17,7 @@ using Random
 using ValueShapes
 import Sobol
 using ProgressMeter
+using Dates
 import Optim
 
 include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
@@ -186,41 +187,11 @@ cp_sm = hyp.null_prior   # the same prior with the tested parameters at their nu
 results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "scan") : args["results-dir"]
 mkpath(results_dir)
 
-#ToDo: implement profile scan
-#ToDo: implement saving of results to file
-
-
-##### strategy and seeds #####
+##### strategy #####
 
 nseeds = args["nseeds"]
-rng = Random.Xoshiro(args["seed"])
 normalize_strategy(strategy)   # checks the stage names/settings/order before any expensive work
-
-# A seed or alias FIRST stage (random, manual, smseed, mle) does not depend on the grid point: it is computed once here
-# (nseeds seeds; smseed is deterministic, so one fit is shared) and every grid point starts its remaining stages from
-# the seed with the scanned parameters overwritten by the point's own values (bat_findmode's ExplicitInit strictly
-# validates the start against the prior's constants). A GLOBAL first stage (optim-pso, mh-de, ...) is run at every
-# grid point instead, anchored at that point's fixed scan values -- a seed computed now would search independently of
-# the point it is used for. With nseeds attempts per point, the best fit (by log_post) is kept.
-first_kind = OPTIMIZERS[parse_optimizer_spec(strategy[1]).name].kind
-hoisted = first_kind in (:seed, :alias)
-rest_strategy = strategy[2:end]
-hoisted && isempty(rest_strategy) && error("--strategy: '$(strategy[1])' only creates a seed; add a fitting stage after it, e.g. --strategy $(strategy[1]) lbfgsb")
-
-# seed_params is also referenced (in a dead branch) inside the pmap closure below, so it must have every slot defined
-# for Distributed's serialization (hashing a Vector{Any} with undefined slots throws UndefRefError) -- hence the fill.
-seed_params = Vector{Any}(undef, nseeds)
-fill!(seed_params, NamedTuple())
-if hoisted
-    for s in 1:nseeds
-        seed_params[s] = if parse_optimizer_spec(strategy[1]).name == "smseed" && s > 1
-            seed_params[1]   # the null-model fit does not depend on s
-        else
-            find_mle_advanced(likelihood, cp_hyp, p; strategy = [strategy[1]], rng, objective, null_prior = cp_sm).params
-        end
-    end
-end
-
+run_date = Dates.format(Dates.today(), "ddmmyyyy")   # execution date, ends every file name
 
 ##### specify gridpoints for scan/profile #####
 
@@ -261,83 +232,60 @@ println("Grid built for hypothesis '$hypothesis_name': $n_grid points, scanning 
 
 ##### run scan/profile #####
 
-if lowercase(args["task"]) == "profile"
-    # Run the strategy at every grid point (find_mle_advanced), keeping the best of `nseeds` attempts by log_posterior.
-    # Uses the optimizer registry (optimizer_tests_common.jl) directly instead of Newtrinos.profile/multistart_profile:
-    # their own nseeds mechanism has no strategy and they are built on find_mle_ext, which never reports an iteration
-    # count. For a global first stage (see above) each point gets its own RNG stream (seed_rng, seeded from args["seed"]
-    # + this point's linear index) rather than reusing the single top-level `rng`: under Threads.@threads, mutating one
-    # shared RNG object from multiple threads concurrently is unsafe, and per-point streams also keep results
-    # reproducible independent of pmap/thread scheduling order.
+# The result is a Newtrinos.NewtrinosResult (like Newtrinos.profile / scan). A grid (1 or 2 tested parameters) has one axis per tested
+# parameter; for more tested parameters (Sobol sample, no common axes) the only axis is the point index and the tested parameters are
+# ordinary entries of `values`.
+sobol = !(length(scan_keys) in (1, 2))
+result_axes = sobol ? (; point = collect(1:n_grid)) : NamedTuple{Tuple(scan_keys)}(init_values)
+result_meta = Dict{String, Any}("hypothesis" => hypothesis_name, "setup" => S.name, "scan_keys" => Tuple(scan_keys), "n_grid" => n_grid,
+                                "mesh_flat" => mesh_flat, "sobol" => sobol)
+sobol || (result_meta["vars_to_scan"] = vars_to_scan)
 
+if lowercase(args["task"]) == "profile"
+    # The strategy is run at every grid point (find_mle_advanced via profile_advanced's pieces in optimizer_tests_common.jl): the best of
+    # `nseeds` attempts by log_posterior is kept. A seed or alias first stage (random, smseed, mle, ...) is computed ONCE here (plan) and
+    # shared by all points; a global first stage runs at every point. Each point has its own RNG stream (seed + point index), so results do
+    # not depend on thread/pmap scheduling. The pieces are used directly instead of profile_advanced so that the likelihood stays a
+    # worker-global inside pmap (a closure in a library function would ship the whole likelihood to every worker).
+    plan = _profile_plan(likelihood, cp_hyp, p, scanpoints, mesh_flat, scan_keys; strategy, nseeds, seed = args["seed"], objective, null_prior = cp_sm)
+    t_start = time()
     if use_distributed
-        opt_results = @showprogress pmap(eachindex(scanpoints)) do i
-            fixed_here = NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i])))
-            seed_rng = Random.Xoshiro(args["seed"] + i)
-            t0 = time()
-            rec = if hoisted
-                find_mle_advanced(likelihood, scanpoints[i], p; strategy = rest_strategy, starts = [merge(seed_params[s], fixed_here) for s in 1:nseeds],
-                                  rng = seed_rng, objective = objective)
-            else
-                find_mle_advanced(likelihood, scanpoints[i], merge(p, fixed_here); strategy = strategy, nseeds = nseeds,
-                                  rng = seed_rng, objective = objective)
-            end
-            best = (rec.llh, rec.log_post, rec.params, rec.converged, rec.n_iters)
-            (best..., time() - t0)
-        end
+        @everywhere plan = $plan
+        recs = @showprogress pmap(i -> _profile_point_fit(likelihood, plan, i), eachindex(scanpoints))
     else
-        opt_results = Vector{Any}(undef, length(scanpoints))
+        recs = Vector{Any}(undef, n_grid)
         @showprogress Threads.@threads for i in eachindex(scanpoints)
-            fixed_here = NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i])))
-            seed_rng = Random.Xoshiro(args["seed"] + i)
-            t0 = time()
-            rec = if hoisted
-                find_mle_advanced(likelihood, scanpoints[i], p; strategy = rest_strategy, starts = [merge(seed_params[s], fixed_here) for s in 1:nseeds],
-                                  rng = seed_rng, objective = objective)
-            else
-                find_mle_advanced(likelihood, scanpoints[i], merge(p, fixed_here); strategy = strategy, nseeds = nseeds,
-                                  rng = seed_rng, objective = objective)
-            end
-            best = (rec.llh, rec.log_post, rec.params, rec.converged, rec.n_iters)
-            opt_results[i] = (best..., time() - t0)
+            recs[i] = _profile_point_fit(likelihood, plan, i)
         end
     end
-
-    result = Dict(
-        "hypothesis"    => hypothesis_name,
-        "scan_keys"     => Tuple(scan_keys),
-        "mesh_flat"     => mesh_flat,
-        "llh"           => [r[1] for r in opt_results],
-        "log_posterior" => [r[2] for r in opt_results],
-        "fit_params"    => [r[3] for r in opt_results],
-        "converged"     => [r[4] for r in opt_results],
-        "n_iterations"  => [r[5] for r in opt_results],
-        "lbfgs_time"    => [r[6] for r in opt_results],
-        "n_grid"        => n_grid,
-        "nseeds"        => nseeds,
-        "strategy"      => strategy,
-        "objective"     => objective,
-        "setup"         => S.name,
-    )
-    FileIO.save(joinpath(results_dir, name * "_profile_$(hypothesis_name)_$(grid_points)points_$(strategy_tag)_nseeds$(nseeds)" * ".jld2"), result) 
+    result = _profile_result(plan, recs, time() - t_start; axes = result_axes, meta = result_meta)
+    FileIO.save(joinpath(results_dir, name * "_profile_$(hypothesis_name)_$(grid_points)points_$(strategy_tag)_nseeds$(nseeds)_$(run_date).jld2"), "result", result)
 
 elseif lowercase(args["task"]) == "scan"
     # No optimization -- straight likelihood evaluation with every non-scanned parameter
     # frozen at its nominal value `p` (matches Newtrinos.scan's own semantics).
-    if length(scan_keys) in (1, 2)
-        r = Newtrinos.scan(likelihood, cp_hyp, vars_to_scan, p)
-        # FileIO/JLD2 cannot save the NewtrinosResult struct directly -> store its fields in a Dict
-        result = Dict("hypothesis"=>hypothesis_name, "scan_keys"=>Tuple(scan_keys), "axes"=>r.axes,
-                      "values"=>r.values, "meta"=>r.meta, "mesh_flat"=>mesh_flat, "n_grid"=>n_grid, "setup"=>S.name)
+    if !sobol
+        result = Newtrinos.scan(likelihood, cp_hyp, vars_to_scan, p)
+        merge!(result.meta, result_meta)
     else
+        t_start = time()
         llhs = Vector{Float64}(undef, n_grid)
         @showprogress Threads.@threads for i in 1:n_grid
             point = merge(p, NamedTuple{Tuple(scan_keys)}(Tuple(Float64.(mesh_flat[i]))))
             llhs[i] = logdensityof(likelihood, point)
         end
-        result = Dict("hypothesis"=>hypothesis_name, "scan_keys"=>Tuple(scan_keys), "mesh_flat"=>mesh_flat, "llh"=>llhs, "n_grid"=>n_grid, "setup"=>S.name)
+        vals = OrderedDict{Symbol, Any}(k => fill(p[k], n_grid) for k in setdiff(keys(p), scan_keys))
+        for (j, k) in enumerate(scan_keys)
+            vals[k] = Float64[Float64(mesh_flat[i][j]) for i in 1:n_grid]
+        end
+        vals[:llh] = llhs
+        vals[:log_posterior] = llhs
+        meta = Dict{String, Any}("task" => "scan", "priors" => cp_hyp, "params" => p, "exec_time" => time() - t_start)
+        merge!(meta, result_meta)
+        Newtrinos.add_meta!(meta)
+        result = NewtrinosResult(axes = result_axes, values = NamedTuple(vals), meta = meta)
     end
-    FileIO.save(joinpath(results_dir, name * "_scan_$(hypothesis_name)_$(grid_points)points" * ".jld2"), result)
+    FileIO.save(joinpath(results_dir, name * "_scan_$(hypothesis_name)_$(grid_points)points_$(run_date)" * ".jld2"), "result", result)
 else
     error("--task must be 'Profile' or 'Scan' (case-insensitive), got '$(args["task"])'")
 end

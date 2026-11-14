@@ -108,6 +108,7 @@ using FileIO
 using CairoMakie
 using Sobol
 using Statistics
+using Dates
 using Distributed
 using SlurmClusterManager
 
@@ -230,8 +231,9 @@ objective_tag = objective == "likelihood" ? "likelihoodfit" : "posteriorfit"
 output_tag = isempty(args["suffix"]) ? "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)" : "$(data_mode_tag)_$(truth_mode_tag)_$(hypothesis_name)_$(objective_tag)_$(args["suffix"])"
 output_tag = nseeds == 1 ? output_tag : output_tag * "_nseeds$(nseeds)"
 output_tag = output_tag * "_" * join((first(split(s, ':')) for s in strategy), "+")   # stage names of the strategy
+output_tag = output_tag * "_" * Dates.format(Dates.today(), "ddmmyyyy")             # execution date ends every file name
 
-Δχ²_label = chi2_mode == "mis-modeling" ? "Δχ² (mis-mod)" : "Δχ² (recovery)"
+Δχ²_label = rich("Δχ", superscript("2"), subscript(chi2_mode == "mis-modeling" ? "mis-mod" : "recovery"))
 
 ### DISTRIBUTED WORKERS (optional) ###
 # Spawn worker processes BEFORE loading any package they'll need, then load those
@@ -698,6 +700,7 @@ n_rows = cld(n_panels, n_cols)
 fig = Figure(size=(n_cols == 1 ? 950 : 600 * n_cols, max(700, 380 * n_rows)))
 
 plt_conv_for_legend = nothing
+fail_drawn = false   # does any panel show a failed fit?
 for (idx, spec) in enumerate(panel_specs)
     local row = (idx - 1) ÷ n_cols + 1
     local col = (idx - 1) % n_cols + 1
@@ -723,7 +726,12 @@ for (idx, spec) in enumerate(panel_specs)
                                   colorrange=colorrange, marker=:xcross, markersize=10, label="not converged")
         any(sel_noflag) && scatter!(ax, truth_vals[sel_noflag], fit_vals[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=:viridis,
                                     colorrange=colorrange, marker=:rect, markersize=8, label="no convergence flag")
-        any(sel_fail) && scatter!(ax, truth_vals[sel_fail], fit_vals[sel_fail]; color=:gray, marker=:xcross, markersize=10, label="fit failed")
+        # failed fits (Δχ² not finite) usually have NaN fit parameters, which cannot be drawn: only those with finite coordinates are shown
+        local failed_here = sel_fail .& isfinite.(truth_vals) .& isfinite.(fit_vals)
+        if any(failed_here)
+            scatter!(ax, truth_vals[failed_here], fit_vals[failed_here]; color=:red, marker=:xcross, markersize=10)
+            global fail_drawn = true
+        end
         ablines!(ax, 0, 1, color=:red, linestyle=:dash)
         Colorbar(fig[row, 2*col + 1], plt_conv, label=Δχ²_label, ticklabelsize=9, labelsize=10)
         if plt_conv_for_legend === nothing
@@ -747,12 +755,16 @@ for (idx, spec) in enumerate(panel_specs)
                                   colorrange=colorrange, marker=:xcross, markersize=14, label="fit (not converged)")
         any(sel_noflag) && scatter!(ax, fit_mags[sel_noflag], fit_phases[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=:viridis,
                                     colorrange=colorrange, marker=:rect, markersize=11, label="fit (no convergence flag)")
-        any(sel_fail) && scatter!(ax, fit_mags[sel_fail], fit_phases[sel_fail]; color=:gray, marker=:xcross, markersize=14, label="fit failed")
+        local failed_plane = sel_fail .& isfinite.(fit_mags) .& isfinite.(fit_phases)
+        if any(failed_plane)
+            scatter!(ax, fit_mags[failed_plane], fit_phases[failed_plane]; color=:red, marker=:xcross, markersize=14)
+            global fail_drawn = true
+        end
         Colorbar(fig[row, 2*col + 1], plt_fit, label=Δχ²_label, ticklabelsize=9, labelsize=10)
 
     elseif spec.kind == :histogram
         local ax_hist = Axis(fig[row, 2*col], xlabel=Δχ²_label, ylabel="count",
-                        title="$(Δχ²_label) distribution (converged or no flag)")
+                        title=rich(Δχ²_label, " distribution (converged or no flag)"))
         local Δχ²_converged = filter(isfinite, Δχ²_all[conv_flags .| noflag_flags])
         if !isempty(Δχ²_converged)
             hist!(ax_hist, Δχ²_converged; bins=20, color=(:steelblue, 0.7), strokewidth=1, strokecolor=:black)
@@ -766,9 +778,13 @@ legend_elems = [
     MarkerElement(color=:steelblue, marker=:circle, markersize=10),
     MarkerElement(color=:steelblue, marker=:xcross, markersize=10),
     MarkerElement(color=:steelblue, marker=:rect, markersize=9),
-    MarkerElement(color=:gray, marker=:xcross, markersize=10),
 ]
-Legend(fig[1:n_rows, 1], legend_elems, ["converged", "not converged", "no convergence flag", "fit failed (no Δχ²)"]; tellwidth=true, tellheight=false)
+legend_labels = ["converged", "not converged", "no convergence flag"]
+if fail_drawn   # the legend entry only appears if a failed fit is actually drawn
+    push!(legend_elems, MarkerElement(color=:red, marker=:xcross, markersize=10))
+    push!(legend_labels, "fit failed (no Δχ²)")
+end
+Legend(fig[1:n_rows, 1], legend_elems, legend_labels; tellwidth=true, tellheight=false)
 
 title_suffix = fluctuate_nuisances_flag ? ", fluctuated nuisances" : ""
 sample_kind = is_many ? "Sobol sample, " : ""

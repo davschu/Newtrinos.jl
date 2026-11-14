@@ -810,20 +810,8 @@ DensityInterface.logdensityof(::BimodalNuisanceDensity, p) =
         end
     end
 
-    @testset "profile_advanced seeding options (nseeds, sequential) and helpers" begin
-        fwd(a, b) = MvNormal([a, b], I(2))
-        likelihood = likelihoodof(splat(fwd), [1.0, 2.0])
-        priors = (a=Uniform(-3.0, 3.0), b=Uniform(-3.0, 3.0))
+    @testset "profile seeding helpers (_sequential_order, randomize_params)" begin
         params = (a=0.0, b=0.0)
-        ref = Newtrinos.profile(likelihood, priors, OrderedDict(:a => 5), params)
-
-        r_seeds = Newtrinos.profile_advanced(likelihood, priors, OrderedDict(:a => 5), params; nseeds=3)
-        @test r_seeds.meta["nseeds"] == 3
-        @test r_seeds.values.llh ≈ ref.values.llh atol=1e-4
-
-        r_seq = Newtrinos.profile_advanced(likelihood, priors, OrderedDict(:a => 5), params; sequential=true, start_from=(a=1.0,))
-        @test r_seq.meta["sequential"]
-        @test r_seq.values.llh ≈ ref.values.llh atol=1e-4
 
         order, parent = Newtrinos._sequential_order((3, 3), 5)
         @test sort(order) == 1:9

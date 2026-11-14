@@ -1,15 +1,17 @@
-# Compares optimizers on the same problems. For each of several injected truth points of one hypothesis of a setup
-# file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl) every optimizer given in --optimizers is run (--nrepeats times,
-# each with its own random seed) with the same objective, bounds and start point and the same evaluation budget, and
+# Compares optimizer STRATEGIES on the same problems. For each of several injected truth points of one hypothesis of a setup
+# file (--setup, e.g. nsi/setups/nsi_deepcore_3y.jl) every strategy given in --strategies (a chain of stages, e.g.
+# "optim-pso lbfgsb @3" = PSO then L-BFGS-B, best of 3 attempts; a single optimizer is a one-stage strategy) is run
+# (--nrepeats times, each with its own random seed) with the same objective, bounds and start point, and
 # compared with
 #   * the log-posterior of the injected truth (a successful optimizer ends at or above it), and
 #   * a truth-seeded reference fit (--reference, by default a long LBFGS fit started at the truth).
 # Timing, number of objective evaluations, per-parameter errors and the convergence trace (best objective value so far
 # against evaluations) are recorded for every run.
 #
-# Optimizers are named entries of the registry in optimizer_tests_common.jl (`OPTIMIZERS`); a spec is "name" or
+# Stages are named entries of the registry in optimizer_tests_common.jl (`OPTIMIZERS`); a spec is "name" or
 # "name:key=val,key=val", e.g.
-#   --optimizers optim-lbfgs "optim-pso:particles=50" mh-de "mh-de:N=30,F=0.5" bbo-xnes
+#   --strategies lbfgsb "optim-pso:particles=50" mh-de "mh-de:N=30,F=0.5 lbfgsb" "smseed lbfgsb" "mle lbfgsb" "mh-de lbfgsb @3"
+# (@N: N attempts, the best is kept; time and calls count ALL attempts; --nseeds sets the default for strategies without @N)
 # (run with --list-optimizers to see the names and their settings). Every run is one task; with --workers N the tasks
 # are distributed over N single-threaded worker processes, so timings are comparable.
 #
@@ -39,6 +41,7 @@ using ArgParse
 using CairoMakie
 using Random
 using Statistics
+using Dates
 import Optim
 import ForwardDiff
 using ProgressMeter
@@ -61,11 +64,17 @@ function parse_command_line()
         help = "Print the registered optimizers with their settings and exit"
         action = :store_true
 
-        "--optimizers"
-        help = "Optimizer specs to compare, space-separated, each \"name\" or \"name:key=val,key=val\" (see --list-optimizers); the same optimizer may appear several times with different settings"
+        "--strategies", "--optimizers"
+        dest_name = "strategies"
+        help = "Strategies to compare, one QUOTED argument each: stage specs separated by spaces, each \"name\" or \"name:key=val,key=val\" (see --list-optimizers; stage rules as in roundtrips.jl --strategy: seed/alias/global stages only first), optionally ending in @N = N independent attempts of that strategy, the best being kept, e.g. --strategies lbfgsb \"mh-de:evals=3000\" \"optim-pso:particles=20 lbfgsb @3\" \"smseed lbfgsb\". A single optimizer is a one-stage strategy. Time and calls are those of ALL attempts and stages"
         arg_type = String
         nargs = '+'
         default = ["optim-lbfgs", "optim-pso:particles=20", "mh-de"]
+
+        "--nseeds"
+        help = "Default number of attempts of a strategy that gives no @N of its own"
+        arg_type = Int
+        default = 1
 
         "--hypothesis"
         help = "Name of the hypothesis (from the setup file) to test; default: the first one of the setup"
@@ -171,12 +180,12 @@ use_distributed = n_workers > 1
 data_mode in ("asimov", "toy") || error("--data-mode must be 'asimov' or 'toy', got '$data_mode'")
 objective in ("posterior", "likelihood") || error("--objective must be 'posterior' or 'likelihood', got '$objective'")
 
-specs    = [parse_optimizer_spec(s) for s in args["optimizers"]]
+specs    = [parse_strategy_arg(s; nseeds = args["nseeds"]) for s in args["strategies"]]   # (; stages, nseeds, label)
 ref_spec = parse_optimizer_spec(args["reference"])
 OPTIMIZERS[ref_spec.name].kind == :local || @warn "the reference is normally a local fit started at the truth; got a global optimizer ($(ref_spec.name))"
 n_specs  = length(specs)
 labels   = [s.label for s in specs]
-length(unique(labels)) == n_specs || error("--optimizers: every spec must be different (got duplicates: $labels)")
+length(unique(labels)) == n_specs || error("--strategies: every strategy must be different (got duplicates: $labels)")
 
 # Distributed workers: single-threaded, so that wall times of different optimizers are comparable
 if use_distributed
@@ -220,9 +229,10 @@ end
 plotted_params = unique([collect(tested_names); collect(vary_truth_params)])   # parameters whose recovery is reported
 results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "optimizer_tests") : args["results-dir"]
 mkpath(results_dir)
+run_date = Dates.format(Dates.today(), "ddmmyyyy")   # execution date, ends every file name
 out_prefix = joinpath(results_dir, "$(name)_$(hyp_name)")
 
-println("setup $(S.name), hypothesis '$hyp_name' (tested: $(join(tested_names, ", "))), $n_truths truths x $n_specs optimizers x $nrepeats repeats, budget $budget evaluations")
+println("setup $(S.name), hypothesis '$hyp_name' (tested: $(join(tested_names, ", "))), $n_truths truths x $n_specs strategies x $nrepeats repeats, default budget $budget evaluations")
 
 ### TRUTH POINTS ###
 
@@ -236,7 +246,7 @@ end
 ### TASKS ###
 
 start = _fix_conditioned(p, prior)   # nominal parameters with the prior's pinned parameters forced to their pinned values
-ctx = (; experiments, prior, prior_dist, start, truths, data_mode, objective, budget, specs, ref_spec, seed = args["seed"])
+ctx = (; experiments, prior, prior_dist, null_prior = hyp.null_prior, start, truths, data_mode, objective, budget, specs, ref_spec, seed = args["seed"])
 use_distributed && @everywhere ctx = $ctx
 
 # One task = one optimizer run on one truth point: t = (; i, s, r) -- truth i, spec s (0: the reference fit), repeat r.
@@ -254,8 +264,22 @@ use_distributed && @everywhere ctx = $ctx
         truth_score = c.objective == "likelihood" ? logdensityof(L, truth) : logdensityof(PosteriorMeasure(L, c.prior_dist), truth)
         return merge(r, (; i = t.i, s = 0, r = t.r, score = score(r), truth_score))
     end
-    r = run_optimizer(c.specs[t.s], L, c.prior, c.start; budget = c.budget, rng = Random.Xoshiro(seed), objective = c.objective)
-    merge(r, (; i = t.i, s = t.s, r = t.r, score = score(r), truth_score = NaN))
+    st = c.specs[t.s]
+    r = find_mle_advanced(L, c.prior, c.start; strategy = st.stages, nseeds = st.nseeds, budget = c.budget, rng = Random.Xoshiro(seed),
+                          objective = c.objective, null_prior = c.null_prior)
+    # time and calls of the record are those of ALL attempts and stages (the summary and the plots use these fields)
+    merge(r, (; time = r.total_time, n_calls = r.total_calls, i = t.i, s = t.s, r = t.r, score = score(r), truth_score = NaN))
+end
+
+# a stage spec with tiny settings (for the warm-up; defined on the workers too)
+@everywhere function tiny_stage(str)
+    sp = parse_optimizer_spec(str)
+    d = OPTIMIZERS[sp.name].defaults
+    st = sp.settings
+    :iterations in keys(d) && (st = merge(st, (; iterations = 2)))
+    :iters in keys(d) && (st = merge(st, (; iters = 1)))
+    :iters in keys(d) || :evals in keys(d) && (st = merge(st, (; evals = 40)))
+    (; sp..., settings = st)
 end
 
 # Warm-up: run every optimizer once, tiny, on every worker (and here) so that compilation does not enter the timings
@@ -263,13 +287,11 @@ end
     c = ctx
     truth = c.truths[1]
     L = Newtrinos.generate_likelihood(c.experiments, Newtrinos.generate_asimov_data(c.experiments, truth))
-    for sp in vcat(c.specs, [c.ref_spec])
-        d = OPTIMIZERS[sp.name].defaults
-        st = sp.settings
-        :iterations in keys(d) && (st = merge(st, (; iterations = 2)))
-        :iters in keys(d) && (st = merge(st, (; iters = 1)))
-        run_optimizer((; sp..., settings = st), L, c.prior, c.start; budget = 40, rng = Random.Xoshiro(1), objective = c.objective)
+    for sp in c.specs
+        find_mle_advanced(L, c.prior, c.start; strategy = [tiny_stage(s) for s in sp.stages], budget = 40, rng = Random.Xoshiro(1),
+                          objective = c.objective, null_prior = c.null_prior)
     end
+    run_optimizer(tiny_stage(c.ref_spec.label), L, c.prior, c.start; budget = 40, rng = Random.Xoshiro(1), objective = c.objective)
     nothing
 end
 
@@ -313,11 +335,12 @@ push!(summary_lines, "$n_truths truths x $nrepeats repeats, budget $budget evalu
                      (isempty(vary_truth_params) ? "" : ", varied truth params: $(join(vary_truth_params, ", "))"))
 push!(summary_lines, "reference: $(ref_spec.label) at the truth; score = " * (objective == "likelihood" ? "llh" : "log_posterior"))
 push!(summary_lines, "excess = reference score - score of the run (0: as good as the reference; > 0: worse; < 0: better); the plots show Δχ²_ref = 2 × excess")
+push!(summary_lines, "calls and time are summed over all stages and attempts (@N) of a strategy; the score is that of the best attempt")
 push!(summary_lines, "below truth = run ended with a score lower than the injected truth's (a failure of the optimizer)")
 push!(summary_lines, "reached = excess <= $tol")
 push!(summary_lines, "param err = |fit - truth| / prior width, median over runs")
 push!(summary_lines, "")
-header = rpad("optimizer", 34) * rpad("runs", 6) * rpad("med excess", 12) * rpad("max excess", 12) * rpad("reached", 9) *
+header = rpad("strategy", 44) * rpad("runs", 6) * rpad("med excess", 12) * rpad("max excess", 12) * rpad("reached", 9) *
          rpad("below truth", 12) * rpad("med calls", 11) * rpad("med time/s", 11) * rpad("failed", 7) * "param err (" * join(plotted_params, ", ") * ")"
 push!(summary_lines, header)
 spec_summaries = Dict{String, Any}()
@@ -331,7 +354,7 @@ for (s, sp) in enumerate(specs)
     spec_summaries[sp.label] = (; n = length(rs), median_excess = med(ex), max_excess = isempty(fin(ex)) ? NaN : maximum(fin(ex)), reached, below_truth = below,
                                 median_calls = med([Float64(coalesce(r.n_calls, NaN)) for r in rs]), median_time = med([r.time for r in rs]), failed = nfail, param_err = perr)
     sm = spec_summaries[sp.label]
-    push!(summary_lines, rpad(sp.label, 34) * rpad(string(sm.n), 6) * rpad(string(round(sm.median_excess, sigdigits = 3)), 12) *
+    push!(summary_lines, rpad(sp.label, 44) * rpad(string(sm.n), 6) * rpad(string(round(sm.median_excess, sigdigits = 3)), 12) *
         rpad(string(round(sm.max_excess, sigdigits = 3)), 12) * rpad("$(reached)/$(sm.n)", 9) * rpad(string(below), 12) *
         rpad(string(round(sm.median_calls, digits = 0)), 11) * rpad(string(round(sm.median_time, digits = 1)), 11) * rpad(string(nfail), 7) *
         join(round.(perr, sigdigits = 2), "  "))
@@ -343,74 +366,123 @@ push!(summary_lines, "reference fits: median time $(round(med([r.time for r in r
 push!(summary_lines, "total wall time: $(round(time() - run_start_time, digits = 1)) s")
 summary_text = join(summary_lines, "\n")
 println(summary_text)
-write(out_prefix * "_summary.txt", summary_text * "\n")
+write(out_prefix * "_summary_$(run_date).txt", summary_text * "\n")
 
 ### PLOTS ###
 
 colors = Makie.to_colormap(:tab10)
 speccolor(s) = colors[mod1(s, length(colors))]
 Δ_label = rich("Δχ", superscript("2"), subscript("ref"))   # Δχ²_ref = 2 (reference score - score of the run)
-ysc = Makie.Symlog10(0.1)   # linear within ±0.1, logarithmic outside: 0 (the reference) and negative values (better than the reference) fit on the axis
+# Symlog scale by hand (linear within ±noise_band, logarithmic outside; 0 -- the reference -- and negative values, i.e. better than the
+# reference, fit on the axis). The data are transformed before plotting and the axes are linear: with Makie's own nonlinear axis scales
+# CairoMakie resamples lines into tiny segments and dashed/dotted line styles come out ragged.
+noise_band = 0.1   # |Δχ²_ref| below this: only optimizer noise is left
+ysym(y) = sign(y) * (abs(y) <= noise_band ? abs(y) / noise_band : 1 + log10(abs(y) / noise_band))
 
-# Trace of a run in Δχ²_ref = 2 × (excess above the reference) against evaluations. Global optimizers: the trace of the best
-# objective value so far per evaluation. Local fits: Optim's per-iteration trace (in BAT's transformed space, shifted to
-# end at the run's final objective value), with the iterations spread evenly over the run's likelihood calls.
+# Trace of a run in Δχ²_ref = 2 × (excess above the reference) against evaluations: the best objective value so far through
+# all stages and attempts of the strategy (`trace_x`/`trace_y` of find_mle_advanced; the evaluation counter continues from stage to
+# stage and from attempt to attempt). Global stages record every evaluation; local fits record per iteration (in BAT's transformed
+# space, shifted to end at the stage's final objective value), spread evenly over the stage's likelihood calls (over its
+# iteration count for `newtrinos`, which does not count calls).
 function trace_xy(r)
     ref_obj = -ref_by_truth[r.i].score
-    if r.trace_evals === missing
-        tr = collect(Float64, r.trace_best)
-        isempty(tr) && return Float64[], Float64[]
-        tr = tr .- tr[end] .- r.score
-        n = length(tr)
-        calls = r.n_calls === missing ? n : r.n_calls
-        x = n == 1 ? [Float64(calls)] : [1 + (calls - 1) * (j - 1) / (n - 1) for j in 1:n]
-        return x, 2 .* (tr .- ref_obj)
+    ok = isfinite.(r.trace_y)
+    r.trace_x[ok], 2 .* (r.trace_y[ok] .- ref_obj), r.trace_stage[ok]
+end
+
+# One line per run of a stage of the strategy (the line style changes with the stage); a segment starts at the last point of the previous
+# run so that the line is continuous.
+const STAGE_STYLES = [:solid, :dashdot, :dot, :dash]
+stagestyle(k) = STAGE_STYLES[mod1(k, length(STAGE_STYLES))]
+function stage_segments(x, y, st)
+    segs = Tuple{Int, Vector{Float64}, Vector{Float64}}[]
+    a = 1
+    for b in 1:length(st)
+        if b == length(st) || st[b + 1] != st[a]   # end of a run of equal stage index (attempts after the first start a new run)
+            idx = (a > 1 ? a - 1 : a):b
+            push!(segs, (st[a], x[idx], y[idx]))
+            a = b + 1
+        end
     end
-    Float64.(r.trace_evals), 2 .* (r.trace_best .- ref_obj)
+    segs
+end
+
+# y ticks of the symlog axis: 0, ±0.1 and the decades above, mirrored below zero when there are negative values
+function symlog_ticks(ymin, ymax)
+    kmax = max(0, ceil(Int, log10(max(ymax, 1.0))))
+    pos = [10.0^k for k in -1:kmax]
+    neg = ymin < -0.1 ? [10.0^k for k in -1:max(0, ceil(Int, log10(-ymin)))] : Float64[]
+    vals = sort(vcat(-neg, 0.0, pos))
+    lab(v) = v == 0 ? rich("0") : rich(v < 0 ? "-10" : "10", superscript(string(round(Int, log10(abs(v))))))
+    (ysym.(vals), [lab(v) for v in vals])
+end
+# x ticks of a log10 axis (the data are transformed with log10 before plotting)
+function log_ticks(xmin, xmax)
+    ks = floor(Int, log10(xmin)):ceil(Int, log10(xmax))
+    (Float64.(ks), [rich("10", superscript(string(k))) for k in ks])
 end
 
 ncols = min(n_truths, 3)
 nrows = cld(n_truths, ncols)
-fig = Figure(size = (550 * ncols, 420 * nrows + 60))
+trace_data = [trace_xy(r) for r in records]   # (x, Δχ²_ref, stage) per record
+all_y = reduce(vcat, (d[2] for d in trace_data); init = Float64[])
+all_x = reduce(vcat, (d[1] for d in trace_data); init = Float64[])
+yticks_sym = symlog_ticks(isempty(all_y) ? 0.0 : minimum(all_y), isempty(all_y) ? 1.0 : maximum(all_y))
+xlo, xhi = isempty(all_x) ? (1.0, 10.0) : (max(minimum(all_x), 1.0), max(maximum(all_x), 10.0))
+xticks_log = log_ticks(xlo, xhi)
+xspan = [log10(xlo), log10(xhi)]
+max_stage = maximum((isempty(d[3]) ? 1 : maximum(d[3]) for d in trace_data); init = 1)
+fig = Figure(size = (550 * ncols, 420 * nrows + 110))
 for i in 1:n_truths
     ax = Axis(fig[(i - 1) ÷ ncols + 1, (i - 1) % ncols + 1], xlabel = "objective evaluations", ylabel = Δ_label, title = "truth $i",
-              xscale = log10, yscale = ysc)
-    for r in records
+              xticks = xticks_log, yticks = yticks_sym)
+    hspan!(ax, -1, 1; color = (:grey, 0.3))                                                                      # |Δχ²| <= noise_band: only optimizer noise left in here
+    for (ri, r) in enumerate(records)
         r.i == i || continue
-        x, y = trace_xy(r)
+        x, y, st = trace_data[ri]
         isempty(x) && continue
-        lines!(ax, x, y; color = speccolor(r.s), label = labels[r.s])
+        for (k, xs, ys) in stage_segments(log10.(x), ysym.(y), st)
+            lines!(ax, xs, ys; color = speccolor(r.s), linestyle = stagestyle(k))
+        end
     end
-    hlines!(ax, [0.0]; color = :black, linestyle = :dash)                                                        # the reference fit
-    hlines!(ax, [2 * (ref_by_truth[i].score - ref_by_truth[i].truth_score)]; color = :gray, linestyle = :dot)   # the injected truth's own value
+    lines!(ax, xspan, [0.0, 0.0]; color = :black, linestyle = :dash)                                             # the reference fit
+    truth_level = ysym(2 * (ref_by_truth[i].score - ref_by_truth[i].truth_score))
+    lines!(ax, xspan, [truth_level, truth_level]; color = :gray, linestyle = :dot)                               # the injected truth's own value
 end
-Legend(fig[nrows + 1, 1:ncols], [LineElement(color = speccolor(s)) for s in 1:n_specs], labels, orientation = :horizontal, tellwidth = false)
-save(out_prefix * "_traces.pdf", fig)
+# legend: only the strategies (colours)
+leg_elems = Any[LineElement(color = speccolor(s)) for s in 1:n_specs]
+Legend(fig[nrows + 1, 1:ncols], leg_elems, String[labels...], orientation = :horizontal, nbanks = cld(n_specs, 4), tellwidth = false)
+save(out_prefix * "_traces_$(run_date).pdf", fig)
 
+excesses = [2 * excess_ref(r) for r in records]   # Δχ²_ref of every run
+ex_fin = filter(isfinite, excesses)
+yticks_sum = symlog_ticks(isempty(ex_fin) ? 0.0 : minimum(ex_fin), isempty(ex_fin) ? 1.0 : maximum(ex_fin))
 fig2 = Figure(size = (1300, 480))
-ax1 = Axis(fig2[1, 1], ylabel = Δ_label, yscale = ysc,
-           xticks = (1:n_specs, labels), xticklabelrotation = π / 6, title = "distance to the reference")
+ax1 = Axis(fig2[1, 1], ylabel = Δ_label, xlabel = "strategy (see legend)", yticks = yticks_sum,
+           xticks = (1:n_specs, string.(1:n_specs)), title = "distance to the reference")
 for (s, sp) in enumerate(specs)
     rs = [r for r in records if r.s == s]
     ex = [2 * excess_ref(r) for r in rs]
     ok = isfinite.(ex)
-    any(ok) && scatter!(ax1, fill(s, count(ok)) .+ 0.12 .* (rand(count(ok)) .- 0.5), ex[ok]; color = speccolor(s))
+    any(ok) && scatter!(ax1, fill(s, count(ok)) .+ 0.12 .* (rand(count(ok)) .- 0.5), ysym.(ex[ok]); color = speccolor(s))
 end
+hspan!(ax1, -1, 1; color = (:grey, 0.3))
 hlines!(ax1, [0.0]; color = :black, linestyle = :dash)   # the reference fit
-hlines!(ax1, [2 * tol]; color = :gray, linestyle = :dot)   # 'reached' threshold
-ax2 = Axis(fig2[1, 2], xlabel = "wall time / s", ylabel = Δ_label, xscale = log10, yscale = ysc, title = "time vs distance")
+hlines!(ax1, [ysym(2 * tol)]; color = :gray, linestyle = :dot)   # 'reached' threshold
+ax2 = Axis(fig2[1, 2], xlabel = "wall time / s", ylabel = Δ_label, yticks = yticks_sum, title = "time vs distance")
 for (s, sp) in enumerate(specs)
     rs = [r for r in records if r.s == s && isfinite(excess_ref(r))]
-    isempty(rs) || scatter!(ax2, [r.time for r in rs], [2 * excess_ref(r) for r in rs]; color = speccolor(s), label = labels[s])
+    isempty(rs) || scatter!(ax2, [r.time for r in rs], [ysym(2 * excess_ref(r)) for r in rs]; color = speccolor(s), label = "$s: $(labels[s])")
 end
+hspan!(ax2, -1, 1; color = (:grey, 0.3))
 hlines!(ax2, [0.0]; color = :black, linestyle = :dash)
 Legend(fig2[1, 3], ax2, framevisible = false)
-save(out_prefix * "_summary.pdf", fig2)
+save(out_prefix * "_summary_$(run_date).pdf", fig2)
 
 ### SAVE RESULTS ###
 
 results_dict = Dict{String, Any}(
-    "settings" => Dict("setup" => S.name, "hypothesis" => hyp_name, "tested" => collect(string.(tested_names)), "optimizers" => labels,
+    "settings" => Dict("setup" => S.name, "hypothesis" => hyp_name, "tested" => collect(string.(tested_names)), "strategies" => labels, "nseeds" => [s.nseeds for s in specs],
                        "reference" => ref_spec.label, "budget" => budget, "n_truths" => n_truths, "nrepeats" => nrepeats,
                        "objective" => objective, "data_mode" => data_mode, "fluctuate_nuisances" => args["fluctuate-nuisances"],
                        "vary_truth_params" => collect(string.(vary_truth_params)), "seed" => args["seed"], "tol" => tol,
@@ -423,5 +495,5 @@ results_dict = Dict{String, Any}(
     "summary"         => spec_summaries,
     "summary_text"    => summary_text,
 )
-FileIO.save(out_prefix * "_results.jld2", results_dict)
+FileIO.save(out_prefix * "_results_$(run_date).jld2", results_dict)
 println("saved results to $results_dir")

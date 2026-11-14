@@ -15,6 +15,7 @@ using Newtrinos
 using Accessors
 using DataStructures
 import Optim
+using FileIO
 
 include(joinpath(@__DIR__, "..", "src", "analysis", "optimizer_tests_common.jl"))
 
@@ -134,6 +135,79 @@ const OPTIMUM_LLH = -0.1
         st = [merge(START, (; a = -0.9)), merge(START, (; a = 0.5))]
         r = find_mle_advanced(ToyLikelihood(), PRIOR, START; strategy = ["lbfgsb"], starts = st, rng = Random.Xoshiro(1))
         @test r.llh ≈ OPTIMUM_LLH atol = 1e-4
+    end
+
+    @testset "strategy arguments, cost and trace" begin
+        a = parse_strategy_arg("optim-pso:particles=10 lbfgsb @3")
+        @test a.stages == ["optim-pso:particles=10", "lbfgsb"] && a.nseeds == 3 && a.label == "optim-pso:particles=10 lbfgsb @3"
+        b = parse_strategy_arg("lbfgsb"; nseeds = 2)
+        @test b.stages == ["lbfgsb"] && b.nseeds == 2 && b.label == "lbfgsb @2"
+        @test parse_strategy_arg("lbfgsb @1").label == "lbfgsb"
+        @test_throws ErrorException parse_strategy_arg("lbfgsb mh-de")        # order is checked
+        @test_throws ErrorException parse_strategy_arg("lbfgsb @0")
+        # cost: summed over all attempts and stages, the trace runs through all of them
+        one = find_mle_advanced(ToyLikelihood(), PRIOR, START; strategy = ["mh-de:N=20,evals=100", "lbfgsb"], nseeds = 1, rng = Random.Xoshiro(1))
+        three = find_mle_advanced(ToyLikelihood(), PRIOR, START; strategy = ["mh-de:N=20,evals=100", "lbfgsb"], nseeds = 3, rng = Random.Xoshiro(1))
+        @test one.n_attempts == 1 && three.n_attempts == 3
+        @test one.total_calls == sum(s.n_calls for s in one.stages) && one.total_calls > 100
+        @test three.total_calls > 2 * one.total_calls && three.total_time >= three.time   # (time() is coarse on Windows: tiny fits can read 0)
+        @test length(three.trace_x) == length(three.trace_y) && issorted(three.trace_x)
+        @test issorted(three.trace_y; rev = true)                             # best objective so far never gets worse
+        @test three.trace_y[end] ≈ -three.log_post atol = 1e-6                # ends at the kept fit's objective value
+        @test three.trace_x[end] <= three.trace_span ≈ three.total_calls
+        # a global-only strategy: the trace is the global search's
+        g = find_mle_advanced(ToyLikelihood(), PRIOR, START; strategy = ["mh-de:N=20,evals=100"], rng = Random.Xoshiro(1))
+        @test g.total_calls == 100 && length(g.trace_x) == 100 && g.trace_x[end] == 100
+        # the stage of every trace point: a chain has both stages, in order; a single stage only stage 1
+        @test length(three.trace_stage) == length(three.trace_x) && issorted(three.trace_stage[1:length(one.trace_stage)])
+        @test Set(three.trace_stage) == Set([1, 2]) && all(==(1), g.trace_stage)
+    end
+
+    @testset "profile_advanced" begin
+        ref_llh(b) = -0.5 * ((b + 0.2) / 0.2)^2 - 0.1       # llh of the toy likelihood with b fixed and a, c at their optimum
+        vars = OrderedDict(:b => 5)
+        r = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["lbfgsb"], seed = 5)
+        @test r isa NewtrinosResult && size(r.values.llh) == (5,)
+        @test r.axes.b == r.values.b
+        @test r.values.llh ≈ ref_llh.(r.axes.b) atol = 1e-3
+        @test r.meta["task"] == "profile" && r.meta["strategy"] == ["lbfgsb"] && r.meta["nseeds"] == 1
+        runs = r.meta["optimizer_runs"]
+        @test size(runs["converged"]) == (5,) && all(==(true), runs["converged"]) && all(>(0), runs["n_calls"])
+        @test length(runs["trace_x"][1]) == length(runs["trace_y"][1]) == length(runs["trace_stage"][1]) > 0
+        @test runs["stages"][1][1].label == "lbfgsb"
+        # a hoisted seed stage is computed once and shared; nseeds attempts per point; a global first stage runs per point
+        rr = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["random", "lbfgsb"], nseeds = 2, seed = 5)
+        @test rr.values.llh ≈ ref_llh.(rr.axes.b) atol = 1e-3
+        @test all(==(2), rr.meta["optimizer_runs"]["n_attempts"])
+        rs = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["smseed", "lbfgsb"], null_prior = NULL_PRIOR, seed = 5)
+        @test rs.values.llh ≈ ref_llh.(rs.axes.b) atol = 1e-3
+        @test_throws ErrorException profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["random"])   # seed only
+        rg = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["mh-de:N=20,evals=300", "lbfgsb"], seed = 5)
+        @test rg.values.llh ≈ ref_llh.(rg.axes.b) atol = 1e-3
+        # same seed: same result (per-point RNG streams, independent of scheduling)
+        again = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["random", "lbfgsb"], nseeds = 2, seed = 5)
+        @test again.values.log_posterior == rr.values.log_posterior
+        # warm starting: sequential (BFS from the nearest grid point) and from an earlier result; warmed points run only local stages
+        rq = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["mh-de:N=20,evals=300", "lbfgsb"], sequential = true, start_from = (b = -0.2,), seed = 5)
+        @test rq.meta["sequential"] && rq.meta["warm_strategy"] == ["lbfgsb"]
+        @test rq.values.llh ≈ ref_llh.(rq.axes.b) atol = 1e-3
+        @test count(s -> length(s) == 2, rq.meta["optimizer_runs"]["stages"]) == 1      # only the root point ran the global stage
+        rw = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["lbfgsb"], seed_result = r, seed = 5)
+        @test rw.values.llh ≈ ref_llh.(rw.axes.b) atol = 1e-3
+        # explicit start overrides
+        ro = profile_advanced(ToyLikelihood(), PRIOR, vars, START; strategy = ["lbfgsb"], starts = [(a = -0.9,), (a = 0.9,)], seed = 5)
+        @test all(==(2), ro.meta["optimizer_runs"]["n_attempts"])
+        @test ro.values.llh ≈ ref_llh.(ro.axes.b) atol = 1e-3
+        # a 2-D grid has grid-shaped arrays
+        r2 = profile_advanced(ToyLikelihood(), PRIOR, OrderedDict(:a => 3, :b => 4), START; strategy = ["lbfgsb"], seed = 5)
+        @test size(r2.values.llh) == (3, 4) && size(r2.meta["optimizer_runs"]["time"]) == (3, 4)
+        # the result can be saved and loaded again
+        mktempdir() do dir
+            f = joinpath(dir, "res.jld2")
+            FileIO.save(f, "result", r)
+            back = FileIO.load(f)["result"]
+            @test back isa NewtrinosResult && back.values.llh == r.values.llh && back.meta["optimizer_runs"]["converged"] == runs["converged"]
+        end
     end
 
     @testset "run_optimizer and registry" begin
