@@ -52,7 +52,7 @@ Memory: each worker needs about 2 GB for a DeepCore-sized likelihood; do not sta
 * `<name>_<hypothesis>_traces_<date>.pdf`: one panel per truth. y: `Δχ²_ref = 2 × excess` of the best objective value so far (symmetric log axis: linear
   inside ±0.1, where only optimizer noise is left, shown as the grey band); x: objective evaluations (log). Colour = strategy, **one line per attempt** (for `@N`
   every attempt starts again from its own beginning), line style = stage of the strategy. Dashed black line: the reference; dotted grey line: the truth's own value.
-* `<name>_<hypothesis>_summary_<date>.pdf`: distance to the reference per strategy (numbered as in the legend) and wall time vs distance.
+* `<name>_<hypothesis>_summary_<date>.pdf`: distance to the reference per strategy (numbered as in the legend) and wall time vs distance (only written when more than one strategy is compared).
 * `<name>_<hypothesis>_results_<date>.jld2`: everything, for further analysis:
 
 ```julia

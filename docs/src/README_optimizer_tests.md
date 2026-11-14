@@ -82,7 +82,7 @@ Output (every file name ends with the run date `DDMMYYYY`):
 | `<name>_<hypothesis>_summary_<date>.txt` | table per strategy: runs, median/max excess, reached, below truth, median calls and time, failures, parameter error |
 | `<name>_<hypothesis>_results_<date>.jld2` | `records` (every run), `truths`, `reference_fits`, `excess_ref`, `excess_truth`, `settings`, `summary` |
 | `<name>_<hypothesis>_traces_<date>.pdf` | `Δχ²_ref` of the best objective so far vs objective evaluations, one panel per truth; colour = strategy, one line per attempt, line style = stage; grey band = optimizer noise (`|Δχ²| ≤ 0.1`) |
-| `<name>_<hypothesis>_summary_<date>.pdf` | distance to the reference per strategy, and wall time vs distance |
+| `<name>_<hypothesis>_summary_<date>.pdf` | distance to the reference per strategy, and wall time vs distance (only written when more than one strategy is compared) |
 
 `excess` = reference score − score of the run (0: as good as the reference; > 0 worse). The plots show `Δχ²_ref = 2 × excess` on a
 symmetric log axis (linear inside ±0.1).

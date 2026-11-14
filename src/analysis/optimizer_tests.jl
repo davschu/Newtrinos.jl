@@ -439,30 +439,33 @@ leg_cols = clamp(floor(Int, 550 * ncols / (6.5 * maximum(length, labels; init = 
 Legend(fig[nrows + 1, 1:ncols], leg_elems, String[labels...], orientation = :horizontal, nbanks = cld(n_specs, leg_cols), tellwidth = false)
 save(out_prefix * "_traces_$(run_date).pdf", fig)
 
-excesses = [2 * excess_ref(r) for r in records]   # Δχ²_ref of every run
-ex_fin = filter(isfinite, excesses)
-yticks_sum = symlog_ticks(isempty(ex_fin) ? 0.0 : minimum(ex_fin), isempty(ex_fin) ? 1.0 : maximum(ex_fin))
-fig2 = Figure(size = (1300, 480))
-ax1 = Axis(fig2[1, 1], ylabel = Δ_label, xlabel = "strategy (see legend)", yticks = yticks_sum,
-           xticks = (1:n_specs, string.(1:n_specs)), title = "distance to the reference")
-for (s, sp) in enumerate(specs)
-    rs = [r for r in records if r.s == s]
-    ex = [2 * excess_ref(r) for r in rs]
-    ok = isfinite.(ex)
-    any(ok) && scatter!(ax1, fill(s, count(ok)) .+ 0.12 .* (rand(count(ok)) .- 0.5), ysym.(ex[ok]); color = speccolor(s))
+# the summary plot compares strategies: with a single strategy there is nothing to compare
+if n_specs > 1
+    excesses = [2 * excess_ref(r) for r in records]   # Δχ²_ref of every run
+    ex_fin = filter(isfinite, excesses)
+    yticks_sum = symlog_ticks(isempty(ex_fin) ? 0.0 : minimum(ex_fin), isempty(ex_fin) ? 1.0 : maximum(ex_fin))
+    fig2 = Figure(size = (1300, 480))
+    ax1 = Axis(fig2[1, 1], ylabel = Δ_label, xlabel = "strategy (see legend)", yticks = yticks_sum,
+               xticks = (1:n_specs, string.(1:n_specs)), title = "distance to the reference")
+    for (s, sp) in enumerate(specs)
+        rs = [r for r in records if r.s == s]
+        ex = [2 * excess_ref(r) for r in rs]
+        ok = isfinite.(ex)
+        any(ok) && scatter!(ax1, fill(s, count(ok)) .+ 0.12 .* (rand(count(ok)) .- 0.5), ysym.(ex[ok]); color = speccolor(s))
+    end
+    hspan!(ax1, -1, 1; color = (:grey, 0.3))
+    hlines!(ax1, [0.0]; color = :black, linestyle = :dash)   # the reference fit
+    hlines!(ax1, [ysym(2 * tol)]; color = :gray, linestyle = :dot)   # 'reached' threshold
+    ax2 = Axis(fig2[1, 2], xlabel = "wall time / s", ylabel = Δ_label, yticks = yticks_sum, title = "time vs distance")
+    for (s, sp) in enumerate(specs)
+        rs = [r for r in records if r.s == s && isfinite(excess_ref(r))]
+        isempty(rs) || scatter!(ax2, [r.time for r in rs], [ysym(2 * excess_ref(r)) for r in rs]; color = speccolor(s), label = "$s: $(labels[s])")
+    end
+    hspan!(ax2, -1, 1; color = (:grey, 0.3))
+    hlines!(ax2, [0.0]; color = :black, linestyle = :dash)
+    Legend(fig2[1, 3], ax2, framevisible = false)
+    save(out_prefix * "_summary_$(run_date).pdf", fig2)
 end
-hspan!(ax1, -1, 1; color = (:grey, 0.3))
-hlines!(ax1, [0.0]; color = :black, linestyle = :dash)   # the reference fit
-hlines!(ax1, [ysym(2 * tol)]; color = :gray, linestyle = :dot)   # 'reached' threshold
-ax2 = Axis(fig2[1, 2], xlabel = "wall time / s", ylabel = Δ_label, yticks = yticks_sum, title = "time vs distance")
-for (s, sp) in enumerate(specs)
-    rs = [r for r in records if r.s == s && isfinite(excess_ref(r))]
-    isempty(rs) || scatter!(ax2, [r.time for r in rs], [ysym(2 * excess_ref(r)) for r in rs]; color = speccolor(s), label = "$s: $(labels[s])")
-end
-hspan!(ax2, -1, 1; color = (:grey, 0.3))
-hlines!(ax2, [0.0]; color = :black, linestyle = :dash)
-Legend(fig2[1, 3], ax2, framevisible = false)
-save(out_prefix * "_summary_$(run_date).pdf", fig2)
 
 ### SAVE RESULTS ###
 

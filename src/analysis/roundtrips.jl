@@ -547,7 +547,7 @@ for (idx, spec) in enumerate(panel_specs)
         local fit_mags     = [r.fit_param[mag_key] for r in results]
         local fit_phases   = [r.fit_param[phase_key] for r in results]
 
-        scatter!(ax, truth_mags, truth_phases; color=:steelblue, marker=:circle, markersize=10, label="truth")
+        scatter!(ax, truth_mags, truth_phases; color=:grey60, marker=:circle, markersize=10, label="truth")
         local plt_fit = scatter!(ax, fit_mags[sel_conv], fit_phases[sel_conv];
                             color=Δχ²_all[sel_conv], colormap=:viridis, colorrange=colorrange,
                             marker=:diamond, markersize=12, label="fit (converged)")
@@ -564,8 +564,8 @@ for (idx, spec) in enumerate(panel_specs)
 
     elseif spec.kind == :histogram
         local ax_hist = Axis(fig[row, 2*col], xlabel=Δχ²_label, ylabel="count",
-                        title=rich(Δχ²_label, " distribution (converged or no flag)"))
-        local Δχ²_converged = filter(isfinite, Δχ²_all[conv_flags .| noflag_flags])
+                        title=rich(Δχ²_label, " distribution (all fits with a finite value)"))
+        local Δχ²_converged = filter(isfinite, Δχ²_all)   # converged, not converged and no-flag fits; only failed fits are left out
         if !isempty(Δχ²_converged)
             hist!(ax_hist, Δχ²_converged; bins=20, color=(:steelblue, 0.7), strokewidth=1, strokecolor=:black)
             vlines!(ax_hist, [mean(Δχ²_converged)]; color=:red, linestyle=:dash, label="mean")
