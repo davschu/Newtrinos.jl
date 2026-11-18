@@ -1,7 +1,6 @@
 ### ANALYSIS SETUP FILE FOR NSI ANALYSIS OF THE DEEPCORE 8-YEAR DATA SET ###
 
 using Distributions
-using Distributions
 using DataStructures
 using Accessors
 using Newtrinos
@@ -13,11 +12,12 @@ function setup(; ftype = Float64)
     osc = Newtrinos.osc.configure(
         Newtrinos.osc.OscillationConfig(
             flavour     = Newtrinos.osc.ThreeFlavour(),
-            interaction = Newtrinos.osc.NSI_Standard()
+            interaction = Newtrinos.osc.NSI_Standard(), 
+            eigen_method = Newtrinos.BargerEigen() # 3x faster than the default method
         )
     )
     atm_flux     = Newtrinos.atm_flux.configure()
-    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM12())
+    earth_layers = Newtrinos.earth_layers.configure(Newtrinos.earth_layers.PREM_discontinuities())
     xsec         = Newtrinos.xsec.configure()
     physics      = (; osc, atm_flux, earth_layers, xsec)
     experiments  = (; deepcore = Newtrinos.deepcore_8y.configure(physics))
@@ -26,10 +26,13 @@ function setup(; ftype = Float64)
     priors = Newtrinos.get_priors(experiments)
 
     # CP-conserving approximation, fix standard oscillation params that are not relevant to the NSI analysis 
-    conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5))
+    # fix δCP, θ₁₂, θ₁₃, Δm²₂₁ since we are not sensitive to them with DeepCore
+    # fix atm_flux_updown_sigma since it is relevant for enegies below 1 GeV, which is below the DeepCore energy threshold
+    # MAYBE also fix atm_flux_nuenuebar_sigma and atm_flux_nuenumu_sigma since they dont really affect the result at the used high energies 
+    conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5), :atm_flux_updown_sigma=>ftype(0.0))
     priors = Newtrinos.condition(priors, conditional_vars, p)
 
-    # fix priors of NSI and theta_23
+    # fix priors of NSI and theta_23 as in icecube paper for 3 year data set 
     @reset priors.θ₂₃   = Uniform(ftype(30*π/180), ftype(60*π/180))
     @reset priors.Δ_eμ     = Uniform(-ftype(5),   ftype(5))
     @reset priors.Δ_τμ     = Uniform(-ftype(0.1), ftype(0.1))
