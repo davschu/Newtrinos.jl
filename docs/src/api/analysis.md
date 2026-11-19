@@ -92,6 +92,8 @@ Newtrinos.find_mle_cached
 Newtrinos.profile
 Newtrinos.scan
 Newtrinos.bestfit
+Newtrinos.correlation
+Newtrinos.gof_pvalue
 Newtrinos.generate_scanpoints
 Newtrinos.assemble_profile_results
 ```

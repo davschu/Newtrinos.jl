@@ -116,6 +116,44 @@ Output: `grid_roundtrip_<asimov|toydata>_<fluctuated|nominal>_<hypothesis>_<post
 the `Δχ²_*` arrays, timings and the `settings`. A failed fit has `NaN` parameters (they are not drawn); how many fits failed can be read
 from the results file only. Failed fits that are drawn would be red crosses.
 
+## sensitivity.jl
+
+Sensitivity studies on one hypothesis of a setup file. The truth is the setup's parameters (pinned parameters of the hypothesis forced);
+the parameters studied are the free parameters of the hypothesis prior, the tested parameters are the parameters of interest. `--method`:
+
+* `fisher` (no fits): the Hessian of the log posterior at the truth. `--information expected` (default) uses the Fisher information of the
+  Poisson model, the Hessian of `Σ μ₀ log μ(q) − μ(q)` with the expected counts μ₀ at the truth fixed (`J' diag(1/μ) J`, no data, no rounding,
+  positive semi-definite); `--information observed` the Hessian of the log likelihood of the rounded Asimov counts, which can be indefinite
+  where the data are insensitive (such truths get no result). From it: the expected
+  uncertainty of every parameter with all others free (`sigma_marg`) and fixed (`sigma_cond`) against its prior width (which parameters the
+  data constrain), the impact of every nuisance on the tested parameters (first-order shift for a +1σ move, and `sigma` with that nuisance
+  fixed), and the **a priori correlation matrix** (`Newtrinos.correlation` at the truth). `--truth grid --n-truths N` repeats it at `truth_grid` points over the tested
+  parameters, including the prior bounds (global sensitivity); with `--drop-boundaries` the grid is cell-centred (`lo + (i-1/2)/n * width`),
+  so no truth lies on a bound or at a zero-effect point such as a phase with zero magnitude. A Gaussian approximation:
+  use `scan` where the likelihood is strongly non-quadratic or multimodal (δCP, θ₂₃ octant). If the matrix is singular at the nominal
+  truth (e.g. a phase whose magnitude is zero), use `--truth grid`.
+* `scan`: one-at-a-time scans of every free scalar parameter (or `--params`) over its **full prior range** (`--n-points` points plus the truth itself) on Asimov data:
+  with all other parameters fixed (likelihood evaluations only) and, unless `--no-profile`, with all other free parameters re-fitted
+  (`--strategy`) at every point. `Δχ² = 2 (llh(truth) − llh(point))`; the summary lists the Δχ² at the worst grid point, the 1σ interval
+  (Δχ² = 1) and, for the profiled scans, the largest shift of the tested parameters (the impact of a nuisance on the result).
+* `toys`: `--n-toys` toy data sets injected at the **null** of the hypothesis; per toy a null fit and then a full fit started from the null fit (so q ≥ 0 up to the optimizer tolerance; use local strategies, a seed or global first stage would ignore the start); the distribution of
+  `q = 2 (log_post_full − log_post_null)` (without the tested parameters' own prior density, which differs between the two fits, e.g. −ln(width) of a Uniform) is compared with `Chisq(number of tested parameters)` (Wilks check, quantile table and histogram).
+
+Options: `--setup` (required), `--hypothesis`, `--method`, `--params`, `--n-points`, `--no-profile`, `--strategy` (default `lbfgsb`; ONE strategy, its stages as separate arguments or in one quoted string, e.g. `"mle optim-lbfgs:iterations=2000"`;
+unlike `roundtrips.jl` several arguments are not several strategies; a last token `@N`, `scan` only, runs N independent attempts per fit and keeps the best),
+`--n-truths`, `--truth`, `--information`, `--drop-boundaries`, `--one-plot`, `--n-toys`, `--seed`, `--name`, `--results-dir` (default `results/<setup name>/sensitivity`), `--workers`.
+Output: `<name>_<hypothesis>_<method>_{summary,results}_<date>.{txt,jld2}` plus the plots (for `fisher`, all truths in one figure each:
+`_sigma_cond` and `_sigma_marg` with σ (log axis) above σ / prior width; the nuisances as the mean over the truths with min-max whiskers,
+the tested parameters as dodged bars per truth (one colour per truth; for more than 2 tested parameters also mean and whiskers), and
+`_correlation_mean`, the elementwise mean of the correlation matrices over the truths, and `_impact`, one tornado plot per tested
+parameter: the shift of its best fit for a +1σ move of each nuisance in units of its own σ_marg (equal to the correlation of the nuisance
+with the tested parameter), nuisances sorted by their largest |impact|, dodged per truth like the tested σ bars. With `--one-plot` all of
+these are drawn into one figure, `_overview`, instead. Truths without a result are left out; one figure for `scan` and `toys`).
+The `.jld2` is saved after the plots, from the same data.
+
+The functions behind it work on any result: `Newtrinos.correlation(result, likelihood)` (correlation at a profile's best fit) and
+`Newtrinos.gof_pvalue(result, experiments)` (Poisson goodness of fit per experiment) are documented in the API page "Analysis API".
+
 ## Who calls what
 
 ```

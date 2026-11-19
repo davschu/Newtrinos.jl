@@ -244,7 +244,7 @@ end
 
 
 """
-    truth_grid(prior, nominal_params, tested_names; n_points=25)
+    truth_grid(prior, nominal_params, tested_names; n_points=25, interior=false)
 
 Generate a grid of `n_points` Asimov-truth NamedTuples scanning the free tested parameters of
 a hypothesis (`tested_names`, e.g. `keys(null)` of a setup's hypothesis). All other parameters
@@ -266,22 +266,24 @@ Returns `(truths, scan_keys, grid_coords)`: `truths` is the vector of truth Name
 `Vector{Vector{Float64}}` -- one vector per sample, ordered to match `scan_keys` -- for
 the >2D Sobol case).
 """
-function truth_grid(prior, nominal_params, tested_names; n_points=25)
+function truth_grid(prior, nominal_params, tested_names; n_points=25, interior=false)
     free = [k for k in tested_names if !_is_fixed(prior[k])]
+    # interior = true: cell-centred values lo + (i - 1/2)/n * (hi - lo), none on a prior bound (the Sobol sequence is interior anyway)
+    axis(d, n) = interior ? [Float64(minimum(d)) + (i - 0.5) / n * Float64(maximum(d) - minimum(d)) for i in 1:n] :
+                            collect(range(Float64(minimum(d)), Float64(maximum(d)), length=n))
 
     if length(free) == 1
         k = free[1]
         d = prior[k]
-        lo, hi = Float64(minimum(d)), Float64(maximum(d))
-        grid_coords = collect(range(lo, hi, length=n_points))
+        grid_coords = axis(d, n_points)
         truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(k,)}((v,))), prior) for v in grid_coords]
         return truths, (k,), grid_coords
     elseif length(free) == 2
         key1, key2 = free[1], free[2]
         d1, d2 = prior[key1], prior[key2]
         n_per_dim = Int(round(sqrt(n_points)))
-        vals1 = collect(range(Float64(minimum(d1)), Float64(maximum(d1)), length=n_per_dim))
-        vals2 = collect(range(Float64(minimum(d2)), Float64(maximum(d2)), length=n_per_dim))
+        vals1 = axis(d1, n_per_dim)
+        vals2 = axis(d2, n_per_dim)
         grid_coords = [(a, b) for a in vals1 for b in vals2]
         truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(key1,key2)}((a,b))), prior)
                   for (a,b) in grid_coords]

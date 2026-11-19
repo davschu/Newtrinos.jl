@@ -35,6 +35,13 @@ DensityInterface.DensityKind(::BimodalNuisanceDensity) = IsDensity()
 DensityInterface.logdensityof(::BimodalNuisanceDensity, p) =
     -0.5*(p.a - 1.0)^2 + log(0.6*exp(-0.5*(p.b-2.0)^2) + 0.4*exp(-0.5*(p.b+2.0)^2))
 
+# Gaussian log-density with precision matrix P over the parameters (a, b, c[1], c[2]), used to test `correlation`
+struct QuadDensity{M}
+    P::M
+end
+DensityInterface.DensityKind(::QuadDensity) = IsDensity()
+DensityInterface.logdensityof(d::QuadDensity, p) = (x = [p.a, p.b, p.c...]; -0.5 * x' * d.P * x)
+
 @testset "Analysis Tools" begin
 
     @testset "NewtrinosResult" begin
@@ -850,6 +857,100 @@ DensityInterface.logdensityof(::BimodalNuisanceDensity, p) =
         @test isfinite(log_posterior)
         @test abs(result.a) < 0.1
         @test abs(result.b) < 0.1
+    end
+
+    @testset "correlation" begin
+        # Gaussian log-density with precision matrix P over (a, b, c1, c2): the Hessian is -P, so cov = inv(P)
+        P = [2.0 0.8 0.0 0.0; 0.8 1.0 0.3 0.0; 0.0 0.3 1.5 -0.4; 0.0 0.0 -0.4 1.0]
+        L = QuadDensity(P)
+        prior = (a = Uniform(-5.0, 5.0), b = Uniform(-5.0, 5.0), c = MvNormal(zeros(2), 1e6 * I(2)), fixed = 1.0)
+        params = (a = 0.0, b = 0.0, c = [0.0, 0.0], fixed = 1.0)
+
+        # MvNormal prior of c is so wide (variance 1e6) that its curvature is negligible against P
+        c = Newtrinos.correlation(L, prior, params)
+        @test c.names == [:a, :b, Symbol("c[1]"), Symbol("c[2]")]
+        @test isempty(c.dropped)
+        @test c.offset < 1e-6
+        cov_expected = inv(P)
+        corr_expected = cov_expected ./ sqrt.(diag(cov_expected) * diag(cov_expected)')
+        @test c.corr ≈ corr_expected atol = 1e-4
+        @test c.corr[1, 2] < 0   # positive off-diagonal precision = negative correlation (the sign a naive inv(H) of log L would get wrong)
+
+        # a parameter on a prior bound is dropped
+        c2 = Newtrinos.correlation(L, merge(prior, (a = Uniform(0.0, 5.0),)), params)
+        @test c2.dropped == [:a]
+        @test c2.names == [:b, Symbol("c[1]"), Symbol("c[2]")]
+        @test size(c2.corr) == (3, 3)
+
+        # from a result: best-fit point = grid point with the largest log posterior
+        res = Newtrinos.NewtrinosResult(axes = (a = [0.0, 1.0],),
+            values = (b = [0.0, 0.5], c = [[0.0, 0.0], [0.1, 0.1]], fixed = [1.0, 1.0], llh = [0.0, -1.0], log_posterior = [0.0, -1.0]),
+            meta = Dict("priors" => prior))
+        c3 = Newtrinos.correlation(res, L)
+        @test sort(c3.names) == sort(c.names)   # the scanned parameter comes last in `bestfit(result)`
+        perm = [findfirst(==(n), c3.names) for n in c.names]
+        @test c3.corr[perm, perm] ≈ c.corr atol = 1e-10
+    end
+
+    @testset "gof_pvalue" begin
+        mock_pois(obs) = MockExperiment(
+            MockPhysics((mu = 2.0,), (mu = Uniform(0.0, 10.0),)),
+            (scale = 1.0,),
+            (scale = 1.0,),
+            (observed = obs,),
+            p -> distprod(Poisson.([p.mu * 5, p.mu * 10] .* p.scale)),
+            (p, data = nothing) -> nothing
+        )
+        res = Newtrinos.NewtrinosResult(axes = (mu = [2.0],), values = (scale = [1.0], llh = [0.0], log_posterior = [0.0]),
+                                        meta = Dict("priors" => (mu = Uniform(0.0, 10.0), scale = 1.0)))
+        # data equal to the prediction: deviance 0, p-value 1; ndof = 2 bins - 1 free parameter (mu; scale is fixed)
+        g0 = Newtrinos.gof_pvalue(res, mock_pois([10, 20]))
+        @test g0.deviance ≈ 0 atol = 1e-10
+        @test g0.ndof == 1
+        @test g0.pvalue ≈ 1
+        # counts [12, 18] against [10, 20]: deviance = 2 * sum(n log(n/λ) - (n - λ))
+        g1 = Newtrinos.gof_pvalue(res, mock_pois([12, 18]))
+        @test g1.deviance ≈ 2 * (12 * log(1.2) - 2 + 18 * log(0.9) + 2)
+        @test g1.pvalue ≈ ccdf(Chisq(1), g1.deviance)
+        # a NamedTuple of experiments gives one entry each
+        g = Newtrinos.gof_pvalue(res, (x = mock_pois([10, 20]), y = mock_pois([12, 18])))
+        @test g.y.deviance ≈ g1.deviance
+        # non-Poisson models are rejected
+        gauss = MockExperiment(MockPhysics((mu = 2.0,), (mu = Uniform(0.0, 10.0),)), (;), (;), (observed = [1.0, 2.0],),
+                               p -> MvNormal([p.mu, p.mu], I(2)), (p, data = nothing) -> nothing)
+        @test_throws ErrorException Newtrinos.gof_pvalue(res, gauss)
+    end
+
+    @testset "correlation, expected information" begin
+        # counts [5 mu, 10 mu] * scale: Fisher information of mu = sum (dλ/dmu)^2 / λ = 25/10 + 100/20 = 7.5
+        mock_pois = MockExperiment(
+            MockPhysics((mu = 2.0,), (mu = Uniform(0.0, 10.0),)),
+            (scale = 1.0,),
+            (scale = 1.0,),
+            (observed = [10, 20],),
+            p -> distprod(Poisson.([p.mu * 5, p.mu * 10] .* p.scale)),
+            (p, data = nothing) -> nothing
+        )
+        params = (mu = 2.0, scale = 1.0)
+        c = Newtrinos.correlation((x = mock_pois,), (mu = Uniform(0.0, 10.0), scale = 1.0), params)
+        @test c.names == [:mu]
+        @test c.cov[1, 1] ≈ 1 / 7.5
+        @test c.offset < 1e-8   # flat prior: the Asimov truth is exactly stationary
+        # a Gaussian prior adds its precision: 7.5 + 1 / 0.5^2; at its mode the point stays stationary
+        c2 = Newtrinos.correlation((x = mock_pois,), (mu = Normal(2.0, 0.5), scale = 1.0), params)
+        @test c2.cov[1, 1] ≈ 1 / 11.5
+        @test c2.offset < 1e-8
+        # two experiments add their information
+        c3 = Newtrinos.correlation((x = mock_pois, y = mock_pois), (mu = Uniform(0.0, 10.0), scale = 1.0), params)
+        @test c3.cov[1, 1] ≈ 1 / 15
+        # agrees with the observed information of exactly Asimov (integer) counts
+        L = Newtrinos.generate_likelihood((x = mock_pois,), (x = [10, 20],))
+        co = Newtrinos.correlation(L, (mu = Uniform(0.0, 10.0), scale = 1.0), params)
+        @test co.cov[1, 1] ≈ c.cov[1, 1]
+        # non-Poisson models are rejected
+        gauss = MockExperiment(MockPhysics((mu = 2.0,), (mu = Uniform(0.0, 10.0),)), (;), (;), (observed = [1.0, 2.0],),
+                               p -> MvNormal([p.mu, p.mu], I(2)), (p, data = nothing) -> nothing)
+        @test_throws ErrorException Newtrinos.correlation((x = gauss,), (mu = Uniform(0.0, 10.0),), (mu = 2.0,))
     end
 
 end

@@ -36,7 +36,7 @@ function parse_command_line()
         default = joinpath(@__DIR__, "setups", "nsi_deepcore_3y.jl")
 
         "--results-dir"
-        help = "Output folder for the saved results (default: results/<setup name>/scan, relative to the working directory)"
+        help = "Output folder for the saved results (default: nsi/results/<setup name>/scan, relative to the working directory)"
         arg_type = String
         default = ""
 
@@ -181,7 +181,7 @@ priors = S.priors
 hyp = hypothesis_info(S, hypothesis_name)
 cp_hyp = hyp.prior       # prior of the hypothesis under test
 cp_sm = hyp.null_prior   # the same prior with the tested parameters at their null values (used by the smseed stage of --strategy)
-results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "scan") : args["results-dir"]
+results_dir = isempty(args["results-dir"]) ? joinpath("nsi/results", S.name, "scan") : args["results-dir"]
 mkpath(results_dir)
 
 ##### strategy #####

@@ -1423,3 +1423,137 @@ function make_merged_seed_interpolants(
     end
     merged
 end
+
+"""
+    correlation(likelihood, prior, params; bound_tol = 1e-6) -> (; cov, corr, names, dropped, offset)
+    correlation(result::NewtrinosResult, likelihood; bound_tol = 1e-6)
+    correlation(experiments::NamedTuple, prior, params; bound_tol = 1e-6)
+
+Parameter covariance and Pearson correlation from the inverse Hessian of the negative log posterior (log likelihood plus log prior of the
+free parameters) at the point `params`, i.e. the Gaussian (Laplace) approximation: `cov = inv(-H)`, `corr = cov_ij / sqrt(cov_ii cov_jj)`.
+Each parameter's correlation with the others is the marginal one, all other free parameters being profiled.
+
+The first two methods use the *observed* information: the Hessian of the log likelihood of the data. The result method evaluates at the
+best fit of a profile result (`bestfit(result)`, using the priors stored in `result.meta["priors"]`). At a grid point of a dense profile this
+is close enough to the true minimum; `offset` (the Newton step to the stationary point of the log posterior, `cov * gradient`, as the
+largest component in units of its parameter's uncertainty) tells how far from it the point is. The likelihood method works at any point,
+e.g. at the truth on Asimov data (`generate_asimov_data`), but the rounding of the Asimov counts then enters the Hessian.
+
+The `experiments` method uses the *expected* (Fisher) information at `params` of Poisson experiments, without any data: the Hessian of
+`sum(mu0 * log(mu(q)) - mu(q))` over all bins, with `mu0` the expected counts at `params` fixed (the Asimov log likelihood without
+rounding), equal to `J' diag(1/mu) J` with `J = d mu / d q`. It is positive semi-definite by construction. `offset` then only measures the
+pull of the priors. Other than Poisson forward models raise an error.
+
+Only free parameters enter: those with a `Number` or `ConstValueDist` prior are fixed; scalar parameters closer than `bound_tol` (relative
+to the prior width) to a prior bound are dropped as well (listed in `dropped`, `bound_tol = 0` keeps all), as the Gaussian approximation
+fails there. Vector parameters (e.g. `solar_norms`) enter with all their components, named `solar_norms[1]`, ...
+An error (`PosDefException`) is thrown if the negative Hessian is not positive definite (no maximum, or a flat direction).
+
+# Arguments
+- `likelihood`: a likelihood object supporting `DensityInterface.logdensityof` (see [`generate_likelihood`](@ref)).
+- `experiments`: NamedTuple of experiments, as for [`generate_likelihood`](@ref).
+- `prior`: NamedTuple of prior distributions (fixed parameters as numbers or `ConstValueDist`).
+- `params::NamedTuple`: the point at which the Hessian is taken, all parameters.
+
+# Returns
+A `NamedTuple` `(; cov, corr, names, dropped, offset)`: the matrices of the entering parameters in the order of `names`.
+Plot with `Newtrinos.plotting.plot_correlation`.
+"""
+function correlation(likelihood, prior, params::NamedTuple; bound_tol = 1e-6)
+    _correlation(q -> logdensityof(likelihood, merge(params, q)), prior, params, bound_tol)
+end
+
+function correlation(experiments::NamedTuple, prior, params::NamedTuple; bound_tol = 1e-6)
+    counts(d) = d isa ValueShapes.NamedTupleDist ? reduce(vcat, [counts(d[k]) for k in keys(d)]) : [mean(p) for p in _poisson_leaves(d)]
+    ks = map(e -> keys(get_params(e)), values(experiments))
+    expected(p) = reduce(vcat, [counts(e.forward_model(NamedTuple{k}(p))) for (e, k) in zip(values(experiments), ks)])
+    μ0 = expected(params)
+    _correlation(q -> (μ = expected(merge(params, q)); sum(m0 > 0 ? m0 * log(m) - m : -m for (m0, m) in zip(μ0, μ))), prior, params, bound_tol)
+end
+
+# shared part: `data_logl(q)` is the data log likelihood at the free parameters `q` (the others fixed at `params`)
+function _correlation(data_logl, prior, params::NamedTuple, bound_tol)
+    is_free(k) = k in keys(prior) && !(prior[k] isa Number || prior[k] isa ValueShapes.ConstValueDist)
+    function at_bound(k)
+        d = prior[k]
+        d isa Distributions.UnivariateDistribution || return false
+        lo, hi = minimum(d), maximum(d)
+        tol = bound_tol * (isfinite(hi - lo) ? hi - lo : 1.0)
+        (isfinite(lo) && params[k] - lo < tol) || (isfinite(hi) && hi - params[k] < tol)
+    end
+    dropped = [k for k in keys(params) if is_free(k) && at_bound(k)]
+    free = [k for k in keys(params) if is_free(k) && !(k in dropped)]
+    p_free = NamedTuple{Tuple(free)}(Tuple(params[k] for k in free))
+
+    f(q) = data_logl(q) + sum(logpdf(prior[k], q[k]) for k in keys(q))
+    h = Newtrinos.hessian(f, p_free)   # NamedTuple of row blocks: stack them to the full matrix
+    H = reduce(vcat, [b isa AbstractMatrix ? b : permutedims(b) for b in values(h)])
+    A = Symmetric(-(H + H') / 2)
+    isposdef(A) || throw(LinearAlgebra.PosDefException(1))   # not a maximum (or a flat direction): cov would have negative variances
+    cov = Matrix(inv(A))
+    corr = cov ./ sqrt.(diag(cov) * diag(cov)')
+    g = ForwardDiff.gradient(f, p_free)
+    offset = maximum(abs.(cov * reduce(vcat, [v isa AbstractVector ? v : [v] for v in values(g)])) ./ sqrt.(diag(cov)))
+
+    names = Symbol[]
+    for k in free
+        v = params[k]
+        v isa AbstractVector ? append!(names, [Symbol(k, "[", i, "]") for i in eachindex(v)]) : push!(names, k)
+    end
+    (; cov, corr, names, dropped, offset)
+end
+
+# the Poisson distributions of a forward model leaf (a `Poisson` or a product of them); error for anything else
+function _poisson_leaves(d)
+    pois = d isa Distributions.Poisson ? [d] :
+           d isa Distributions.Product ? vec(d.v) :
+           d isa Distributions.ProductDistribution ? vec(d.dists) : []
+    (!isempty(pois) && all(p -> p isa Distributions.Poisson, pois)) || error("only Poisson forward models are supported, got $(typeof(d))")
+    pois
+end
+
+function correlation(result::NewtrinosResult, likelihood; kwargs...)
+    bf = bestfit(result)
+    ks = Tuple(k for k in keys(bf) if k ∉ (:llh, :log_posterior))
+    correlation(likelihood, result.meta["priors"], NamedTuple{ks}(bf); kwargs...)
+end
+
+"""
+    gof_pvalue(result::NewtrinosResult, experiment::Newtrinos.Experiment) -> (; deviance, ndof, pvalue)
+    gof_pvalue(result::NewtrinosResult, experiments::NamedTuple) -> NamedTuple of those, one per experiment
+
+Goodness-of-fit p-value of an experiment at the best fit of `result` (no refit): the Poisson deviance against the saturated model,
+`2 * sum(logpdf(Poisson(n), n) - logpdf(model, n))` over all bins with observed counts `n`, compared with a `Chisq(ndof)` distribution
+(Wilks): `pvalue = ccdf(Chisq(ndof), deviance)`.
+
+- `ndof` = number of bins - number of free parameters, the free parameters being the non-fixed priors in `result.meta["priors"]` that
+  belong to the experiment (`get_params(experiment)`; vector parameters count with their length). This includes the scanned parameters
+  (free in the stored priors) and counts prior-constrained nuisance parameters as fully free (conservative).
+- Pass a result of a fit of this experiment alone for its own best fit, or the result of a combined fit to test it at the joint best
+  fit. For a combined fit the shared parameters make `ndof` approximate.
+- The deviance is only defined for Poisson forward models (a `Poisson` product, possibly inside a `NamedTupleDist`); other
+  distributions raise an error.
+"""
+function gof_pvalue(result::NewtrinosResult, experiment::Newtrinos.Experiment)
+    bf = bestfit(result)
+    ks = keys(get_params(experiment))
+    dist = experiment.forward_model(NamedTuple{ks}(bf))
+
+    function deviance(d, x)   # (deviance, number of bins) of one distribution
+        if d isa ValueShapes.NamedTupleDist
+            parts = [deviance(d[k], x[k]) for k in keys(d)]
+            return sum(first, parts), sum(last, parts)
+        end
+        pois = _poisson_leaves(d)
+        n = x isa Number ? [x] : vec(x)
+        2 * sum(logpdf(Distributions.Poisson(ni), ni) - logpdf(p, ni) for (p, ni) in zip(pois, n)), length(n)
+    end
+    dev, nbins = deviance(dist, experiment.assets.observed)
+
+    priors = result.meta["priors"]
+    n_free = sum(length(priors[k]) for k in ks if k in keys(priors) && !(priors[k] isa Number || priors[k] isa ValueShapes.ConstValueDist); init = 0)
+    ndof = nbins - n_free
+    (; deviance = dev, ndof, pvalue = ccdf(Distributions.Chisq(ndof), dev))
+end
+
+gof_pvalue(result::NewtrinosResult, experiments::NamedTuple) = map(e -> gof_pvalue(result, e), experiments)

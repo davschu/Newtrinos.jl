@@ -116,7 +116,7 @@ function parse_command_line()
         default = "optimizer_tests"
 
         "--results-dir"
-        help = "Output folder (default: results/<setup name>/optimizer_tests, relative to the working directory)"
+        help = "Output folder (default: analysis_results/results/<setup name>/optimizer_tests, relative to the working directory)"
         arg_type = String
         default = ""
 
@@ -206,7 +206,7 @@ for k in vary_truth_params
     k in keys(prior) || error("--vary-truth-params: unknown parameter $k")
 end
 plotted_params = unique([collect(tested_names); collect(vary_truth_params)])   # parameters whose recovery is reported
-results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "optimizer_tests") : args["results-dir"]
+results_dir = isempty(args["results-dir"]) ? joinpath("analysis_results/results", S.name, "optimizer_tests") : args["results-dir"]
 mkpath(results_dir)
 run_date = Dates.format(Dates.today(), "ddmmyyyy")   # execution date, ends every file name
 out_prefix = joinpath(results_dir, "$(name)_$(hyp_name)")

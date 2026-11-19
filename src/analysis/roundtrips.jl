@@ -34,7 +34,7 @@ function parse_command_line()
         default = ""
 
         "--results-dir"
-        help = "Output folder for the saved results and plots (default: results/<setup name>/roundtrip, relative to the working directory)"
+        help = "Output folder for the saved results and plots (default: analysis_results/results/<setup name>/roundtrip, relative to the working directory)"
         arg_type = String
         default = ""
 
@@ -44,7 +44,7 @@ function parse_command_line()
         default = 25
 
         "--fluctuate-nuisances"
-        help = "Replicate the dissertation's section 7.6.3 test: also randomly draw every other free parameter of the hypothesis (nuisances, and e.g. θ₂₃/Δm²₃₁) from its own prior (the tested parameters' truth from --hypothesis's grid/Sobol point is unaffected). Adds per-parameter truth-vs-fit panels and a Δχ²_mod histogram to the output figure. Also selects the 'fluctuated' vs 'nominal' output filename tag."
+        help = "Randomly draw every other free parameter of the hypothesis (nuisances, and e.g. θ₂₃/Δm²₃₁) from its own prior (the tested parameters' truth from --hypothesis's grid/Sobol point is unaffected). Adds per-parameter truth-vs-fit panels and a Δχ²_mod histogram to the output figure. Also selects the 'fluctuated' vs 'nominal' output filename tag."
         action = :store_true
 
         "--chi2-recovery"
@@ -194,7 +194,7 @@ cp_hyp = hyp.prior                  # prior of the hypothesis under test
 cp_sm = hyp.null_prior              # the same prior with the tested parameters at their null values
 tested_names = hyp.tested           # tested parameters = keys of the hypothesis' `null`
 fluctuated_names = hyp.fluctuated   # all other free parameters: redrawn by --fluctuate-nuisances, shown in the extra panels
-results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "roundtrip") : args["results-dir"]
+results_dir = isempty(args["results-dir"]) ? joinpath("analysis_results/results", S.name, "roundtrip") : args["results-dir"]
 
 ### BUILD THE TRUTH GRID ###
 
@@ -296,8 +296,7 @@ println("Running $(n_grid) grid-point roundtrips (strategy: $(join(strategy, " "
     Δχ²_prior_pull = NaN
     Δχ²_optimizer_residual = NaN
     if prior_effect_flag
-        # Cheap local fit started at the truth, always with objective="posterior" (prior pull is a posterior-only effect): estimates the local
-        # posterior maximum near the truth, whatever the main fit optimized.
+        # Cheap local fit started at the truth, always with objective="posterior" (prior pull is a posterior-only effect): estimates the local posterior maximum near the truth, whatever the main fit optimized.
         t3 = time()
         log_post_ref = run_optimizer(extra_spec, truth_likelihood, prior_dist, truth_param; objective="posterior").log_post
         prior_pull_elapsed = time() - t3

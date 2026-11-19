@@ -108,5 +108,31 @@ function plot(result::NewtrinosResult; kwargs...)
     fig
 end
 
+"""
+    plot_correlation(c; title = "Parameter correlation") -> Figure
+    plot_correlation!(gl::GridLayout, c; title = "Parameter correlation")
+
+Heatmap of the correlation matrix `c.corr` returned by [`Newtrinos.correlation`](@ref), with the parameter names `c.names` as tick
+labels and a symmetric colour range from -1 to 1. The second form draws the heatmap and its colour bar into the layout `gl` of a
+larger figure (`NaN` entries are left empty).
+"""
+function plot_correlation!(gl::GridLayout, c; title = "Parameter correlation")
+    n = length(c.names)
+    ax = Axis(gl[1, 1], title = title, xticks = (1:n, string.(c.names)), yticks = (1:n, string.(c.names)),
+              xticklabelrotation = pi / 2, yreversed = true, aspect = DataAspect())
+    hm = heatmap!(ax, 1:n, 1:n, c.corr; colormap = Reverse(:RdBu), colorrange = (-1, 1))
+    Colorbar(gl[1, 2], hm, label = "Pearson correlation")
+    gl
+end
+
+function plot_correlation(c; title = "Parameter correlation")
+    n = length(c.names)
+    fig = Figure(size = (max(500, 40 * n + 150), max(450, 40 * n + 100)))
+    gl = GridLayout()
+    fig[1, 1] = gl
+    plot_correlation!(gl, c; title)
+    fig
+end
+
 
 end
