@@ -519,11 +519,11 @@ for (idx, spec) in enumerate(panel_specs)
         end
 
         local plt_conv = scatter!(ax, truth_vals[sel_conv], fit_vals[sel_conv];
-                             color=Δχ²_all[sel_conv], colormap=:viridis, colorrange=colorrange,
+                             color=Δχ²_all[sel_conv], colormap=Reverse(:viridis), colorrange=colorrange,
                              markersize=8, label="converged")
-        any(sel_nonc) && scatter!(ax, truth_vals[sel_nonc], fit_vals[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=:viridis,
+        any(sel_nonc) && scatter!(ax, truth_vals[sel_nonc], fit_vals[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=Reverse(:viridis),
                                   colorrange=colorrange, marker=:xcross, markersize=10, label="not converged")
-        any(sel_noflag) && scatter!(ax, truth_vals[sel_noflag], fit_vals[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=:viridis,
+        any(sel_noflag) && scatter!(ax, truth_vals[sel_noflag], fit_vals[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=Reverse(:viridis),
                                     colorrange=colorrange, marker=:rect, markersize=8, label="no convergence flag")
         # failed fits (Δχ² not finite) usually have NaN fit parameters, which cannot be drawn: only those with finite coordinates are shown
         local failed_here = sel_fail .& isfinite.(truth_vals) .& isfinite.(fit_vals)
@@ -548,11 +548,11 @@ for (idx, spec) in enumerate(panel_specs)
 
         scatter!(ax, truth_mags, truth_phases; color=:grey60, marker=:circle, markersize=10, label="truth")
         local plt_fit = scatter!(ax, fit_mags[sel_conv], fit_phases[sel_conv];
-                            color=Δχ²_all[sel_conv], colormap=:viridis, colorrange=colorrange,
+                            color=Δχ²_all[sel_conv], colormap=Reverse(:viridis), colorrange=colorrange,
                             marker=:diamond, markersize=12, label="fit (converged)")
-        any(sel_nonc) && scatter!(ax, fit_mags[sel_nonc], fit_phases[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=:viridis,
+        any(sel_nonc) && scatter!(ax, fit_mags[sel_nonc], fit_phases[sel_nonc]; color=Δχ²_all[sel_nonc], colormap=Reverse(:viridis),
                                   colorrange=colorrange, marker=:xcross, markersize=14, label="fit (not converged)")
-        any(sel_noflag) && scatter!(ax, fit_mags[sel_noflag], fit_phases[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=:viridis,
+        any(sel_noflag) && scatter!(ax, fit_mags[sel_noflag], fit_phases[sel_noflag]; color=Δχ²_all[sel_noflag], colormap=Reverse(:viridis),
                                     colorrange=colorrange, marker=:rect, markersize=11, label="fit (no convergence flag)")
         local failed_plane = sel_fail .& isfinite.(fit_mags) .& isfinite.(fit_phases)
         if any(failed_plane)

@@ -953,4 +953,24 @@ DensityInterface.logdensityof(d::QuadDensity, p) = (x = [p.a, p.b, p.c...]; -0.5
         @test_throws ErrorException Newtrinos.correlation((x = gauss,), (mu = Uniform(0.0, 10.0),), (mu = 2.0,))
     end
 
+    @testset "jacobian of a NamedTuple function" begin
+        # entries in the order of the NamedTuple, vector parameters expanded
+        J = Newtrinos.jacobian(p -> [p.a * p.v[1], p.a + p.v[2]^2, p.v[1] * p.v[2]], (a = 2.0, v = [3.0, 4.0]))
+        @test size(J) == (3, 3)
+        @test J ≈ [3.0 2.0 0.0; 1.0 0.0 8.0; 0.0 4.0 3.0]
+    end
+
+    @testset "correlation, expected information with a vector parameter" begin
+        # two vector components, each with its own Poisson bin: F = diag(1/lambda_i * dlambda_i^2)
+        mock_vec = MockExperiment(
+            MockPhysics((w = [1.0, 2.0],), (w = Product([Uniform(0.0, 5.0), Uniform(0.0, 5.0)]),)),
+            (;), (;), (observed = [10, 40],),
+            p -> distprod(Poisson.([10 * p.w[1], 20 * p.w[2]])),
+            (p, data = nothing) -> nothing
+        )
+        c = Newtrinos.correlation((x = mock_vec,), (w = Product([Uniform(0.0, 5.0), Uniform(0.0, 5.0)]),), (w = [1.0, 2.0],))
+        @test c.names == [Symbol("w[1]"), Symbol("w[2]")]
+        @test c.cov ≈ Diagonal([1 / 10, 1 / 10]) rtol = 1e-8   # F_i = (dlambda_i/dw_i)^2 / lambda_i = 10^2 / 10 and 20^2 / 40
+    end
+
 end

@@ -212,7 +212,8 @@ if method == "fisher"
     # or of the Hessian of the log likelihood of the (rounded) Asimov counts (observed)
     @everywhere function fisher_task(i)
         c = ctx
-        try
+        t0 = time()
+        out = try
             if c.information == "expected"
                 Newtrinos.correlation(c.experiments, c.prior, c.truths[i]; bound_tol = c.bound_tol)
             else
@@ -223,13 +224,15 @@ if method == "fisher"
             e isa Union{LinearAlgebra.SingularException, LinearAlgebra.PosDefException} || rethrow(e)
             nothing
         end
+        println("truth $i of $(length(c.truths)): ", isnothing(out) ? "no result (not positive definite)" : "done", " in ", round(time() - t0, digits = 1), " s")
+        out
     end
     cs = use_distributed ? pmap(fisher_task, 1:length(truths)) : map(fisher_task, 1:length(truths))
 
     say("=== sensitivity (fisher) summary ===")
     say("setup: $(S.name)   hypothesis: $hyp_name (tested: $(join(tested, ", ")))   information: $(args["information"])")
     say(args["information"] == "expected" ?
-        "Hessian of the log posterior at the truth with the Fisher information of the Poisson model (no data); sigma_marg = expected uncertainty with all other parameters free, sigma_cond = with all others fixed;" :
+        "Fisher information of the Poisson model at the truth (J' diag(1/mu) J from the Jacobian of the expected counts, no data) plus the curvature of the priors; sigma_marg = expected uncertainty with all other parameters free, sigma_cond = with all others fixed;" :
         "Hessian of the log posterior at the truth on (rounded) Asimov data; sigma_marg = expected uncertainty with all other parameters free, sigma_cond = with all others fixed;")
     say("width = prior width (6 sigma for unbounded priors); the impact of nuisance j on tested parameter i = shift of i for a +1 sigma_marg move of j (first order)")
     fisher_results = []
@@ -237,7 +240,7 @@ if method == "fisher"
         say()
         say("--- truth $i: " * join(("$k = $(round.(truths[i][k], sigdigits = 4))" for k in tested), ", "))
         if isnothing(c)
-            say("the Fisher matrix is not positive definite at this truth: a parameter has no effect here (e.g. a phase whose magnitude is zero)" *
+            say("the information matrix is not positive definite at this truth (see the warning above for the smallest eigenvalues and the parameters in them: a parameter without effect or prior curvature, e.g. a phase whose magnitude is zero)" *
                 (args["information"] == "observed" ? ", or the rounded Asimov counts make the Hessian indefinite where the data are insensitive (try --information expected)" : "") * ". No result for this truth")
             push!(fisher_results, nothing)
             continue

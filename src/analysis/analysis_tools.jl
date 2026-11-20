@@ -1441,7 +1441,9 @@ e.g. at the truth on Asimov data (`generate_asimov_data`), but the rounding of t
 
 The `experiments` method uses the *expected* (Fisher) information at `params` of Poisson experiments, without any data: the Hessian of
 `sum(mu0 * log(mu(q)) - mu(q))` over all bins, with `mu0` the expected counts at `params` fixed (the Asimov log likelihood without
-rounding), equal to `J' diag(1/mu) J` with `J = d mu / d q`. It is positive semi-definite by construction. `offset` then only measures the
+rounding), which equals `J' diag(1/mu) J` with `J = d mu / d q`; computed this way, from the Jacobian of the expected counts
+(`Newtrinos.jacobian`, first derivatives only, much cheaper than a Hessian), plus the curvature of the priors. It is positive semi-definite by
+construction. If `mu` is not differentiable at `params` (e.g. a parameter sitting on a kink of the model) the slope of one side is used. `offset` then only measures the
 pull of the priors. Other than Poisson forward models raise an error.
 
 Only free parameters enter: those with a `Number` or `ConstValueDist` prior are fixed; scalar parameters closer than `bound_tol` (relative
@@ -1468,11 +1470,16 @@ function correlation(experiments::NamedTuple, prior, params::NamedTuple; bound_t
     ks = map(e -> keys(get_params(e)), values(experiments))
     expected(p) = reduce(vcat, [counts(e.forward_model(NamedTuple{k}(p))) for (e, k) in zip(values(experiments), ks)])
     μ0 = expected(params)
-    _correlation(q -> (μ = expected(merge(params, q)); sum(m0 > 0 ? m0 * log(m) - m : -m for (m0, m) in zip(μ0, μ))), prior, params, bound_tol)
+    W = [m > 0 ? 1 / m : zero(m) for m in μ0]
+    data_logl(q) = (μ = expected(merge(params, q)); sum(m0 > 0 ? m0 * log(m) - m : -m for (m0, m) in zip(μ0, μ)))   # only for the offset diagnostic
+    # Fisher information J' diag(1/mu) J from the Jacobian of the expected counts (first derivatives only)
+    data_info(p_free) = (J = Newtrinos.jacobian(q -> expected(merge(params, q)), p_free); J' * (W .* J))
+    _correlation(data_logl, prior, params, bound_tol; data_info)
 end
 
-# shared part: `data_logl(q)` is the data log likelihood at the free parameters `q` (the others fixed at `params`)
-function _correlation(data_logl, prior, params::NamedTuple, bound_tol)
+# shared part: `data_logl(q)` is the data log likelihood at the free parameters `q` (the others fixed at `params`); by default its Hessian gives the
+# information, or `data_info(p_free)` returns the (positive) information matrix of the data directly, the priors then adding their curvature
+function _correlation(data_logl, prior, params::NamedTuple, bound_tol; data_info = nothing)
     is_free(k) = k in keys(prior) && !(prior[k] isa Number || prior[k] isa ValueShapes.ConstValueDist)
     function at_bound(k)
         d = prior[k]
@@ -1485,21 +1492,38 @@ function _correlation(data_logl, prior, params::NamedTuple, bound_tol)
     free = [k for k in keys(params) if is_free(k) && !(k in dropped)]
     p_free = NamedTuple{Tuple(free)}(Tuple(params[k] for k in free))
 
-    f(q) = data_logl(q) + sum(logpdf(prior[k], q[k]) for k in keys(q))
-    h = Newtrinos.hessian(f, p_free)   # NamedTuple of row blocks: stack them to the full matrix
-    H = reduce(vcat, [b isa AbstractMatrix ? b : permutedims(b) for b in values(h)])
-    A = Symmetric(-(H + H') / 2)
-    isposdef(A) || throw(LinearAlgebra.PosDefException(1))   # not a maximum (or a flat direction): cov would have negative variances
-    cov = Matrix(inv(A))
-    corr = cov ./ sqrt.(diag(cov) * diag(cov)')
-    g = ForwardDiff.gradient(f, p_free)
-    offset = maximum(abs.(cov * reduce(vcat, [v isa AbstractVector ? v : [v] for v in values(g)])) ./ sqrt.(diag(cov)))
-
+    logprior(q) = sum(logpdf(prior[k], q[k]) for k in keys(q))
+    f(q) = data_logl(q) + logprior(q)
+    stack(h) = reduce(vcat, [b isa AbstractMatrix ? b : permutedims(b) for b in values(h)])   # NamedTuple of row blocks -> full matrix
+    A = if isnothing(data_info)
+        H = stack(Newtrinos.hessian(f, p_free))
+        Symmetric(-(H + H') / 2)
+    else
+        Hp = stack(Newtrinos.hessian(logprior, p_free))   # curvature of the priors (cheap, the model is not involved)
+        F = data_info(p_free)
+        Symmetric((F + F') / 2 - (Hp + Hp') / 2)
+    end
     names = Symbol[]
     for k in free
         v = params[k]
         v isa AbstractVector ? append!(names, [Symbol(k, "[", i, "]") for i in eachindex(v)]) : push!(names, k)
     end
+    if !isposdef(A)   # not a maximum (or a flat direction): cov would have negative variances; say which parameters carry the bad directions
+        if all(isfinite, A)
+            d = sqrt.(max.(diag(A), eps()))
+            ev = eigen(Symmetric(A ./ (d * d')))   # eigenvalues of the diagonally scaled matrix, the smallest first
+            bad = [ev.values[j] for j in 1:min(3, length(names))]
+            who = [join(["$(names[i]) ($(round(ev.vectors[i, j], digits = 2)))" for i in sortperm(abs.(ev.vectors[:, j]); rev = true)[1:min(3, length(names))]], ", ") for j in eachindex(bad)]
+            @warn "information matrix not positive definite" smallest_scaled_eigenvalues = bad dominant_parameters = who
+        else
+            @warn "information matrix contains non-finite entries"
+        end
+        throw(LinearAlgebra.PosDefException(1))
+    end
+    cov = Matrix(inv(A))
+    corr = cov ./ sqrt.(diag(cov) * diag(cov)')
+    g = ForwardDiff.gradient(f, p_free)
+    offset = maximum(abs.(cov * reduce(vcat, [v isa AbstractVector ? v : [v] for v in values(g)])) ./ sqrt.(diag(cov)))
     (; cov, corr, names, dropped, offset)
 end
 
