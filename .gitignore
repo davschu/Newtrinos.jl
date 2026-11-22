@@ -8,3 +8,6 @@ __pycache__/
 *.pdf
 *.jld2
 LocalPreferences.toml
+deepcore_3year_analysis/pso_test_results/logs/
+deepcore_3year_analysis/roundtrip_results/logs/
+deepcore_3year_analysis/scan_results_lrz/logs/

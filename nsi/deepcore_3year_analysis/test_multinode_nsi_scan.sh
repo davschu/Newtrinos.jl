@@ -40,14 +40,14 @@ module load slurm_setup
 export JULIA_DEPOT_PATH="$HOME/.julia"
 JULIA=/dss/lrzsys/sys/tools/julia_base/julia-1.12.6/bin/julia
 
-cd "$HOME/Newtrinos.jl/nsi/deepcore_3year_analysis"
+cd "$HOME/Newtrinos.jl/nsi"
 mkdir -p scan_results/logs
 
 # Don't comment sth out here, just delete the line or else it will cause a bug!
 $JULIA nsi_scan.jl \
     --name multinode_smoketest \
     --hypothesis μτ \
-    --experiments deepcore_3y \
+    --experiments deepcore \
     --task profile \
     --grid-points 4 \
     --objective posterior \

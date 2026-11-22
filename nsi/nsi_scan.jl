@@ -283,3 +283,4 @@ elseif lowercase(args["task"]) == "scan"
 else
     error("--task must be 'Profile' or 'Scan' (case-insensitive), got '$(args["task"])'")
 end
+
