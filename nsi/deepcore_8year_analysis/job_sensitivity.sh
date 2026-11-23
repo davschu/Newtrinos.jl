@@ -4,10 +4,10 @@
 #SBATCH --export=NONE
 #SBATCH --clusters=cm4
 #SBATCH --partition=cm4_tiny        # single-node only; switch to cm4_std if/when multi-node distribution is wired up
-#SBATCH --mem=40G
+#SBATCH --mem=50G
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=22          # single hypothesis, single grid scan: threads ~= n-points budget, not the 5-hypothesis formula used by job_optimizer_tests.sh
+#SBATCH --cpus-per-task=27          # single hypothesis, single grid scan: threads ~= n-points budget, not the 5-hypothesis formula used by job_optimizer_tests.sh
 #SBATCH --time=4:00:00
 #SBATCH --array=0-5                 # one array task per hypothesis (eμ, eτ, μτ, ee_μμ, ττ_μμ, all) -- see HYPOTHESES below
 # NOTE: the logs/ folder below must already exist when you run sbatch (Slurm opens the log files before the script starts; mkdir inside the script is too late)
@@ -33,10 +33,9 @@ $JULIA ../src/analysis/sensitivity.jl \
     --hypothesis "$HYPOTHESIS" \
     --method fisher \
     --truth grid \
-    --n-truths 20 \
-    --information \
+    --n-truths 25 \
+    --information expected \
     --drop-boundaries \
-    --one-plot \
-    --workers 20 \
+    --workers 25 \
     --results-dir deepcore_8year_analysis/results/sensitivity_results/ \
     --name "sensitivity_tests_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"

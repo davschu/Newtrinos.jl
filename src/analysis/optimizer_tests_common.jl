@@ -244,13 +244,15 @@ end
 
 
 """
-    truth_grid(prior, nominal_params, tested_names; n_points=25, interior=false)
+    truth_grid(prior, nominal_params, tested_names; n_points=25, interior=false, ranges=Dict())
 
 Generate a grid of `n_points` Asimov-truth NamedTuples scanning the free tested parameters of
 a hypothesis (`tested_names`, e.g. `keys(null)` of a setup's hypothesis). All other parameters
 stay at `nominal_params`, except the ones `prior` holds fixed, which are forced to their fixed
 value (`_fix_conditioned`, same as `controlled_truth`). The grid only controls how the injected
 truth is built; the subsequent fit is still free to vary every non-fixed parameter in `prior`.
+`ranges` (name => (lo, hi)) restricts the grid of a tested parameter to that interval instead
+of its whole prior range.
 
 The sampling strategy follows from the number of FREE tested parameters:
 - 1 parameter: `n_points` evenly spaced values over its prior range (1D).
@@ -266,32 +268,34 @@ Returns `(truths, scan_keys, grid_coords)`: `truths` is the vector of truth Name
 `Vector{Vector{Float64}}` -- one vector per sample, ordered to match `scan_keys` -- for
 the >2D Sobol case).
 """
-function truth_grid(prior, nominal_params, tested_names; n_points=25, interior=false)
+function truth_grid(prior, nominal_params, tested_names; n_points=25, interior=false, ranges=Dict{Symbol, Tuple{Float64, Float64}}())
     free = [k for k in tested_names if !_is_fixed(prior[k])]
+    # `ranges`: name => (lo, hi) restricts the grid of a tested parameter to that interval (default: its whole prior range)
+    lohi(k) = get(ranges, k, (Float64(minimum(prior[k])), Float64(maximum(prior[k]))))
     # interior = true: cell-centred values lo + (i - 1/2)/n * (hi - lo), none on a prior bound (the Sobol sequence is interior anyway)
-    axis(d, n) = interior ? [Float64(minimum(d)) + (i - 0.5) / n * Float64(maximum(d) - minimum(d)) for i in 1:n] :
-                            collect(range(Float64(minimum(d)), Float64(maximum(d)), length=n))
+    function axis(k, n)
+        lo, hi = lohi(k)
+        interior ? [lo + (i - 0.5) / n * (hi - lo) for i in 1:n] : collect(range(lo, hi, length=n))
+    end
 
     if length(free) == 1
         k = free[1]
-        d = prior[k]
-        grid_coords = axis(d, n_points)
+        grid_coords = axis(k, n_points)
         truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(k,)}((v,))), prior) for v in grid_coords]
         return truths, (k,), grid_coords
     elseif length(free) == 2
         key1, key2 = free[1], free[2]
-        d1, d2 = prior[key1], prior[key2]
         n_per_dim = Int(round(sqrt(n_points)))
-        vals1 = axis(d1, n_per_dim)
-        vals2 = axis(d2, n_per_dim)
+        vals1 = axis(key1, n_per_dim)
+        vals2 = axis(key2, n_per_dim)
         grid_coords = [(a, b) for a in vals1 for b in vals2]
         truths = [_fix_conditioned(merge(nominal_params, NamedTuple{(key1,key2)}((a,b))), prior)
                   for (a,b) in grid_coords]
         return truths, (key1, key2), grid_coords
     elseif length(free) > 2
         scan_keys = Tuple(free)
-        los = Float64[Float64(minimum(prior[k])) for k in scan_keys]
-        his = Float64[Float64(maximum(prior[k])) for k in scan_keys]
+        los = Float64[lohi(k)[1] for k in scan_keys]
+        his = Float64[lohi(k)[2] for k in scan_keys]
         seq = Sobol.SobolSeq(los, his)
         grid_coords = Vector{Vector{Float64}}(undef, n_points)
         truths = Vector{typeof(_fix_conditioned(nominal_params, prior))}(undef, n_points)
@@ -304,6 +308,110 @@ function truth_grid(prior, nominal_params, tested_names; n_points=25, interior=f
     else
         error("truth_grid: none of the tested parameters $(collect(tested_names)) is free in the prior -- " *
               "a hypothesis needs at least one free tested parameter.")
+    end
+end
+
+# ---- truth selection (`--truth` of sensitivity.jl) ----------------------------------------------
+
+"""`name=value` pairs of a `--truth` spec, `name=lo,hi` for ranges (`pairs` separated by `sep`) -> Vector of (name, string of the values)."""
+function _spec_pairs(str, sep, flag)
+    out = Tuple{Symbol, String}[]
+    for item in split(str, sep; keepempty = false)
+        m = match(r"^\s*([^=\s]+)\s*=\s*(\S.*?)\s*$", item)
+        m === nothing && error("--truth $flag: expected name=value, got '$item'")
+        push!(out, (Symbol(m.captures[1]), String(m.captures[2])))
+    end
+    isempty(out) && error("--truth $flag: nothing given after the colon")
+    out
+end
+
+function _spec_float(s, what)
+    v = tryparse(Float64, strip(s))
+    (v === nothing || !isfinite(v)) && error("--truth: $what must be a finite number, got '$s'")
+    v
+end
+
+"""
+    truth_from_spec(spec, prior, nominal_params, tested_names; n_points = 25, interior = false)
+        -> (; truths, scan_keys, grid_coords, kind, description)
+
+The injected truths of `sensitivity.jl --truth <spec>`; `truths`, `scan_keys` and `grid_coords` as in [`truth_grid`](@ref) (`scan_keys = ()` and
+`grid_coords = nothing` where nothing is scanned). `spec`:
+- `nominal`: the setup's parameters (the parameters `prior` holds fixed forced to their fixed values);
+- `grid`: [`truth_grid`](@ref) over the whole prior ranges of the tested parameters;
+- `range:lo,hi` (one free tested parameter) or `range:name=lo,hi;name2=lo,hi`: the same grid restricted to these intervals (tested parameters not
+  listed keep their whole range); the intervals must lie in the prior range;
+- `point:name=x,name2=y`: ONE truth, these parameters (tested or nuisances) set on top of the nominal ones; the values must lie in the prior range;
+- `bf:file.jld2`: ONE truth, the best fit (`Newtrinos.bestfit`, highest `log_posterior`) of the `NewtrinosResult` stored under the key `"result"` (as written by
+  `save_result`); parameters the result does not contain stay nominal.
+"""
+function truth_from_spec(spec, prior, nominal_params, tested_names; n_points = 25, interior = false)
+    parts = split(spec, ':'; limit = 2)
+    kind, arg = String(parts[1]), length(parts) == 2 ? String(parts[2]) : ""
+    kind in ("nominal", "grid", "range", "point", "bf") ||
+        error("--truth must be nominal, grid, range:<spec>, point:<spec> or bf:<file.jld2>, got '$spec'")
+    (kind in ("nominal", "grid")) && !isempty(arg) && error("--truth $kind takes no argument, got '$spec'")
+    kind in ("range", "point", "bf") && isempty(strip(arg)) && error("--truth $kind: needs an argument, e.g. $(kind == "bf" ? "bf:result.jld2" : kind == "range" ? "range:lo,hi" : "point:name=value")")
+    free = [k for k in tested_names if !_is_fixed(prior[k])]
+    single(t) = (; truths = [t], scan_keys = (), grid_coords = nothing)
+    if kind == "nominal"
+        return (; single(_fix_conditioned(nominal_params, prior))..., kind = :nominal, description = "nominal parameters of the setup (a priori forecast)")
+    elseif kind == "grid"
+        truths, keys_, coords = truth_grid(prior, nominal_params, tested_names; n_points, interior)
+        return (; truths, scan_keys = keys_, grid_coords = coords, kind = :grid, description = "grid over the prior range of $(join(keys_, ", ")) ($(length(truths)) truths, others nominal)")
+    elseif kind == "range"
+        ranges = Dict{Symbol, Tuple{Float64, Float64}}()
+        pairs_ = if occursin('=', arg)
+            _spec_pairs(arg, ';', "range")
+        else
+            length(free) == 1 || error("--truth range:lo,hi needs exactly one free tested parameter, this hypothesis has $(length(free)) ($(join(free, ", "))): use range:name=lo,hi;name2=lo,hi")
+            [(free[1], strip(arg))]
+        end
+        for (k, s) in pairs_
+            k in free || error("--truth range: '$k' is not a free tested parameter (free tested: $(join(free, ", ")))")
+            vals = split(s, ','; keepempty = false)
+            length(vals) == 2 || error("--truth range: expected lo,hi for $k, got '$s'")
+            lo, hi = _spec_float(vals[1], "range of $k"), _spec_float(vals[2], "range of $k")
+            lo < hi || error("--truth range: lo < hi is required for $k, got $lo, $hi")
+            plo, phi = Float64(minimum(prior[k])), Float64(maximum(prior[k]))
+            (lo >= plo && hi <= phi) || error("--truth range: $k in [$lo, $hi] is outside its prior range [$plo, $phi]")
+            haskey(ranges, k) && error("--truth range: $k given twice")
+            ranges[k] = (lo, hi)
+        end
+        truths, keys_, coords = truth_grid(prior, nominal_params, tested_names; n_points, interior, ranges)
+        intervals = [string(k, " in [", get(ranges, k, (Float64(minimum(prior[k])), Float64(maximum(prior[k]))))[1], ", ",
+                     get(ranges, k, (Float64(minimum(prior[k])), Float64(maximum(prior[k]))))[2], "]") for k in keys_]
+        return (; truths, scan_keys = keys_, grid_coords = coords, kind = :range,
+                description = "grid over " * join(intervals, ", ") * " ($(length(truths)) truths, others nominal)")
+    elseif kind == "point"
+        over = Dict{Symbol, Float64}()
+        for (k, s) in _spec_pairs(arg, ',', "point")
+            k in keys(nominal_params) || error("--truth point: '$k' is not a parameter of the setup")
+            nominal_params[k] isa AbstractVector && error("--truth point: '$k' is a vector parameter, only scalar parameters can be set")
+            _is_fixed(prior[k]) && error("--truth point: '$k' is fixed in the prior of this hypothesis, it cannot be set")
+            v = _spec_float(s, "value of $k")
+            plo, phi = Float64(minimum(prior[k])), Float64(maximum(prior[k]))
+            (v >= plo && v <= phi) || error("--truth point: $k = $v is outside its prior range [$plo, $phi]")
+            haskey(over, k) && error("--truth point: $k given twice")
+            over[k] = v
+        end
+        return (; single(_fix_conditioned(merge(nominal_params, NamedTuple(over)), prior))..., kind = :point,
+                description = "point " * join(("$k = $v" for (k, v) in over), ", ") * " (other parameters nominal)")
+    else
+        path = strip(arg)
+        isfile(path) || error("--truth bf: file '$path' not found")
+        d = FileIO.load(path)
+        haskey(d, "result") || error("--truth bf: '$path' has no key \"result\" (keys: $(join(keys(d), ", "))); expected a NewtrinosResult saved with save_result")
+        result = d["result"]
+        result isa Newtrinos.NewtrinosResult || error("--truth bf: the \"result\" of '$path' is a $(typeof(result)), not a NewtrinosResult")
+        bf = Newtrinos.bestfit(result)
+        found = [k for k in keys(nominal_params) if k in keys(bf)]
+        isempty(found) && error("--truth bf: the best fit in '$path' contains none of the parameters of the setup")
+        over = NamedTuple{Tuple(found)}(Tuple(bf[k] isa AbstractArray ? collect(Float64, bf[k]) : Float64(bf[k]) for k in found))
+        missing_ = [k for k in keys(nominal_params) if !(k in keys(bf))]
+        isempty(missing_) || @warn "--truth bf: the result does not contain $(join(missing_, ", ")); they stay at their nominal values"
+        return (; single(_fix_conditioned(merge(nominal_params, over), prior))..., kind = :bf,
+                description = "best fit of $(basename(path)) (log posterior $(round(bf.log_posterior; digits = 3)); post-fit, parameters missing in the result nominal)")
     end
 end
 

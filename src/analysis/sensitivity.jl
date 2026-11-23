@@ -1,5 +1,6 @@
 # Sensitivity studies on one hypothesis of a setup file, with data injected at the setup's parameters (Asimov, or toys for --method toys):
-#   --method fisher  expected uncertainties and the a priori correlation matrix from the Hessian at the truth (no fits)
+#   --method fisher  expected uncertainties and the a priori correlation matrix from the Hessian at the truth (no fits); --truth selects the truth(s):
+#                    nominal | grid | range:<intervals> | point:<name=value,...> | bf:<result.jld2>; one overview figure (sensitivity_plots.jl)
 #   --method scan    one-at-a-time scans over the full prior range of every free parameter: others fixed and (unless --no-profile) others re-fitted
 #   --method toys    distribution of the test statistic q = 2 (log post. of the full fit - log post. of the null fit) for toys injected at the null
 # Usage: julia src/analysis/sensitivity.jl --setup <file> --hypothesis <name> --method fisher|scan|toys [--workers N]  (--help)
@@ -31,6 +32,7 @@ import Optim
 import ForwardDiff
 
 include(joinpath(@__DIR__, "optimizer_tests_common.jl"))
+include(joinpath(@__DIR__, "sensitivity_plots.jl"))
 
 ### CLI ###
 
@@ -75,22 +77,23 @@ function parse_command_line()
         default = ["lbfgsb"]
 
         "--n-truths"
-        help = "fisher: number of truths; with --truth grid they are spread over the tested parameters (1 or 2 tested: grid, more: Sobol)"
+        help = "fisher with --truth grid or range:...: number of truths, spread over the tested parameters (1 or 2 tested: grid, more: Sobol)"
         arg_type = Int
         default = 1
 
         "--truth"
-        help = "fisher: nominal (the setup's parameters, default) or grid (truth_grid over the tested parameters, --n-truths points). Use grid if the Fisher matrix is singular at the nominal point, e.g. a phase whose magnitude is zero"
+        help = "fisher: where the data are injected. nominal (the setup's parameters, default); grid (truth_grid over the whole prior ranges of the tested parameters, --n-truths points; use it if the Fisher matrix is singular at the nominal point, e.g. a phase whose magnitude is zero); range:lo,hi or range:name=lo,hi;name2=lo,hi (the same grid restricted to these intervals, e.g. a suspicious region; with one tested parameter lo,hi is enough); point:name=x,name2=y (ONE truth: these parameters, tested or nuisances, set on top of the nominal ones); bf:file.jld2 (ONE truth: the best fit of a NewtrinosResult stored under the key \"result\", as written by save_result; parameters it does not contain stay nominal)"
         arg_type = String
         default = "nominal"
 
         "--drop-boundaries"
-        help = "fisher with --truth grid: keep the truths off the prior bounds (cell-centred grid values lo + (i-1/2)/n * width instead of values from lo to hi), so no tested parameter sits at a bound or has no effect (e.g. a phase at zero magnitude). All parameters stay in the matrix"
+        help = "fisher with --truth grid or range:...: keep the truths off the interval bounds (cell-centred grid values lo + (i-1/2)/n * width instead of values from lo to hi), so no tested parameter sits at a bound or has no effect (e.g. a phase at zero magnitude). All parameters stay in the matrix"
         action = :store_true
 
-        "--one-plot"
-        help = "fisher: write all plots (sigma_cond, sigma_marg, mean correlation, impact ranking) into one figure and file (default: one file each)"
-        action = :store_true
+        "--top-n"
+        help = "fisher: number of nuisances drawn in the overview figure (the ones with the largest |impact| on a tested parameter at any truth); all of them are in the summary text and the results file"
+        arg_type = Int
+        default = 25
 
         "--information"
         help = "fisher: expected (Fisher information of the Poisson model at the truth, no data, always positive semi-definite; default) or observed (Hessian of the log likelihood of the rounded Asimov counts, which can be indefinite where the data are insensitive)"
@@ -130,7 +133,9 @@ args = parse_command_line()
 run_start_time = time()
 method = lowercase(args["method"])
 method in ("fisher", "scan", "toys") || error("--method must be fisher, scan or toys, got '$method'")
-args["truth"] in ("nominal", "grid") || error("--truth must be nominal or grid, got '$(args["truth"])'")
+first(split(args["truth"], ':'; limit = 2)) in ("nominal", "grid", "range", "point", "bf") ||
+    error("--truth must be nominal, grid, range:<spec>, point:<spec> or bf:<file.jld2>, got '$(args["truth"])'")
+args["top-n"] >= 1 || error("--top-n must be at least 1")
 args["information"] in ("expected", "observed") || error("--information must be expected or observed, got '$(args["information"])'")
 n_workers = args["workers"]
 use_distributed = n_workers > 1
@@ -200,11 +205,10 @@ results = Dict{String, Any}("settings" => Dict("setup" => S.name, "hypothesis" =
 ### FISHER ###
 
 if method == "fisher"
-    truths = if args["truth"] == "grid"
-        first(truth_grid(prior, S.params, tested; n_points = args["n-truths"], interior = args["drop-boundaries"]))
-    else
-        [nominal]
-    end
+    truth_sel = truth_from_spec(args["truth"], prior, S.params, tested; n_points = args["n-truths"], interior = args["drop-boundaries"])
+    truths = truth_sel.truths
+    results["settings"]["truth"] = args["truth"]
+    results["settings"]["truth_description"] = truth_sel.description
     ctx = (; experiments, prior, truths, bound_tol = 0.0, information = args["information"])
     use_distributed && @everywhere ctx = $ctx
 
@@ -231,6 +235,7 @@ if method == "fisher"
 
     say("=== sensitivity (fisher) summary ===")
     say("setup: $(S.name)   hypothesis: $hyp_name (tested: $(join(tested, ", ")))   information: $(args["information"])")
+    say("truth: $(truth_sel.description)")
     say(args["information"] == "expected" ?
         "Fisher information of the Poisson model at the truth (J' diag(1/mu) J from the Jacobian of the expected counts, no data) plus the curvature of the priors; sigma_marg = expected uncertainty with all other parameters free, sigma_cond = with all others fixed;" :
         "Hessian of the log posterior at the truth on (rounded) Asimov data; sigma_marg = expected uncertainty with all other parameters free, sigma_cond = with all others fixed;")
@@ -280,153 +285,14 @@ if method == "fisher"
     results["truths"] = truths
     results["fisher"] = fisher_results
 
-    # plots: all truths in one figure per quantity; a parameter dropped at a truth has no bar (NaN), truths without a result are left out
-    ok = [i for i in eachindex(fisher_results) if !isnothing(fisher_results[i])]
-    if isempty(ok)
+    # the overview figure (sensitivity_plots.jl); the summary and the results file are written below even if the plot fails
+    if all(isnothing, fisher_results)
         say("\nno truth gave a result: no plots")
     else
-        all_names = reduce(vcat, [nominal[k] isa AbstractVector ? [Symbol(k, "[", j, "]") for j in eachindex(nominal[k])] : [k] for k in keys(nominal) if k in free_keys])
-        place(v, names) = [(j = findfirst(==(n), names)) === nothing ? NaN : v[j] for n in all_names]
-        truth_label(i) = length(tested) <= 2 ? join(("$k = $(round(truths[i][k], sigdigits = 3))" for k in tested), ", ") : "truth $i"
-        labels = [truth_label(i) for i in ok]
-        failed = [i for i in eachindex(fisher_results) if isnothing(fisher_results[i])]
-        note = isempty(failed) ? "" : "   (no result: " * join((truth_label(i) for i in failed), "; ") * ")"
-        colors = Makie.cgrad(:viridis, max(length(ok), 2), categorical = true)
-
-        # parameters x truths matrices (NaN = no value at that truth); nuisances: bar = mean over the truths with min to max whiskers, tested
-        # parameters: one dodged bar per truth (mean and whiskers too for more than 2 tested parameters)
-        dodged = length(tested) <= 2
-        nuis_idx = [j for (j, n) in enumerate(all_names) if !(n in tested)]
-        test_idx = [j for (j, n) in enumerate(all_names) if n in tested]
-        nt = length(ok)
-        pick(f) = reduce(hcat, [place(f(fisher_results[i]), fisher_results[i].names) for i in ok])
-        width_mat = pick(r -> r.width)
-
-        # sigma block (absolute sigma on a log axis above sigma / prior width; left the nuisances, right the tested parameters) drawn into the layout `gl`
-        function sigma_block!(gl, abs_mat, rel_mat, name)
-            function panel!(ax, M, idx, dodge)
-                if dodge
-                    pts = [(k, M[j, t], t) for t in 1:nt for (k, j) in enumerate(idx) if isfinite(M[j, t])]
-                    isempty(pts) && return
-                    ys = [p[2] for p in pts]
-                    base = ax.yscale[] === log10 ? minimum(ys) / 3 : 0.0   # on a log axis the bars start below the smallest value
-                    barplot!(ax, [p[1] for p in pts], ys; dodge = [p[3] for p in pts], n_dodge = nt, color = [colors[p[3]] for p in pts], fillto = base, dodge_gap = 0.02)
-                else
-                    st = [(k, mean(v), minimum(v), maximum(v)) for (k, j) in enumerate(idx) for v in [filter(isfinite, M[j, :])] if !isempty(v)]
-                    isempty(st) && return
-                    base = ax.yscale[] === log10 ? minimum(s[3] for s in st) / 3 : 0.0
-                    barplot!(ax, [s[1] for s in st], [s[2] for s in st]; color = :steelblue, fillto = base)
-                    rangebars!(ax, [s[1] for s in st], [s[3] for s in st], [s[4] for s in st]; color = :black, whiskerwidth = 8)
-                end
-            end
-            Label(gl[0, 1:2], "$name ($(args["information"]) information, $nt truths)$note"; font = :bold, tellwidth = false)
-            for (col, idx, dodge, what) in ((1, nuis_idx, false, "nuisances: mean, whiskers min to max"),
-                                            (2, test_idx, dodged, dodged ? "tested: per truth" : "tested: mean, min to max"))
-                isempty(idx) && continue
-                xt = (1:length(idx), string.(all_names[idx]))
-                top = Axis(gl[1, col]; title = what, ylabel = col == 1 ? name : "", yscale = log10, xticks = xt, xticklabelsvisible = false)
-                bot = Axis(gl[2, col]; ylabel = col == 1 ? "$name / prior width" : "", xticks = xt, xticklabelrotation = pi / 2)
-                linkxaxes!(top, bot)
-                panel!(top, abs_mat, idx, dodge)
-                panel!(bot, rel_mat, idx, dodge)
-                colsize!(gl, col, Auto(length(idx) + (dodge ? 1 : 0)))
-            end
-            dodged && !isempty(test_idx) && Legend(gl[1:2, 3], [PolyElement(color = colors[t]) for t in 1:nt], labels, join(tested, ", "))
-            gl
-        end
-
-        # impact block: for every tested parameter a tornado plot of the shift of its best fit for a +1 sigma_marg move of a nuisance, in units of the
-        # sigma_marg of the tested parameter (this equals the correlation of the nuisance with the tested parameter); nuisances sorted by their
-        # largest |impact| over the truths, one dodged bar per truth (or mean with min to max whiskers for more than 2 tested parameters)
-        nuis_names = all_names[nuis_idx]
-        function impact_of(a)   # nuisances x truths
-            V = fill(NaN, length(nuis_names), nt)
-            for (t, i) in enumerate(ok)
-                r = fisher_results[i]
-                ra = findfirst(j -> r.names[j] == a, r.tested_idx)
-                isnothing(ra) && continue   # the tested parameter was dropped at this truth
-                for (k, n) in enumerate(nuis_names)
-                    j = findfirst(==(n), r.names)
-                    isnothing(j) || (V[k, t] = r.impact[ra, j] / r.σ_marg[r.tested_idx[ra]])
-                end
-            end
-            V
-        end
-        n_tested = length(tested)
-        imp_cols = n_tested <= 2 ? n_tested : ceil(Int, sqrt(n_tested))
-        imp_rows = cld(n_tested, imp_cols)
-        function impact_block!(gl)
-            Label(gl[0, 1:imp_cols], "impact of the nuisances on the tested parameters ($(args["information"]) information, $nt truths)$note"; font = :bold, tellwidth = false)
-            for (p, a) in enumerate(tested)
-                V = impact_of(a)
-                fin = [filter(isfinite, V[k, :]) for k in axes(V, 1)]
-                order = sortperm([isempty(v) ? 0.0 : maximum(abs, v) for v in fin]; rev = true)   # largest impact on top
-                r, c = fldmod1(p, imp_cols)
-                ax = Axis(gl[r, c]; title = string(a), xlabel = "shift for +1σ of the nuisance / σ_marg($a)", yticks = (1:length(order), string.(nuis_names[order])), yreversed = true)
-                vlines!(ax, [0.0]; color = :gray, linestyle = :dot)
-                if dodged
-                    pts = [(k, V[o, t], t) for t in 1:nt for (k, o) in enumerate(order) if isfinite(V[o, t])]
-                    isempty(pts) && continue
-                    barplot!(ax, [q[1] for q in pts], [q[2] for q in pts]; direction = :x, dodge = [q[3] for q in pts], n_dodge = nt, color = [colors[q[3]] for q in pts], dodge_gap = 0.02)
-                else
-                    st = [(k, mean(fin[o]), minimum(fin[o]), maximum(fin[o])) for (k, o) in enumerate(order) if !isempty(fin[o])]
-                    isempty(st) && continue
-                    barplot!(ax, [s[1] for s in st], [s[2] for s in st]; direction = :x, color = :steelblue)
-                    rangebars!(ax, [s[1] for s in st], [s[3] for s in st], [s[4] for s in st]; direction = :x, color = :black, whiskerwidth = 6)
-                end
-            end
-            dodged && Legend(gl[1:imp_rows, imp_cols + 1], [PolyElement(color = colors[t]) for t in 1:nt], labels, join(tested, ", "))
-            gl
-        end
-
-        # mean correlation over the truths (elementwise, ignoring truths where a parameter was dropped)
-        corrs = [begin
-                     idx = [findfirst(==(n), fisher_results[i].names) for n in all_names]
-                     [isnothing(a) || isnothing(b) ? NaN : fisher_results[i].corr[a, b] for a in idx, b in idx]
-                 end for i in ok]
-        mean_corr = [(v = filter(isfinite, [C[a, b] for C in corrs]); isempty(v) ? NaN : mean(v)) for a in eachindex(all_names), b in eachindex(all_names)]
-        corr_c = (; corr = mean_corr, names = all_names)
-        corr_title = "Parameter correlation, mean over $nt truths"
-
-        sigmas = (("sigma_cond", pick(r -> r.σ_cond)), ("sigma_marg", pick(r -> r.σ_marg)))
-        w_sigma, h_sigma = max(900, 36 * length(all_names) + 300), 800
-        w_corr = 40 * length(all_names) + 200
-        w_imp, h_imp = 520 * imp_cols + (dodged ? 160 : 0), imp_rows * (24 * length(nuis_names) + 130)
-        if args["one-plot"]
-            # one figure: sigma_cond, sigma_marg, and below them the mean correlation and the impact ranking
-            h_bottom = max(h_imp, w_corr)
-            fig = Figure(size = (max(w_sigma, w_corr + w_imp), 2 * h_sigma + h_bottom))
-            for (row, (name, vals)) in enumerate(sigmas)
-                gl_row = GridLayout()
-                fig[row, 1] = gl_row
-                sigma_block!(gl_row, vals, vals ./ width_mat, name)
-                rowsize!(fig.layout, row, Auto(h_sigma))   # proportional shares (Fixed sizes plus the layout gaps overflow the figure and clip it)
-            end
-            bottom = GridLayout()
-            fig[3, 1] = bottom
-            rowsize!(fig.layout, 3, Auto(h_bottom))
-            gl_corr, gl_imp = GridLayout(), GridLayout()
-            bottom[1, 1] = gl_corr
-            bottom[1, 2] = gl_imp
-            Newtrinos.plotting.plot_correlation!(gl_corr, corr_c; title = corr_title)
-            impact_block!(gl_imp)
-            colsize!(bottom, 1, Auto(w_corr))
-            colsize!(bottom, 2, Auto(w_imp))
-            save("$(out_prefix)_overview_$(run_date).pdf", fig)
-        else
-            for (name, vals) in sigmas
-                fig_s = Figure(size = (w_sigma, h_sigma))
-                gl_s = GridLayout()
-                fig_s[1, 1] = gl_s
-                sigma_block!(gl_s, vals, vals ./ width_mat, name)
-                save("$(out_prefix)_$(name)_$(run_date).pdf", fig_s)
-            end
-            save("$(out_prefix)_correlation_mean_$(run_date).pdf", Newtrinos.plotting.plot_correlation(corr_c; title = corr_title))
-            fig = Figure(size = (w_imp, h_imp))
-            gl = GridLayout()
-            fig[1, 1] = gl
-            impact_block!(gl)
-            save("$(out_prefix)_impact_$(run_date).pdf", fig)
+        try
+            save("$(out_prefix)_overview_$(run_date).pdf", static_overview(sensitivity_data(results); top_n = args["top-n"]))
+        catch e
+            @error "the overview plot failed (the summary and the results file are still written)" exception = (e, catch_backtrace())
         end
     end
 end

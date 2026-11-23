@@ -24,6 +24,7 @@ using Test
         include("test_regression.jl")
         include("test_cli_common.jl")
         include("test_optimizer_strategy.jl")
+        include("test_sensitivity.jl")
         include("test_molewhacker.jl")
     end
     

@@ -127,11 +127,17 @@ the parameters studied are the free parameters of the hypothesis prior, the test
   where the data are insensitive (such truths get no result). From it: the expected
   uncertainty of every parameter with all others free (`sigma_marg`) and fixed (`sigma_cond`) against its prior width (which parameters the
   data constrain), the impact of every nuisance on the tested parameters (first-order shift for a +1σ move, and `sigma` with that nuisance
-  fixed), and the **a priori correlation matrix** (`Newtrinos.correlation` at the truth). `--truth grid --n-truths N` repeats it at `truth_grid` points over the tested
-  parameters, including the prior bounds (global sensitivity); with `--drop-boundaries` the grid is cell-centred (`lo + (i-1/2)/n * width`),
-  so no truth lies on a bound or at a zero-effect point such as a phase with zero magnitude. A Gaussian approximation:
-  use `scan` where the likelihood is strongly non-quadratic or multimodal (δCP, θ₂₃ octant). If the matrix is singular at the nominal
-  truth (e.g. a phase whose magnitude is zero), use `--truth grid`.
+  fixed), and the **a priori correlation matrix** (`Newtrinos.correlation` at the truth). Where the data are injected is chosen with `--truth`:
+  `nominal` (default, the setup's parameters), `grid` (`--n-truths N` points of `truth_grid` over the whole prior ranges of the tested parameters, including the bounds:
+  global sensitivity; 1 tested parameter: a line, 2: a grid, more: Sobol points), `range:lo,hi` (one tested parameter) or `range:name=lo,hi;name2=lo,hi` (the same
+  grid restricted to intervals, e.g. a suspicious region: `--truth range:-1.3,-0.7 --n-truths 13`; tested parameters not listed keep their whole range),
+  `point:name=x,name2=y` (ONE truth: these parameters, tested or nuisances, set on top of the nominal ones) and `bf:result.jld2` (ONE truth: the best fit of a
+  `NewtrinosResult` stored under the key `"result"`, as written by `save_result`; parameters the result does not contain stay nominal, with a warning). The intervals and values must lie in the prior
+  range. The summary states which truth was used (an a priori forecast at the nominal truth, or post-fit at a best fit) and the `.jld2` keeps it in
+  `settings["truth"]`. With `--drop-boundaries` the grid is cell-centred (`lo + (i-1/2)/n * width`), so no truth lies on a bound or at a zero-effect point such as a
+  phase with zero magnitude. A Gaussian approximation: use `scan` where the likelihood is strongly non-quadratic or multimodal (δCP, θ₂₃ octant), and be careful with truths where
+  the model changes quickly (a vacuum-like truth such as Δ_eμ = −1 for NSI: the matter effect switches on there, sigma is very small and correlations flip sign). If the matrix is singular at the
+  nominal truth (e.g. a phase whose magnitude is zero), use `--truth grid`.
 * `scan`: one-at-a-time scans of every free scalar parameter (or `--params`) over its **full prior range** (`--n-points` points plus the truth itself) on Asimov data:
   with all other parameters fixed (likelihood evaluations only) and, unless `--no-profile`, with all other free parameters re-fitted
   (`--strategy`) at every point. `Δχ² = 2 (llh(truth) − llh(point))`; the summary lists the Δχ² at the worst grid point, the 1σ interval
@@ -141,15 +147,24 @@ the parameters studied are the free parameters of the hypothesis prior, the test
 
 Options: `--setup` (required), `--hypothesis`, `--method`, `--params`, `--n-points`, `--no-profile`, `--strategy` (default `lbfgsb`; ONE strategy, its stages as separate arguments or in one quoted string, e.g. `"mle optim-lbfgs:iterations=2000"`;
 unlike `roundtrips.jl` several arguments are not several strategies; a last token `@N`, `scan` only, runs N independent attempts per fit and keeps the best),
-`--n-truths`, `--truth`, `--information`, `--drop-boundaries`, `--one-plot`, `--n-toys`, `--seed`, `--name`, `--results-dir` (default `results/<setup name>/sensitivity`), `--workers`.
-Output: `<name>_<hypothesis>_<method>_{summary,results}_<date>.{txt,jld2}` plus the plots (for `fisher`, all truths in one figure each:
-`_sigma_cond` and `_sigma_marg` with σ (log axis) above σ / prior width; the nuisances as the mean over the truths with min-max whiskers,
-the tested parameters as dodged bars per truth (one colour per truth; for more than 2 tested parameters also mean and whiskers), and
-`_correlation_mean`, the elementwise mean of the correlation matrices over the truths, and `_impact`, one tornado plot per tested
-parameter: the shift of its best fit for a +1σ move of each nuisance in units of its own σ_marg (equal to the correlation of the nuisance
-with the tested parameter), nuisances sorted by their largest |impact|, dodged per truth like the tested σ bars. With `--one-plot` all of
-these are drawn into one figure, `_overview`, instead. Truths without a result are left out; one figure for `scan` and `toys`).
-The `.jld2` is saved after the plots, from the same data.
+`--n-truths`, `--truth`, `--information`, `--drop-boundaries`, `--top-n`, `--n-toys`, `--seed`, `--name`, `--results-dir` (default `results/<setup name>/sensitivity`), `--workers`.
+Output: `<name>_<hypothesis>_<method>_{summary,results}_<date>.{txt,jld2}` plus the plot. For `fisher` one figure, `_overview`
+(PDF), with the truths resolved instead of averaged: row 1 σ / prior width of every tested parameter against its own truth (σ_marg solid, σ_cond dashed, log axis, a dotted line at
+σ = width, where the data no longer constrain the parameter within its prior range; several tested parameters: one panel each, markers) next to the nuisances (σ_marg and σ_cond over
+the prior width, mean over the truths with min-max whiskers); row 2 the RMS of the correlation matrix over the truths (sign not shown, a smell test) next to
+the range over the truths of **impact / σ_marg** of each nuisance (shift of the tested parameter for a +1σ_marg move of the nuisance, in units of the σ_marg of the tested parameter,
+equal to their correlation; a bar crossing zero is a sign flip, which the RMS matrix cannot show). At most `--top-n` (default 25) nuisances are drawn, the ones with the largest |impact| at any
+truth (the title says so); the summary text and the `.jld2` hold all of them, and the height of the panels follows the number of drawn rows. With ONE truth (`point:`, `bf:`, `nominal`)
+there is nothing to resolve over truths, so the overview shows the actual numbers instead: the σ / prior width of the tested parameter(s) (listed first) and the nuisances in one bar panel, the signed
+correlation matrix at the truth and the signed impact / σ_marg bars. Truths without a result are named in the title; one figure for `scan` and `toys`.
+The `.jld2` and the summary are written after the plot, also if the plot fails (the error is logged). Plot code: `src/analysis/sensitivity_plots.jl`
+(`sensitivity_data(results)`, `static_overview(D; top_n)`), usable on a loaded `.jld2`.
+
+**Interactive explorer (on demand).** `nsi/deepcore_8year_analysis/results/sensitivity_results/make_explorer_html.jl` turns the results `.jld2` of a `fisher` run into ONE self-contained
+HTML file with a slider (and the arrow keys) over the injected truth; it is not written by `sensitivity.jl` (the file is large):
+`julia --project=<Newtrinos.jl> make_explorer_html.jl <results.jld2> [--out explorer.html] [--top-n 25] [--max-frames 60]`. Every truth is a pre-rendered frame (about 0.4 MB; at most `--max-frames`,
+evenly subsampled) with the σ / prior width of the tested parameter(s) against the truth (the selected one marked) and of the nuisances at the truth, and below the correlation matrix and the
+impact / σ_marg of the nuisances at the truth. No Julia server or kernel is needed to open it; `page.html#N` starts at the (N+1)-th frame.
 
 The functions behind it work on any result: `Newtrinos.correlation(result, likelihood)` (correlation at a profile's best fit) and
 `Newtrinos.gof_pvalue(result, experiments)` (Poisson goodness of fit per experiment) are documented in the API page "Analysis API".
