@@ -29,7 +29,7 @@ function setup(; ftype = Float64)
     # fix δCP, θ₁₂, θ₁₃, Δm²₂₁ since we are not sensitive to them with DeepCore
     # fix atm_flux_updown_sigma since it is relevant for enegies below 1 GeV, which is below the DeepCore energy threshold
     # MAYBE also fix atm_flux_nuenuebar_sigma and atm_flux_nuenumu_sigma since they dont really affect the result at the used high energies 
-    conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5), :atm_flux_updown_sigma=>ftype(0.0))
+    conditional_vars = Dict(:δCP=>0.0, :θ₁₂=>ftype(33.62 * π/180), :θ₁₃=>ftype(8.54  * π/180), :Δm²₂₁=>ftype(7.40e-5), :atm_flux_updown_sigma=>ftype(0.0), :atm_flux_nuenuebar_sigma=>ftype(0.0), :atm_flux_nuenumu_sigma=>ftype(0.0))
     priors = Newtrinos.condition(priors, conditional_vars, p)
 
     # fix priors of NSI and theta_23 as in icecube paper for 3 year data set 

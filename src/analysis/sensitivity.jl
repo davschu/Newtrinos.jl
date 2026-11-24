@@ -187,6 +187,15 @@ results_dir = isempty(args["results-dir"]) ? joinpath("results", S.name, "sensit
 mkpath(results_dir)
 run_date = Dates.format(Dates.today(), "ddmmyyyy")
 out_prefix = joinpath(results_dir, "$(args["name"])_$(hyp_name)_$(method)")
+# a figure must never cost the results of a long run: its failure (e.g. the results folder was moved while the run was going) is reported, the summary and the results file are still written
+function save_figure(path, fig)
+    try
+        mkpath(dirname(path))
+        save(path, fig)
+    catch e
+        @error "the figure $path could not be saved (the summary and the results file are still written)" exception = (e, catch_backtrace())
+    end
+end
 println("setup $(S.name), hypothesis '$hyp_name' (tested: $(join(tested, ", "))), method $method, $(length(free_keys)) free parameters")
 
 # width of a prior (finite range, else 6 standard deviations), per scalar parameter or vector component
@@ -383,7 +392,7 @@ if method == "scan"
     end
     Legend(fig[nrows + 1, 1:ncols], [LineElement(color = :gray, linestyle = :dash), LineElement(color = :steelblue)], ["others fixed", "others profiled"],
            orientation = :horizontal, tellwidth = false)
-    save("$(out_prefix)_$(run_date).pdf", fig)
+    save_figure("$(out_prefix)_$(run_date).pdf", fig)
 end
 
 ### TOYS ###
@@ -430,13 +439,14 @@ if method == "toys"
     xs = range(max(1e-3, minimum(qf)), max(maximum(qf), 1.0), length = 200)
     lines!(ax, xs, pdf.(Chisq(k), xs); color = :black, label = "Chisq($k) (Wilks)")
     axislegend(ax)
-    save("$(out_prefix)_$(run_date).pdf", fig)
+    save_figure("$(out_prefix)_$(run_date).pdf", fig)
 end
 
 ### SAVE ###
 
 say()
 say("total wall time: $(round(time() - run_start_time, digits = 1)) s")
+mkpath(results_dir)   # again: the folder may have been moved or deleted during a long run
 write("$(out_prefix)_summary_$(run_date).txt", join(summary_lines, "\n") * "\n")
 results["summary_text"] = join(summary_lines, "\n")
 FileIO.save("$(out_prefix)_results_$(run_date).jld2", results)
