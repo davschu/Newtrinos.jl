@@ -11,8 +11,8 @@
 #SBATCH --time=4:00:00
 #SBATCH --array=0-5                 # one array task per hypothesis (eμ, eτ, μτ, ee_μμ, ττ_μμ, all) -- see HYPOTHESES below
 # NOTE: the logs/ folder below must already exist when you run sbatch (Slurm opens the log files before the script starts; mkdir inside the script is too late)
-#SBATCH --output=deepcore_8year_analysis/results/sensitivity_results/logs/%x_%A_%a.out  # %x jobname, %A array job id, %a array task id
-#SBATCH --error=deepcore_8year_analysis/results/sensitivity_results/logs/%x_%A_%a.err
+#SBATCH --output=/dss/dsshome1/04/ge42niq2/Newtrinos.jl/nsi/deepcore_8year_analysis/results/sensitivity_results/logs/%x_%A_%a.out  # %x jobname, %A array job id, %a array task id
+#SBATCH --error=/dss/dsshome1/04/ge42niq2/Newtrinos.jl/nsi/deepcore_8year_analysis/results/sensitivity_results/logs/%x_%A_%a.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=d.schultheiss@tum.de
 
