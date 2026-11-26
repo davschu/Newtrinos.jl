@@ -56,15 +56,20 @@ function parse_command_line()
         default = "fisher"
 
         "--params"
-        help = "scan: names of the free parameters to scan (default: all free scalar parameters of the hypothesis)"
+        help = "scan: names of the free parameters to scan. One name: a 1D scan of it (the truth is a grid point). Two or more names: ONE joint scan of all of them (2: a 2D grid, more: a Sobol sample; the others are fixed or profiled at every point; the nominal truth is not added as a point). Default (no --params): all free scalar parameters of the hypothesis, one at a time"
         arg_type = String
         nargs = '*'
         default = String[]
 
         "--n-points"
-        help = "scan: grid points per parameter over its prior range (infinite prior ranges: quantiles 0.001 to 0.999)"
+        help = "scan: grid points over the prior range (infinite prior ranges: quantiles 0.001 to 0.999). With one parameter (or none: each one separately): this many points per parameter. With a joint scan (--params with 2 or more names): the TOTAL number of points: round(sqrt(n)) per axis for 2 parameters (so 64 gives 8 x 8), n Sobol points for more"
         arg_type = Int
         default = 11
+
+        "--range"
+        help = "scan with 2 or more --params: restrict the joint scan to these intervals, name=lo,hi;name2=lo,hi (parameters not listed keep their whole prior range; needed for a parameter with an infinite prior range)"
+        arg_type = String
+        default = ""
 
         "--no-profile"
         help = "scan: only the scans with all other parameters fixed (likelihood evaluations, no fits); default: also re-fit all other free parameters at every grid point"
@@ -314,14 +319,41 @@ if method == "scan"
         k in free_keys || error("--params: $k is not a free parameter of hypothesis '$hyp_name'")
         nominal[k] isa AbstractVector && error("--params: $k is a vector parameter, only scalar parameters can be scanned")
     end
+    length(unique(scan_keys)) == length(scan_keys) || error("--params: a parameter is given twice")
+    joint = length(args["params"]) >= 2   # several named parameters: one joint scan (2D grid or Sobol sample) instead of one scan per parameter
+    n_points = args["n-points"]
+    if joint
+        n_points >= (length(scan_keys) == 2 ? 4 : 2) || error("--n-points is the total number of points of a joint scan: at least 4 for 2 parameters (2 per axis), got $n_points")
+    else
+        isempty(args["range"]) || error("--range is only used with 2 or more --params (a joint scan)")
+        n_points >= 2 || error("--n-points must be at least 2 (a grid from the lower to the upper end of the prior range), got $n_points")
+    end
     data = Newtrinos.generate_asimov_data(experiments, nominal)
     function grid(d)
         lo, hi = minimum(d), maximum(d)
         (isfinite(lo) && isfinite(hi)) || ((lo, hi) = (quantile(d, 0.001), quantile(d, 0.999)))
-        collect(range(lo, hi, length = args["n-points"]))
+        collect(range(lo, hi, length = n_points))
     end
-    grids = Dict(k => sort(unique(vcat(grid(prior[k]), Float64(nominal[k])))) for k in scan_keys)   # the truth itself is a grid point (Δχ² = 0)
-    tasks = [(; i, k, v) for (i, (k, v)) in enumerate(Iterators.flatten([(k, v) for v in grids[k]] for k in scan_keys))]
+    if joint
+        listed = isempty(args["range"]) ? Symbol[] : [Symbol(strip(first(split(item, '=')))) for item in split(args["range"], ';'; keepempty = false)]
+        for k in scan_keys
+            k in listed || isfinite(maximum(prior[k]) - minimum(prior[k])) || error("--params: $k has an infinite prior range, give an interval with --range $k=lo,hi")
+        end
+        jtruths, _, jcoords = if isempty(args["range"])
+            truth_grid(prior, nominal, scan_keys; n_points)
+        else
+            try
+                r = truth_from_spec("range:" * args["range"], prior, nominal, scan_keys; n_points)
+                (r.truths, r.scan_keys, r.grid_coords)
+            catch e
+                e isa ErrorException ? error(replace(e.msg, "--truth range" => "--range")) : rethrow()
+            end
+        end
+        tasks = [(; i, pin = NamedTuple{Tuple(scan_keys)}(Tuple(Float64(t[k]) for k in scan_keys))) for (i, t) in enumerate(jtruths)]
+    else
+        grids = Dict(k => sort(unique(vcat(grid(prior[k]), Float64(nominal[k])))) for k in scan_keys)   # the truth itself is a grid point (Δχ² = 0)
+        tasks = [(; i, pin = NamedTuple{(k,)}((v,))) for (i, (k, v)) in enumerate(Iterators.flatten([(k, v) for v in grids[k]] for k in scan_keys))]
+    end
     profile = !args["no-profile"]
     ctx = (; experiments, data, prior, nominal, strategy, nseeds, profile, seed = args["seed"])
     use_distributed && @everywhere ctx = $ctx
@@ -329,17 +361,17 @@ if method == "scan"
     @everywhere function scan_task(t)
         c = ctx
         L = Newtrinos.generate_likelihood(c.experiments, c.data)
-        p = merge(c.nominal, NamedTuple{(t.k,)}((t.v,)))
+        p = merge(c.nominal, t.pin)   # t.pin: the scanned parameter(s) of this point
         llh_fixed = logdensityof(L, p)
         c.profile || return (; llh_fixed, llh = NaN, params = p)
-        pinned = Newtrinos.condition(c.prior, Dict{Symbol, Float64}(t.k => t.v), c.nominal)
+        pinned = Newtrinos.condition(c.prior, Dict{Symbol, Float64}(k => Float64(v) for (k, v) in pairs(t.pin)), c.nominal)
         r = find_mle_advanced(L, pinned, p; strategy = c.strategy, nseeds = c.nseeds, rng = Random.Xoshiro(c.seed + t.i), objective = "posterior")
         (; llh_fixed, llh = r.llh, params = r.params)
     end
 
     L0 = Newtrinos.generate_likelihood(experiments, data)
     llh_truth = logdensityof(L0, nominal)
-    println("$(length(scan_keys)) parameters x $(args["n-points"]) points" * (profile ? ", each profiled" : "") * " (reference llh at the truth: $(round(llh_truth, digits = 3))) ...")
+    println((joint ? "joint scan of $(join(scan_keys, ", ")): $(length(tasks)) points" : "$(length(scan_keys)) parameters x $(n_points) points") * (profile ? ", each profiled" : "") * " (reference llh at the truth: $(round(llh_truth, digits = 3))) ...")
     recs = use_distributed ? @showprogress(pmap(scan_task, tasks)) : @showprogress(map(scan_task, tasks))
 
     # Δχ² = 2 (llh(truth) - llh(point)); the 1σ crossing is interpolated linearly on the grid, going out from the truth
@@ -356,8 +388,75 @@ if method == "scan"
         (crossing(xs[i0:-1:1] .- x0, ys[i0:-1:1], 1.0), crossing(xs[i0:end] .- x0, ys[i0:end], 1.0))   # offsets from the truth (lower side negative)
     end
 
+    if joint
+    ndof = length(scan_keys)
+    coords = [Float64[t.pin[k] for k in scan_keys] for t in tasks]
+    dj_fixed = 2 .* (llh_truth .- [r.llh_fixed for r in recs])
+    dj_prof = profile ? 2 .* (llh_truth .- [r.llh for r in recs]) : fill(NaN, length(recs))
+    levels = [0.68, 0.9, 0.95]
+    thr = quantile.(Chisq(ndof), levels)   # Δχ² of the 68 / 90 / 95 % regions for ndof scanned parameters
+    dj = profile ? dj_prof : dj_fixed
+    ok = findall(isfinite, dj)
+    others = [a for a in tested if !(a in scan_keys)]
+    jshifts = profile ? [maximum(abs(Float64(r.params[a]) - Float64(nominal[a])) / prior_width(prior[a]) for r in recs) for a in others] : Float64[]
+
+    say("=== sensitivity (scan, joint) summary ===")
+    say("setup: $(S.name)   hypothesis: $hyp_name (tested: $(join(tested, ", ")))   joint scan of $(join(scan_keys, ", ")): $(length(tasks)) points ($(ndof == 2 ? "2D grid" : "Sobol sample"), --n-points $n_points is the total), Asimov data at the setup's parameters")
+    say("Δχ² = 2 (llh(truth) - llh(point)); 'fixed': all other parameters at the truth, 'profiled': all other free parameters re-fitted ($(join(strategy, " "))$(nseeds > 1 ? " @$nseeds" : ""))")
+    say("regions: Δχ² below the Chisq($ndof) quantiles " * join(("$(round(Int, 100l)) % = $(round(t, sigdigits = 3))" for (l, t) in zip(levels, thr)), ", ") * " (the 1σ level of one parameter, Δχ² = 1, does not apply)")
+    say()
+    say(rpad("", 12) * rpad("max Δχ²", 12) * rpad("min Δχ²", 12) * join((rpad("n < $(round(t, sigdigits = 3))", 12) for t in thr), ""))
+    for (name, d) in (profile ? [("fixed", dj_fixed), ("profiled", dj_prof)] : [("fixed", dj_fixed)])
+        f = filter(isfinite, d)
+        say(rpad(name, 12) * rpad(isempty(f) ? "NaN" : string(round(maximum(f), sigdigits = 3)), 12) * rpad(isempty(f) ? "NaN" : string(round(minimum(f), sigdigits = 3)), 12) *
+            join((rpad(string(count(<(t), f)), 12) for t in thr), "") * "  (of $(length(f)) finite points)")
+    end
+    if !isempty(ok)
+        ib = ok[argmin(dj[ok])]
+        say("lowest Δχ² ($(profile ? "profiled" : "fixed")): $(round(dj[ib], sigdigits = 3)) at " * join(("$k = $(round(coords[ib][j], sigdigits = 4))" for (j, k) in enumerate(scan_keys)), ", "))
+    end
+    profile && !isempty(others) && say("shift = largest change of a tested parameter in the profiled fits, in units of its prior width: " * join(("$a: $(round(s, sigdigits = 2))" for (a, s) in zip(others, jshifts)), ", "))
+    results["scan"] = Dict{Symbol, Any}(:joint => (; keys = scan_keys, coords, delta_chi2_fixed = dj_fixed, delta_chi2_profiled = dj_prof, params = [r.params for r in recs], ndof, levels, thresholds = thr, shifts = jshifts))
+    results["llh_truth"] = llh_truth
+    results["settings"]["scan_params"] = collect(string.(scan_keys))
+    results["settings"]["range"] = args["range"]
+
+    cmax = max(maximum(filter(isfinite, vcat(dj_fixed, dj_prof)); init = 0.0), 1e-6)
+    panels = profile ? [("others fixed", dj_fixed), ("others profiled", dj_prof)] : [("others fixed", dj_fixed)]
+    if ndof == 2
+        k1, k2 = scan_keys
+        gx = sort(unique(c[1] for c in coords)); gy = sort(unique(c[2] for c in coords))
+        fig = Figure(size = (480 * length(panels) + 120, 420))
+        for (n, (ttl, d)) in enumerate(panels)
+            Z = fill(NaN, length(gx), length(gy))
+            for (c, v) in zip(coords, d)
+                Z[searchsortedfirst(gx, c[1]), searchsortedfirst(gy, c[2])] = v
+            end
+            ax = Axis(fig[1, n]; title = ttl, xlabel = string(k1), ylabel = string(k2))
+            heatmap!(ax, gx, gy, Z; colorrange = (0, cmax), colormap = :viridis)
+            try
+                contour!(ax, gx, gy, Z; levels = thr, color = :white, linewidth = 1.5)   # 68 / 90 / 95 % regions
+            catch e
+                @warn "contours not drawn" exception = e
+            end
+            scatter!(ax, [Float64(nominal[k1])], [Float64(nominal[k2])]; color = :red, marker = :xcross, markersize = 12)
+        end
+        Colorbar(fig[1, length(panels) + 1]; colorrange = (0, cmax), colormap = :viridis, label = "Δχ²")
+    else
+        prs = [(a, b) for a in 1:ndof for b in a+1:ndof]
+        ncols = min(length(prs), 3); nrows = cld(length(prs), ncols)
+        fig = Figure(size = (400 * ncols + 120, 340 * nrows))
+        for (n, (a, b)) in enumerate(prs)
+            ax = Axis(fig[(n - 1) ÷ ncols + 1, (n - 1) % ncols + 1]; xlabel = string(scan_keys[a]), ylabel = string(scan_keys[b]))
+            scatter!(ax, [c[a] for c in coords], [c[b] for c in coords]; color = dj, colorrange = (0, cmax), colormap = :viridis, markersize = 9)
+            scatter!(ax, [Float64(nominal[scan_keys[a]])], [Float64(nominal[scan_keys[b]])]; color = :red, marker = :xcross, markersize = 12)
+        end
+        Colorbar(fig[1:nrows, ncols + 1]; colorrange = (0, cmax), colormap = :viridis, label = "Δχ² ($(profile ? "profiled" : "fixed"))")
+    end
+    save_figure("$(out_prefix)_$(run_date).pdf", fig)
+    else
     say("=== sensitivity (scan) summary ===")
-    say("setup: $(S.name)   hypothesis: $hyp_name (tested: $(join(tested, ", ")))   $(args["n-points"]) points per parameter over the prior range, Asimov data at the setup's parameters")
+    say("setup: $(S.name)   hypothesis: $hyp_name (tested: $(join(tested, ", ")))   $(n_points) points per parameter over the prior range, Asimov data at the setup's parameters")
     say("Δχ² = 2 (llh(truth) - llh(point)); 'fixed': all other parameters at the truth, 'profiled': all other free parameters re-fitted ($(join(strategy, " "))$(nseeds > 1 ? " @$nseeds" : ""))")
     say("max Δχ² = Δχ² at the worst grid point (how strongly the data exclude the extremes of the prior range); 1σ = distance from the truth to Δχ² = 1 (NaN: not reached within the prior range)")
     say("shift = largest change of a tested parameter in the profiled fits, in units of its prior width")
@@ -366,7 +465,7 @@ if method == "scan"
         (profile ? "shift of " * join(tested, ", ") : ""))
     scan_results = Dict{Symbol, Any}()
     for k in scan_keys
-        sel = [r for (t, r) in zip(tasks, recs) if t.k == k]
+        sel = [r for (t, r) in zip(tasks, recs) if first(keys(t.pin)) == k]
         xs = grids[k]
         d_fixed = 2 .* (llh_truth .- [r.llh_fixed for r in sel])
         d_prof = profile ? 2 .* (llh_truth .- [r.llh for r in sel]) : fill(NaN, length(xs))
@@ -393,6 +492,7 @@ if method == "scan"
     Legend(fig[nrows + 1, 1:ncols], [LineElement(color = :gray, linestyle = :dash), LineElement(color = :steelblue)], ["others fixed", "others profiled"],
            orientation = :horizontal, tellwidth = false)
     save_figure("$(out_prefix)_$(run_date).pdf", fig)
+    end   # joint / one at a time
 end
 
 ### TOYS ###
